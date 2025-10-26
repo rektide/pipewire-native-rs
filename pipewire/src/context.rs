@@ -300,7 +300,12 @@ impl InnerContext {
             .is_none()
         {
             let mut name: [u8; 256] = [0; 256];
-            unsafe { libc::gethostname(name.as_mut_ptr() as *mut i8, name.len() as libc::size_t) };
+            unsafe {
+                libc::gethostname(
+                    name.as_mut_ptr() as *mut libc::c_char,
+                    name.len() as libc::size_t,
+                )
+            };
             if let Ok(hostname) = CStr::from_bytes_until_nul(&name) {
                 self.properties.write().unwrap().set(
                     keys::APP_PROCESS_HOST,
