@@ -22,10 +22,8 @@ default_topic!(log::topic::MAIN_LOOP);
 /// Main loop events
 pub struct MainLoopEvents {
     /// The main loop was destroyed.
-    pub destroy: Option<Box<dyn FnMut()>>,
+    pub destroy: Option<Box<dyn FnMut() + Send>>,
 }
-
-unsafe impl Send for MainLoopEvents {}
 
 #[derive(Clone)]
 pub(crate) struct LoopSupport {
