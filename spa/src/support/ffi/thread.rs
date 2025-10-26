@@ -68,7 +68,7 @@ pub(crate) unsafe fn make_native(thread_utils: &ThreadUtilsImpl) -> *mut CInterf
 
 pub(crate) unsafe fn free_native(c_thread_utils: *mut CInterface) {
     unsafe {
-        let _ = CString::from_raw((*c_thread_utils).type_ as *mut i8);
+        let _ = CString::from_raw((*c_thread_utils).type_ as *mut std::ffi::c_char);
         libc::free(c_thread_utils as *mut c_void);
     }
 }

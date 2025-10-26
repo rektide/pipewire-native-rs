@@ -202,7 +202,7 @@ pub(crate) unsafe fn make_native(cpu: &CpuImpl) -> *mut CInterface {
 
 pub(crate) unsafe fn free_native(c_cpu: *mut CInterface) {
     unsafe {
-        let _ = CString::from_raw((*c_cpu).type_ as *mut i8);
+        let _ = CString::from_raw((*c_cpu).type_ as *mut std::ffi::c_char);
         libc::free(c_cpu as *mut c_void);
     }
 }

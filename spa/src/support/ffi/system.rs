@@ -459,7 +459,7 @@ pub(crate) unsafe fn make_native(system: &SystemImpl) -> *mut CInterface {
 
 pub(crate) unsafe fn free_native(c_system: *mut CInterface) {
     unsafe {
-        let _ = CString::from_raw((*c_system).type_ as *mut i8);
+        let _ = CString::from_raw((*c_system).type_ as *mut std::ffi::c_char);
         libc::free(c_system as *mut c_void);
     }
 }

@@ -652,7 +652,7 @@ pub(crate) unsafe fn make_native(loop_utils: &LoopUtilsImpl) -> *mut CInterface 
 
 pub(crate) unsafe fn free_native(c_loop_util: *mut CInterface) {
     unsafe {
-        let _ = CString::from_raw((*c_loop_util).type_ as *mut i8);
+        let _ = CString::from_raw((*c_loop_util).type_ as *mut std::ffi::c_char);
         libc::free(c_loop_util as *mut c_void);
     }
 }
