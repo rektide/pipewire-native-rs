@@ -4,9 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
-// FIXME: get via build configuration
-const PIPEWIRE_CONFIG_DIR: &str = "/etc/pipewire";
-const PIPEWIRE_CONFIG_DATA_DIR: &str = "/usr/share/pipewire";
+// Include config directories from file generated in build.rs
+include!(concat!(env!("OUT_DIR"), "/conf_dir.rs"));
 
 use crate::{debug, default_topic, log, properties::Properties, trace};
 
