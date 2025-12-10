@@ -363,7 +363,7 @@ impl Client {
         let stream = UnixStream::connect(socket_path)?;
         stream.set_nonblocking(true)?;
 
-        let res = self.set_stream(stream, true);
+        let res = self.set_stream(stream, false);
 
         if let Some(cb) = done_cb {
             cb(res);
