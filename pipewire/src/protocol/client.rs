@@ -170,6 +170,7 @@ impl Client {
                         break;
                     } else {
                         self.on_connection_error(err, "failed to read messages");
+                        return;
                     }
                 }
             }
