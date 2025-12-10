@@ -261,6 +261,15 @@ impl Connection {
         let start = *offset + marshal::HEADER_LEN;
         let end = start + header.size as usize;
 
+        // Update the external offset and size before possibly bailing out with an error, otherwise
+        // we could be reading the same chunk again and again when that happens.
+        *offset += marshal::HEADER_LEN + header.size as usize;
+        if *offset == *size {
+            // We've consumed all the data
+            *offset = 0;
+            *size = 0;
+        }
+
         let (body, body_size) = T::decode(header.opcode, &buf[start..end]).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -288,14 +297,6 @@ impl Connection {
                     header.size, body_size, footer_size
                 ),
             ));
-        }
-
-        *offset += marshal::HEADER_LEN + header.size as usize;
-
-        if *offset == *size {
-            // We've consumed all the data
-            *offset = 0;
-            *size = 0;
         }
 
         Ok((body, footer))
