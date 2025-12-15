@@ -109,7 +109,7 @@ impl Client {
         *self.inner.last_in_seq.write().unwrap() = 0;
     }
 
-    pub(crate) fn set_stream(&self, stream: UnixStream, close: bool) -> std::io::Result<()> {
+    pub(crate) fn set_stream(&self, stream: UnixStream) -> std::io::Result<()> {
         debug!("Setting fd on connection: {stream:?}");
 
         let fd = stream.as_raw_fd();
@@ -125,7 +125,7 @@ impl Client {
         let source = main_loop.add_io(
             fd,
             spa::flags::Io::all(),
-            close,
+            false,
             closure!([client <- self] fd, mask, {
                 client.on_remote_data(fd, spa::flags::Io::from_bits_truncate(mask));
             }),
@@ -364,7 +364,7 @@ impl Client {
         let stream = UnixStream::connect(socket_path)?;
         stream.set_nonblocking(true)?;
 
-        let res = self.set_stream(stream, false);
+        let res = self.set_stream(stream);
 
         if let Some(cb) = done_cb {
             cb(res);
