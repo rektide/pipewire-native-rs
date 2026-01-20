@@ -223,7 +223,7 @@ where
     }
 
     fn decode(data: &[u8]) -> Result<(Self::DecodesTo, usize), Error> {
-        if data.len() < 16 {
+        if data.len() < 8 {
             return Err(Error::Invalid("Not enough data for primitive".to_string()));
         }
 
