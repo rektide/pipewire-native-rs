@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
 use pipewire_native_spa as spa;
@@ -18,7 +18,7 @@ use crate::{
 refcounted! {
     /// Proxy that represents a module that is loaded on the server.
     pub struct Module {
-        proxy: RwLock<Option<Proxy<Module>>>,
+        proxy: Proxy,
         hooks: Arc<Mutex<spa::hook::HookList<ModuleEvents>>>,
     }
 }
@@ -66,30 +66,18 @@ impl HasProxy for Module {
         3
     }
 
-    fn proxy(&self) -> Proxy<Self> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Module proxy should be initialised on creation")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
 impl Module {
     pub(crate) fn new(core: &Core) -> Self {
         let this = Self {
-            inner: new_refcounted(InnerModule::new()),
+            inner: new_refcounted(InnerModule::new(core)),
         };
 
-        let id = core.next_proxy_id();
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(Proxy::new(id, &this));
-        core.add_proxy(&this, id);
+        core.add_proxy(&this);
 
         this
     }
@@ -110,9 +98,9 @@ impl Module {
 }
 
 impl InnerModule {
-    fn new() -> Self {
+    fn new(core: &Core) -> Self {
         Self {
-            proxy: RwLock::new(None),
+            proxy: Proxy::new(core.next_proxy_id()),
             hooks: spa::hook::HookList::new(),
         }
     }

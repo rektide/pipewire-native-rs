@@ -12,13 +12,13 @@ use pipewire_native_spa as spa;
 
 use crate::{
     context::{Context, WeakContext},
-    debug, default_topic, hasproxy_method_call_unlocked, hasproxy_notify, hasproxy_notify_unlocked,
+    debug, default_topic, hasproxy_method_call, hasproxy_notify,
     id_map::IdMap,
-    keys, log, new_refcounted,
+    keys, log, new_refcounted, object_invoke,
     properties::Properties,
     protocol,
     proxy::{self, HasProxy, Proxy, ProxyEvents},
-    proxy_notify, proxy_object_invoke, refcounted, some_closure, types, HookId, Id, Refcounted,
+    proxy_notify, refcounted, some_closure, types, HookId, Id, Refcounted,
 };
 
 default_topic!(log::topic::CORE);
@@ -43,11 +43,11 @@ pub(crate) fn get_remote(props: Option<&spa::dict::Dict>) -> String {
 refcounted! {
     /// A singleton object representing the connection between the client and the PipeWire server.
     pub struct Core {
+        proxy: Proxy,
         context: WeakContext,
         properties: Properties,
         client: protocol::client::Client,
         destroyed: RwLock<bool>,
-        proxy: RwLock<Option<Proxy<Core>>>,
         objects: RwLock<IdMap<Box<dyn HasProxy>>>,
         methods: Arc<Mutex<CoreMethods<Core>>>,
         hooks: Arc<Mutex<spa::hook::HookList<CoreEvents>>>,
@@ -64,12 +64,6 @@ impl Core {
 
         // Reserve id 0 because we are id 0
         let id = this.inner.objects.write().unwrap().reserve();
-        let core_proxy = Proxy::new(0, &this);
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(core_proxy.clone());
         this.inner
             .objects
             .write()
@@ -77,11 +71,10 @@ impl Core {
             .insert_at(id, Box::new(this.clone()));
 
         let client = proxy::client::Client::new(&this);
-        let client_proxy = client.proxy();
 
         this.inner.client.set_core(this.downgrade());
 
-        core_proxy.add_listener(ProxyEvents {
+        this.proxy().add_listener(ProxyEvents {
             destroy: some_closure!([this] {
                 debug!("core destroy");
                 let mut destroyed = this.inner.destroyed.write().unwrap();
@@ -125,45 +118,41 @@ impl Core {
                         .update_properties(props, vec!["default.clock.quantum-limit"]);
                 }
             }),
-            done: some_closure!([core_proxy] id, seq, {
+            done: some_closure!([this] id, seq, {
                 debug!("got done: {id} {seq}");
-                let core = core_proxy.object().unwrap();
-                let proxies = core.inner.objects.read().unwrap();
+                let proxies = this.inner.objects.read().unwrap();
 
                 if let Some(object) = proxies.get(id) {
-                    hasproxy_notify_unlocked!(object, proxies, done, seq);
+                    hasproxy_notify!(object, done, seq);
                 }
             }),
-            error: some_closure!([core_proxy] id, seq, res, message, {
+            error: some_closure!([this] id, seq, res, message, {
                 debug!("got error: {id} {seq} {res} {message}");
-                let core = core_proxy.object().unwrap();
-                let proxies = core.inner.objects.read().unwrap();
+                let proxies = this.inner.objects.read().unwrap();
 
                 if let Some(object) = proxies.get(id) {
-                    hasproxy_notify_unlocked!(object, proxies, error, seq, res, message);
+                    hasproxy_notify!(object, error, seq, res, message);
                 }
             }),
-            ping: some_closure!([core_proxy] id, seq, {
+            ping: some_closure!([this] id, seq, {
                 debug!("got ping: {id} {seq}");
-                let _ = proxy_object_invoke!(core_proxy, pong, id, seq);
+                let _ = object_invoke!(this, pong, id, seq);
             }),
-            remove_id: some_closure!([core_proxy] id, {
+            remove_id: some_closure!([this] id, {
                 debug!("got remove_id: {id}");
-                let core = core_proxy.object().unwrap();
-                let mut proxies = core.inner.objects.write().unwrap();
+                let mut proxies = this.inner.objects.write().unwrap();
 
                 if let Some(object) = proxies.get(id) {
                     hasproxy_notify!(object, removed);
                     proxies.remove(id);
                 }
             }),
-            bound_id: some_closure!([core_proxy] id, global_id, {
+            bound_id: some_closure!([this] id, global_id, {
                 debug!("got bound_id: {id} {global_id}");
-                let core = core_proxy.object().unwrap();
-                let proxies = core.inner.objects.read().unwrap();
+                let proxies = this.inner.objects.read().unwrap();
 
                 if let Some(object) = proxies.get(id) {
-                    hasproxy_method_call_unlocked!(object, proxies, set_bound_id, global_id);
+                    hasproxy_method_call!(object, set_bound_id, global_id);
                 }
             }),
             add_mem: some_closure!([] _id, _type_, _fd, _flags, {
@@ -172,20 +161,19 @@ impl Core {
             remove_mem: some_closure!([] _id, {
                 todo!("core.remove_mem is not yet implemented")
             }),
-            bound_props: some_closure!([core_proxy] id, global_id, props, {
+            bound_props: some_closure!([this] id, global_id, props, {
                 debug!("got bound_props: {id} {global_id} {props:?}");
-                let core = core_proxy.object().unwrap();
-                let proxies = core.inner.objects.read().unwrap();
+                let proxies = this.inner.objects.read().unwrap();
 
                 if let Some(object) = proxies.get(id) {
-                    hasproxy_method_call_unlocked!(object, proxies, set_bound_props, global_id, props);
+                    hasproxy_method_call!(object, set_bound_props, global_id, props);
                 }
             }),
         });
 
-        proxy_object_invoke!(core_proxy, hello, VERSION)?;
+        object_invoke!(this, hello, VERSION)?;
 
-        proxy_object_invoke!(client_proxy, update_properties, &this.inner.properties)?;
+        object_invoke!(client, update_properties, &this.inner.properties)?;
 
         this.inner
             .client
@@ -240,12 +228,12 @@ impl Core {
         self.inner.objects.write().unwrap().reserve()
     }
 
-    pub(crate) fn add_proxy<T: HasProxy + Refcounted>(&self, object: &T, id: Id) {
+    pub(crate) fn add_proxy<T: HasProxy + Refcounted>(&self, object: &T) {
         self.inner
             .objects
             .write()
             .unwrap()
-            .insert_at(id, Box::new(object.clone()));
+            .insert_at(object.proxy().id(), Box::new(object.clone()));
     }
 
     pub(crate) fn find_proxy_type(&self, id: Id) -> Option<types::ObjectType> {
@@ -257,13 +245,13 @@ impl Core {
             .map(|o| o.type_())
     }
 
-    pub(crate) fn find_proxy<T: HasProxy + Refcounted>(&self, id: Id) -> Option<Proxy<T>> {
+    pub(crate) fn find_object<T: HasProxy + Refcounted>(&self, id: Id) -> Option<T> {
         self.inner
             .objects
             .read()
             .unwrap()
             .get(id)
-            .and_then(|o| o.downcast_proxy::<T>())
+            .and_then(|o| o.downcast::<T>())
     }
 
     /// Listen for events on the core object.
@@ -278,15 +266,13 @@ impl Core {
 
     /// Trigger a `sync` message to the server, flushing all pending messages.
     pub fn sync(&self) -> std::io::Result<u32> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, sync, 0)
+        object_invoke!(self, sync, 0)
     }
 
     /// Retrieve a [Registry](proxy::registry::Registry). This can be used to query and track
     /// objects exposed by the server.
     pub fn registry(&self) -> std::io::Result<proxy::registry::Registry> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, get_registry)
+        object_invoke!(self, get_registry)
     }
 
     /// Create an object of the given factory type on the server.
@@ -297,14 +283,12 @@ impl Core {
         version: u32,
         props: &Properties,
     ) -> std::io::Result<Box<dyn HasProxy>> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, create_object, factory_name, type_, version, props)
+        object_invoke!(self, create_object, factory_name, type_, version, props)
     }
 
     /// Destroy a proxy.
     pub fn destroy(&self, object: &dyn HasProxy) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, destroy, object)
+        object_invoke!(self, destroy, object)
     }
 
     pub(crate) fn methods(&self) -> Arc<Mutex<CoreMethods<Core>>> {
@@ -325,14 +309,8 @@ impl HasProxy for Core {
         4
     }
 
-    fn proxy(&self) -> Proxy<Core> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Proxy should be initialised")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
@@ -367,18 +345,16 @@ pub struct CoreInfo<'a> {
 }
 
 #[allow(clippy::type_complexity)]
-pub(crate) struct CoreMethods<T: HasProxy + Refcounted> {
-    pub(crate) hello: Box<dyn FnMut(&Proxy<T>, u32) -> std::io::Result<()>>,
-    pub(crate) sync: Box<dyn FnMut(&Proxy<T>, Id) -> std::io::Result<u32>>,
-    pub(crate) pong: Box<dyn FnMut(&Proxy<T>, Id, u32) -> std::io::Result<()>>,
+pub(crate) struct CoreMethods<T> {
+    pub(crate) hello: Box<dyn FnMut(&T, u32) -> std::io::Result<()>>,
+    pub(crate) sync: Box<dyn FnMut(&T, Id) -> std::io::Result<u32>>,
+    pub(crate) pong: Box<dyn FnMut(&T, Id, u32) -> std::io::Result<()>>,
     #[allow(unused)]
-    pub(crate) error: Box<dyn FnMut(&Proxy<T>, u32, u32, &str) -> std::io::Result<()>>,
-    pub(crate) get_registry:
-        Box<dyn FnMut(&Proxy<T>) -> std::io::Result<proxy::registry::Registry>>,
-    pub(crate) create_object: Box<
-        dyn FnMut(&Proxy<T>, &str, &str, u32, &Properties) -> std::io::Result<Box<dyn HasProxy>>,
-    >,
-    pub(crate) destroy: Box<dyn FnMut(&Proxy<T>, &dyn HasProxy) -> std::io::Result<()>>,
+    pub(crate) error: Box<dyn FnMut(&T, u32, u32, &str) -> std::io::Result<()>>,
+    pub(crate) get_registry: Box<dyn FnMut(&T) -> std::io::Result<proxy::registry::Registry>>,
+    pub(crate) create_object:
+        Box<dyn FnMut(&T, &str, &str, u32, &Properties) -> std::io::Result<Box<dyn HasProxy>>>,
+    pub(crate) destroy: Box<dyn FnMut(&T, &dyn HasProxy) -> std::io::Result<()>>,
 }
 
 /// Events that may be emitted by a [Core] proxy object.
@@ -401,6 +377,23 @@ pub struct CoreEvents {
     pub(crate) bound_props: Option<Box<dyn FnMut(Id, Id, &Properties) + Send>>,
 }
 
+#[allow(clippy::type_complexity)]
+impl CoreEvents {
+    /// Create a new CoreEvents struct with the given `info`, `done` and `error` callbacks.
+    pub fn new(
+        info: Option<Box<dyn FnMut(&CoreInfo<'_>) + Send>>,
+        done: Option<Box<dyn FnMut(Id, u32) + Send>>,
+        error: Option<Box<dyn FnMut(Id, u32, u32, &str) + Send>>,
+    ) -> Self {
+        Self {
+            info,
+            done,
+            error,
+            ..Default::default()
+        }
+    }
+}
+
 impl InnerCore {
     fn new(context: &Context, mut properties: Properties) -> Self {
         properties.add_dict(&context.properties_dict());
@@ -411,11 +404,11 @@ impl InnerCore {
         let connection = client.connection();
 
         Self {
+            proxy: Proxy::new(0),
             context: context.downgrade(),
             properties,
             client,
             destroyed: RwLock::new(false),
-            proxy: RwLock::new(None),
             objects: RwLock::new(IdMap::new()),
             methods: Arc::new(Mutex::new(protocol::marshal::core::Methods::marshal(
                 connection,

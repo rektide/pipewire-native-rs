@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
 use pipewire_native_macros as macros;
@@ -10,31 +10,31 @@ use pipewire_native_spa as spa;
 
 use crate::{
     core::Core,
-    new_refcounted,
+    new_refcounted, object_invoke,
     properties::Properties,
     protocol,
     proxy::{HasProxy, Proxy},
-    proxy_object_invoke, refcounted,
+    refcounted,
     types::{self, params::ParamBuilder},
-    HookId, Id, Refcounted,
+    HookId, Id,
 };
 
 refcounted! {
     /// Proxy that represents a node that is connected to the server.
     pub struct Node {
-        proxy: RwLock<Option<Proxy<Node>>>,
+        proxy: Proxy,
         methods: Arc<Mutex<NodeMethods<Node>>>,
         hooks: Arc<Mutex<spa::hook::HookList<NodeEvents>>>,
     }
 }
 
 #[allow(clippy::type_complexity)]
-pub(crate) struct NodeMethods<T: HasProxy + Refcounted> {
+pub(crate) struct NodeMethods<T> {
     pub(crate) subscribe_params:
-        Box<dyn FnMut(&Proxy<T>, &[spa::param::ParamType]) -> std::io::Result<()>>,
+        Box<dyn FnMut(&T, &[spa::param::ParamType]) -> std::io::Result<()>>,
     pub(crate) enum_params: Box<
         dyn FnMut(
-            &Proxy<T>,
+            &T,
             u32,
             Option<spa::param::ParamType>,
             u32,
@@ -44,7 +44,7 @@ pub(crate) struct NodeMethods<T: HasProxy + Refcounted> {
     >,
     pub(crate) set_param: Box<
         dyn FnMut(
-            &Proxy<T>,
+            &T,
             spa::param::ParamType,
             spa::pod::types::ObjectType,
             u32,
@@ -53,7 +53,7 @@ pub(crate) struct NodeMethods<T: HasProxy + Refcounted> {
     >,
     pub(crate) send_command: Box<
         dyn FnMut(
-            &Proxy<T>,
+            &T,
             Box<dyn FnOnce(spa::pod::builder::Builder) -> spa::pod::builder::Builder>,
         ) -> std::io::Result<()>,
     >,
@@ -138,14 +138,8 @@ impl HasProxy for Node {
         3
     }
 
-    fn proxy(&self) -> Proxy<Self> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Node proxy should be initialised on creation")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
@@ -155,13 +149,7 @@ impl Node {
             inner: new_refcounted(InnerNode::new(core)),
         };
 
-        let id = core.next_proxy_id();
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(Proxy::new(id, &this));
-        core.add_proxy(&this, id);
+        core.add_proxy(&this);
 
         this
     }
@@ -178,8 +166,7 @@ impl Node {
 
     /// Register for notifications of the specified param types.
     pub fn subscribe_params(&self, ids: &[spa::param::ParamType]) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, subscribe_params, ids)
+        object_invoke!(self, subscribe_params, ids)
     }
 
     /// Enumerate params (via [NodeEvents::param]). Set `id` to [None] to query all param types.
@@ -191,8 +178,7 @@ impl Node {
         num: u32,
         filter: Option<ParamBuilder>,
     ) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, enum_params, seq, id, start, num, filter)
+        object_invoke!(self, enum_params, seq, id, start, num, filter)
     }
 
     /// Set a parameter on the node.
@@ -205,8 +191,7 @@ impl Node {
             dyn FnOnce(spa::pod::builder::ObjectBuilder) -> spa::pod::builder::ObjectBuilder,
         >,
     ) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, set_param, param_id, object_type, flags, builder)
+        object_invoke!(self, set_param, param_id, object_type, flags, builder)
     }
 
     /// Send a command to the node.
@@ -214,8 +199,7 @@ impl Node {
         &self,
         builder: Box<dyn FnOnce(spa::pod::builder::Builder) -> spa::pod::builder::Builder>,
     ) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, send_command, builder)
+        object_invoke!(self, send_command, builder)
     }
 
     pub(crate) fn methods(&self) -> Arc<Mutex<NodeMethods<Node>>> {
@@ -230,7 +214,7 @@ impl Node {
 impl InnerNode {
     fn new(core: &Core) -> Self {
         Self {
-            proxy: RwLock::new(None),
+            proxy: Proxy::new(core.next_proxy_id()),
             methods: Arc::new(Mutex::new(protocol::marshal::node::Methods::marshal(
                 core.connection(),
             ))),

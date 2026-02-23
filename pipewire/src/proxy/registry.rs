@@ -2,34 +2,34 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use pipewire_native_spa as spa;
 
 use crate::{
     core::Core,
-    new_refcounted, permission,
+    new_refcounted, object_invoke, permission,
     properties::Properties,
     protocol,
     proxy::{HasProxy, Proxy},
-    proxy_object_invoke, refcounted, types, HookId, Id, Refcounted,
+    refcounted, types, HookId, Id,
 };
 
 refcounted! {
     /// The registry object allows clients to enumerate and interact with objects. For more
     /// details, see the [Proxy](super::Proxy) documentation.
     pub struct Registry {
+        proxy: Proxy,
         core: Core,
-        proxy: RwLock<Option<Proxy<Registry>>>,
         methods: Arc<Mutex<RegistryMethods<Registry>>>,
         hooks: Arc<Mutex<spa::hook::HookList<RegistryEvents>>>,
     }
 }
 
 #[allow(clippy::type_complexity)]
-pub(crate) struct RegistryMethods<T: HasProxy + Refcounted> {
-    pub bind: Box<dyn FnMut(&Proxy<T>, Id, &str, u32) -> std::io::Result<Box<dyn HasProxy>>>,
-    pub destroy: Box<dyn FnMut(&Proxy<T>, Id) -> std::io::Result<()>>,
+pub(crate) struct RegistryMethods<T> {
+    pub bind: Box<dyn FnMut(&T, Id, &str, u32) -> std::io::Result<Box<dyn HasProxy>>>,
+    pub destroy: Box<dyn FnMut(&T, Id) -> std::io::Result<()>>,
 }
 
 /// Events that might be emitted by a [Registry].
@@ -53,14 +53,8 @@ impl HasProxy for Registry {
         3
     }
 
-    fn proxy(&self) -> Proxy<Self> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Registry proxy should be initialised on creation")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
@@ -70,13 +64,7 @@ impl Registry {
             inner: new_refcounted(InnerRegistry::new(core)),
         };
 
-        let id = core.next_proxy_id();
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(Proxy::new(id, &this));
-        core.add_proxy(&this, id);
+        core.add_proxy(&this);
 
         this
     }
@@ -98,15 +86,13 @@ impl Registry {
     /// "Bind" to a given object, creating a proxy for it that can be used for method calls and
     /// event notifications.
     pub fn bind(&self, id: Id, type_: &str, version: u32) -> std::io::Result<Box<dyn HasProxy>> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, bind, id, type_, version)
+        object_invoke!(self, bind, id, type_, version)
     }
 
     /// Try to destroy the global object corresponding to this proxy. This may fail if the client
     /// does not have sufficient permissions.
     pub fn destroy(&self, id: Id) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, destroy, id)
+        object_invoke!(self, destroy, id)
     }
 
     pub(crate) fn methods(&self) -> Arc<Mutex<RegistryMethods<Registry>>> {
@@ -121,8 +107,8 @@ impl Registry {
 impl InnerRegistry {
     fn new(core: &Core) -> Self {
         Self {
+            proxy: Proxy::new(core.next_proxy_id()),
             core: core.clone(),
-            proxy: RwLock::new(None),
             methods: Arc::new(Mutex::new(protocol::marshal::registry::Methods::marshal(
                 core.connection(),
             ))),

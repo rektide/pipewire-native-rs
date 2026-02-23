@@ -10,14 +10,14 @@ use pipewire_native_spa::{
 };
 
 use crate::{
-    closure, default_topic, log,
+    closure, default_topic, log, object_notify,
     properties::Properties,
     protocol::connection::Connection,
     proxy::{
         port::{Port, PortChangeMask, PortDirection, PortInfo, PortMethods},
-        Proxy,
+        HasProxy,
     },
-    proxy_object_notify, trace, warn, Id,
+    trace, warn, Id,
 };
 
 use super::PairList;
@@ -48,15 +48,15 @@ pub(crate) struct EnumParams {
 impl Methods {
     pub(crate) fn marshal(connection: Connection) -> PortMethods<Port> {
         PortMethods {
-            subscribe_params: closure!([connection] proxy, ids, {
+            subscribe_params: closure!([connection] port, ids, {
                 connection.push(
-                    proxy.id(),
+                    port.proxy().id(),
                     Methods::SubscribeParams(SubscribeParams {
                         ids: ids.iter().map(|id| SpaId(*id)).collect::<Vec<_>>()
                     })
                 )
             }),
-            enum_params: closure!([connection] proxy, seq, id, index, num, filter, {
+            enum_params: closure!([connection] port, seq, id, index, num, filter, {
                 let id = match id {
                     Some(id) => id as u32,
                     None => crate::ANY_ID,
@@ -89,7 +89,7 @@ impl Methods {
                 let filter = RawPodOwned::wrap(Vec::from(filter_data)).unwrap();
 
                 connection.push(
-                    proxy.id(),
+                    port.proxy().id(),
                     Methods::EnumParams(EnumParams {
                         seq: seq as i32,
                         id: SpaId(id),
@@ -131,7 +131,7 @@ impl Events {
     pub(crate) fn demarshal(
         connection: &Connection,
         header: &super::message::Header,
-        proxy: Proxy<Port>,
+        port: Port,
     ) -> std::io::Result<()> {
         let event = connection.decode_core_message::<Events>(header)?;
 
@@ -159,7 +159,7 @@ impl Events {
                     params: param_info.as_slice(),
                 };
 
-                proxy_object_notify!(proxy, info, &port_info);
+                object_notify!(port, info, &port_info);
             }
             Events::Param(param) => {
                 let seq = param.seq as u32;
@@ -167,7 +167,7 @@ impl Events {
                 let index = param.index as u32;
                 let next = param.next as u32;
                 let param_pod = param.param;
-                proxy_object_notify!(proxy, param, seq, param_id, index, next, &param_pod);
+                object_notify!(port, param, seq, param_id, index, next, &param_pod);
             }
         }
 

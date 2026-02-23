@@ -6,13 +6,13 @@ use pipewire_native_macros as macros;
 use pipewire_native_spa::{self as spa, pod::Pod};
 
 use crate::{
-    closure, default_topic, log,
+    closure, default_topic, log, object_notify,
     protocol::connection::Connection,
     proxy::{
         metadata::{Metadata, MetadataMethods},
-        Proxy,
+        HasProxy,
     },
-    proxy_object_notify, trace, Id,
+    trace, Id,
 };
 
 default_topic!(log::topic::PROTOCOL);
@@ -40,9 +40,9 @@ pub(crate) struct Clear {
 impl Methods {
     pub(crate) fn marshal(connection: Connection) -> MetadataMethods<Metadata> {
         MetadataMethods {
-            set_property: closure!([connection] proxy, subject, key, type_, value, {
+            set_property: closure!([connection] metadata, subject, key, type_, value, {
                 connection.push(
-                    proxy.id(),
+                    metadata.proxy().id(),
                     Methods::SetProperty(SetProperty {
                         subject: subject as i32,
                         key: key.map(|s| s.to_string()),
@@ -51,9 +51,9 @@ impl Methods {
                     })
                 )
             }),
-            clear: closure!([connection] proxy, {
+            clear: closure!([connection] metadata, {
                 connection.push(
-                    proxy.id(),
+                    metadata.proxy().id(),
                     Methods::Clear(Clear{
                         empty: ()
                     }),
@@ -80,7 +80,7 @@ impl Events {
     pub(crate) fn demarshal(
         connection: &Connection,
         header: &super::message::Header,
-        proxy: Proxy<Metadata>,
+        metadata: Metadata,
     ) -> std::io::Result<()> {
         let event = connection.decode_core_message::<Events>(header)?;
 
@@ -93,7 +93,7 @@ impl Events {
                 let type_ = prop.type_.as_deref();
                 let value = prop.value.as_deref();
 
-                proxy_object_notify!(proxy, property, subject, key, type_, value)
+                object_notify!(metadata, property, subject, key, type_, value)
             }
         }
 

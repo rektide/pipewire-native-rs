@@ -2,32 +2,31 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use pipewire_native_spa as spa;
 
 use crate::{
     core::Core,
-    new_refcounted, protocol,
+    new_refcounted, object_invoke, protocol,
     proxy::{HasProxy, Proxy},
-    proxy_object_invoke, refcounted, types, HookId, Id, Refcounted,
+    refcounted, types, HookId, Id,
 };
 
 refcounted! {
     /// Proxy that represents a metadata that is connected to the server.
     pub struct Metadata {
-        proxy: RwLock<Option<Proxy<Metadata>>>,
+        proxy: Proxy,
         methods: Arc<Mutex<MetadataMethods<Metadata>>>,
         hooks: Arc<Mutex<spa::hook::HookList<MetadataEvents>>>,
     }
 }
 
 #[allow(clippy::type_complexity)]
-pub(crate) struct MetadataMethods<T: HasProxy + Refcounted> {
-    pub(crate) set_property: Box<
-        dyn FnMut(&Proxy<T>, Id, Option<&str>, Option<&str>, Option<&str>) -> std::io::Result<()>,
-    >,
-    pub(crate) clear: Box<dyn FnMut(&Proxy<T>) -> std::io::Result<()>>,
+pub(crate) struct MetadataMethods<T> {
+    pub(crate) set_property:
+        Box<dyn FnMut(&T, Id, Option<&str>, Option<&str>, Option<&str>) -> std::io::Result<()>>,
+    pub(crate) clear: Box<dyn FnMut(&T) -> std::io::Result<()>>,
 }
 
 /// Metadata events that can be subscribed to.
@@ -47,14 +46,8 @@ impl HasProxy for Metadata {
         3
     }
 
-    fn proxy(&self) -> Proxy<Self> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Metadata proxy should be initialised on creation")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
@@ -64,13 +57,7 @@ impl Metadata {
             inner: new_refcounted(InnerMetadata::new(core)),
         };
 
-        let id = core.next_proxy_id();
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(Proxy::new(id, &this));
-        core.add_proxy(&this, id);
+        core.add_proxy(&this);
 
         this
     }
@@ -95,14 +82,12 @@ impl Metadata {
         type_: Option<&str>,
         value: Option<&str>,
     ) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, set_property, subject, key, type_, value)
+        object_invoke!(self, set_property, subject, key, type_, value)
     }
 
     /// Clear all metadata.
     pub fn clear(&self) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, clear)
+        object_invoke!(self, clear)
     }
 
     pub(crate) fn methods(&self) -> Arc<Mutex<MetadataMethods<Metadata>>> {
@@ -117,7 +102,7 @@ impl Metadata {
 impl InnerMetadata {
     fn new(core: &Core) -> Self {
         Self {
-            proxy: RwLock::new(None),
+            proxy: Proxy::new(core.next_proxy_id()),
             methods: Arc::new(Mutex::new(protocol::marshal::metadata::Methods::marshal(
                 core.connection(),
             ))),

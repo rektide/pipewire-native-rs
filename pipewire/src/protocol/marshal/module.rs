@@ -6,14 +6,11 @@ use pipewire_native_macros as macros;
 use pipewire_native_spa::{self as spa, pod::Pod};
 
 use crate::{
-    default_topic, log,
+    default_topic, log, object_notify,
     properties::Properties,
     protocol::connection::Connection,
-    proxy::{
-        module::{Module, ModuleChangeMask, ModuleInfo},
-        Proxy,
-    },
-    proxy_object_notify, trace, Id,
+    proxy::module::{Module, ModuleChangeMask, ModuleInfo},
+    trace, Id,
 };
 
 use super::PairList;
@@ -41,7 +38,7 @@ impl Events {
     pub(crate) fn demarshal(
         connection: &Connection,
         header: &super::message::Header,
-        proxy: Proxy<Module>,
+        module: Module,
     ) -> std::io::Result<()> {
         let event = connection.decode_core_message::<Events>(header)?;
 
@@ -60,7 +57,7 @@ impl Events {
                     props: &props,
                 };
 
-                proxy_object_notify!(proxy, info, &module_info);
+                object_notify!(module, info, &module_info);
             }
         }
 

@@ -4,7 +4,7 @@
 
 use std::{
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
 };
 
 use pipewire_native_spa::{self as spa, pod::types::Fraction};
@@ -21,7 +21,7 @@ use crate::{
 refcounted! {
     /// Proxy that represents a profiler that is connected to the server.
     pub struct Profiler {
-        proxy: RwLock<Option<Proxy<Profiler>>>,
+        proxy: Proxy,
         hooks: Arc<Mutex<spa::hook::HookList<ProfilerEvents>>>,
     }
 }
@@ -182,30 +182,18 @@ impl HasProxy for Profiler {
         3
     }
 
-    fn proxy(&self) -> Proxy<Self> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Profiler proxy should be initialised on creation")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
 impl Profiler {
     pub(crate) fn new(core: &Core) -> Self {
         let this = Self {
-            inner: new_refcounted(InnerProfiler::new()),
+            inner: new_refcounted(InnerProfiler::new(core)),
         };
 
-        let id = core.next_proxy_id();
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(Proxy::new(id, &this));
-        core.add_proxy(&this, id);
+        core.add_proxy(&this);
 
         this
     }
@@ -226,9 +214,9 @@ impl Profiler {
 }
 
 impl InnerProfiler {
-    fn new() -> Self {
+    fn new(core: &Core) -> Self {
         Self {
-            proxy: RwLock::new(None),
+            proxy: Proxy::new(core.next_proxy_id()),
             hooks: spa::hook::HookList::new(),
         }
     }

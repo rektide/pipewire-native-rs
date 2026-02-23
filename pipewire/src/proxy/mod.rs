@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use pipewire_native_spa as spa;
 
 use crate::HookId;
-use crate::{new_refcounted, properties::Properties, refcounted, Refcounted};
+use crate::{properties::Properties, Refcounted};
 
 use crate::{types::ObjectType, Id};
 
@@ -33,43 +33,35 @@ pub mod profiler;
 /// A proxy representing the registry.
 pub mod registry;
 
-refcounted! {
-    /// Proxies are a central concept to how clients interact with a PipeWire server. The server
-    /// has a list of objects (either instantiated locally, or by other clients). A number of these
-    /// objects are exported to other clients to enumerate, interact with (call _methods_ on) and
-    /// be notified when they change (via _events_).
-    ///
-    /// Clients discover exported objects using a [Registry](registry::Registry) (itself also a
-    /// proxy), which can be created using [Core::registry()](super::core::Core::registry()). The
-    /// [RegistryEvents::global](registry::RegistryEvents::global) event is triggered for each
-    /// existing exported object (and subsequenty when new objects are created).
-    ///
-    /// If an object is of interest, clients can "bind" to that object using
-    /// [Registry::bind()](registry::Registry::bind()). This provides an object on which methods
-    /// may be called, and  event notifications may be received.
-    ///
-    /// The object itself will be a specific type (such as [Client](client::Client), but will also
-    /// have an associated [Proxy\<T\>](Proxy) type (in this example, [Proxy\<Client\>](Proxy)).
-    /// The specific type provides methods and events that are specific to the object itself. In
-    /// addition, the [Proxy\<T\>](Proxy) type provides more general proxy-related methods and
-    /// events.
-    ///
-    /// Specific types implement the [HasProxy] trait, which allows maintaining a generic
-    /// collection of these objects, while having the ability to downcast to the specific type. The
-    /// [HasProxy::proxy()] method can be used to get the corresponding [Proxy] object.
-    ///
-    /// Note that there are two IDs associated with a proxy. One is a "local" ID, which represents
-    /// the client's view of the object. The other is a "global" ID, which is the server's view of
-    /// the object. Due to the asynchronous nature of the protocol, it is possible that the client
-    /// has a view of server objects that is not current. Global IDs might be reused, and this
-    /// mechanism allows the server to keep track of what each client's view of the server state is
-    /// and avoid calling methods on objects that have gone away.
-    pub struct Proxy<T: HasProxy + Refcounted> {
-        object: T::WeakRef,
-        id: Id,
-        bound_id: RwLock<Option<Id>>,
-        hooks: Arc<Mutex<spa::hook::HookList<ProxyEvents>>>,
-    }
+/// Proxies are a central concept to how clients interact with a PipeWire server. The server has a
+/// list of objects (either instantiated locally, or by other clients). A number of these objects
+/// are exported to other clients to enumerate, interact with (call _methods_ on) and be notified
+/// when they change (via _events_).
+///
+/// Clients discover exported objects using a [Registry](registry::Registry) (itself also a proxy),
+/// which can be created using [Core::registry()](super::core::Core::registry()). The
+/// [RegistryEvents::global](registry::RegistryEvents::global) event is triggered for each existing
+/// exported object (and subsequenty when new objects are created).
+///
+/// If an object is of interest, clients can "bind" to that object using
+/// [Registry::bind()](registry::Registry::bind()). This provides an object on which methods may be
+/// called, and  event notifications may be received.
+///
+/// The object itself will be a specific type (such as [Client](client::Client), but will also have
+/// a [HasProxy] implementation, which allows maintaining a generic collection of these objects,
+/// while having the ability to downcast to the specific type. The [HasProxy::proxy()]
+/// method can be used to get the corresponding [Proxy] object.
+///
+/// Note that there are two IDs associated with a proxy. One is a "local" ID, which represents the
+/// client's view of the object. The other is a "global" ID, which is the server's view of the
+/// object. Due to the asynchronous nature of the protocol, it is possible that the client has a
+/// view of server objects that is not current. Global IDs might be reused, and this mechanism
+/// allows the server to keep track of what each client's view of the server state is and avoid
+/// calling methods on objects that have gone away.
+pub struct Proxy {
+    id: Id,
+    bound_id: RwLock<Option<Id>>,
+    hooks: Arc<Mutex<spa::hook::HookList<ProxyEvents>>>,
 }
 
 /// Events that might be emitted by a proxy.
@@ -91,67 +83,53 @@ pub struct ProxyEvents {
     pub bound_props: Option<Box<dyn FnMut(u32, &Properties) + Send>>,
 }
 
-impl<T: HasProxy + Refcounted> Proxy<T> {
-    pub(crate) fn new(id: Id, object: &T) -> Self {
+impl Proxy {
+    /// Create a new unbound proxy.
+    pub fn new(id: Id) -> Self {
         Self {
-            inner: new_refcounted(InnerProxy::<T>::new(id, object.downgrade())),
-        }
-    }
-
-    /// The "local" ID for this object.
-    pub fn id(&self) -> Id {
-        self.inner.id
-    }
-
-    /// Retrieves the specific object corresponding to this [Proxy]. Because the proxy holds a weak
-    /// reference to the object, the returned value is an [Option].
-    pub fn object(&self) -> Option<T> {
-        Refcounted::upgrade(&self.inner.object)
-    }
-
-    /// The "global" ID for this object.
-    pub fn bound_id(&self) -> Option<Id> {
-        *self.inner.bound_id.read().unwrap()
-    }
-
-    pub(crate) fn set_bound_id(&self, id: Id) {
-        *self.inner.bound_id.write().unwrap() = Some(id);
-        spa::emit_hook!(self.inner.hooks, bound, id);
-    }
-
-    pub(crate) fn set_bound_props(&self, id: Id, props: &Properties) {
-        *self.inner.bound_id.write().unwrap() = Some(id);
-        spa::emit_hook!(self.inner.hooks, bound_props, id, props);
-    }
-
-    /// Register a listener for proxy events.
-    pub fn add_listener(&self, events: ProxyEvents) -> HookId {
-        self.inner.hooks.lock().unwrap().append(events)
-    }
-
-    /// Remove a set of event listeners.
-    pub fn remove_listener(&self, hook_id: HookId) {
-        self.inner.hooks.lock().unwrap().remove(hook_id);
-    }
-
-    pub(crate) fn events(&self) -> Arc<Mutex<spa::hook::HookList<ProxyEvents>>> {
-        self.inner.hooks.clone()
-    }
-}
-
-impl<T: HasProxy + Refcounted> InnerProxy<T> {
-    fn new(id: Id, object: T::WeakRef) -> Self {
-        Self {
-            object,
             id,
             bound_id: RwLock::new(None),
             hooks: spa::hook::HookList::new(),
         }
     }
+
+    /// The "local" ID for this object.
+    pub fn id(&self) -> Id {
+        self.id
+    }
+
+    /// The "global" ID for this object.
+    pub fn bound_id(&self) -> Option<Id> {
+        *self.bound_id.read().unwrap()
+    }
+
+    pub(crate) fn set_bound_id(&self, id: Id) {
+        *self.bound_id.write().unwrap() = Some(id);
+        spa::emit_hook!(self.hooks, bound, id);
+    }
+
+    pub(crate) fn set_bound_props(&self, id: Id, props: &Properties) {
+        *self.bound_id.write().unwrap() = Some(id);
+        spa::emit_hook!(self.hooks, bound_props, id, props);
+    }
+
+    /// Register a listener for proxy events.
+    pub fn add_listener(&self, events: ProxyEvents) -> HookId {
+        self.hooks.lock().unwrap().append(events)
+    }
+
+    /// Remove a set of event listeners.
+    pub fn remove_listener(&self, hook_id: HookId) {
+        self.hooks.lock().unwrap().remove(hook_id);
+    }
+
+    pub(crate) fn events(&self) -> Arc<Mutex<spa::hook::HookList<ProxyEvents>>> {
+        self.hooks.clone()
+    }
 }
 
-/// This trait is implemented by all specific types of proxies. See the [Proxy] documentation for
-/// more details.
+/// This trait is implemented by all types of proxies. See the [Proxy] documentation for more
+/// details.
 pub trait HasProxy: Any + Send + Sync {
     // See the invoke! and notify! macros below
     // type Methods;
@@ -163,8 +141,8 @@ pub trait HasProxy: Any + Send + Sync {
     /// The interface version of the proxy object.
     fn version(&self) -> u32;
 
-    /// Get a [Proxy\<T\>](Proxy) for this object.
-    fn proxy(&self) -> Proxy<Self>
+    /// Get a [Proxy] for this object.
+    fn proxy(&self) -> &Proxy
     where
         Self: Refcounted;
 }
@@ -176,7 +154,7 @@ impl dyn HasProxy {
     }
 
     /// Downcast from a `dyn HasProxy` to the corresponding [Proxy] type.
-    pub fn downcast_proxy<T: HasProxy + Refcounted>(&self) -> Option<Proxy<T>> {
+    pub fn downcast_proxy<T: HasProxy + Refcounted>(&self) -> Option<&Proxy> {
         (self as &dyn Any).downcast_ref::<T>().map(|o| o.proxy())
     }
 }
@@ -192,19 +170,17 @@ impl dyn HasProxy {
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! proxy_object_invoke {
-    ($proxy:ident, $method:ident $(, $($args:tt)*)?) => {
-        ($proxy.object().unwrap().methods().lock().unwrap().$method)(&$proxy $(, $($args)*)?)
+macro_rules! object_invoke {
+    ($object:ident, $method:ident $(, $($args:tt)*)?) => {
+        ($object.methods().lock().unwrap().$method)(&$object $(, $($args)*)?)
     };
 }
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! proxy_object_notify {
-    ($proxy:ident, $event:ident $(, $($args:tt)*)?) => {
-        if let Some(_object) = $proxy.object() {
-            spa::emit_hook!(_object.events(), $event $(, $($args)*)?);
-        }
+macro_rules! object_notify {
+    ($object:ident, $event:ident $(, $($args:tt)*)?) => {
+        spa::emit_hook!($object.events(), $event $(, $($args)*)?)
     };
 }
 
@@ -276,14 +252,6 @@ macro_rules! hasproxy_method_call {
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! hasproxy_method_call_unlocked {
-    ($object:expr, $lock: ident, $method:ident $(, $($args:tt),*)?) => {
-        $crate::hasproxy_method_call_internal!($object, { drop($lock); }, $method $(, $($args),*)?)
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
 macro_rules! hasproxy_notify_internal {
     ($object:ident, $unlock:block, $event:ident $(, $($args:tt),*)?) => {
         if $object.type_() == $crate::types::interface::CORE {
@@ -341,14 +309,6 @@ macro_rules! hasproxy_notify_internal {
 macro_rules! hasproxy_notify {
     ($object:ident, $event:ident $(, $($args:tt),*)?) => {
         $crate::hasproxy_notify_internal!($object, {}, $event $(, $($args),*)?)
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! hasproxy_notify_unlocked {
-    ($object:ident, $lock:ident, $event:ident $(, $($args:tt),*)?) => {
-        $crate::hasproxy_notify_internal!($object, { drop($lock); }, $event $(, $($args),*)?)
     };
 }
 

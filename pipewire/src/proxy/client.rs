@@ -2,36 +2,36 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
 use pipewire_native_spa as spa;
 
 use crate::{
     core::Core,
-    new_refcounted, permission,
+    new_refcounted, object_invoke, permission,
     properties::Properties,
     protocol,
     proxy::{HasProxy, Proxy},
-    proxy_object_invoke, refcounted, types, HookId, Id, Refcounted,
+    refcounted, types, HookId, Id,
 };
 
 refcounted! {
     /// Proxy that represents a client that is connected to the server.
     pub struct Client {
-        proxy: RwLock<Option<Proxy<Client>>>,
+        proxy: Proxy,
         methods: Arc<Mutex<ClientMethods<Client>>>,
         hooks: Arc<Mutex<spa::hook::HookList<ClientEvents>>>,
     }
 }
 
 #[allow(clippy::type_complexity)]
-pub(crate) struct ClientMethods<T: HasProxy + Refcounted> {
-    pub(crate) error: Box<dyn FnMut(&Proxy<T>, u32, u32, &str) -> std::io::Result<()>>,
-    pub(crate) update_properties: Box<dyn FnMut(&Proxy<T>, &Properties) -> std::io::Result<()>>,
-    pub(crate) get_permissions: Box<dyn FnMut(&Proxy<T>, u32, u32) -> std::io::Result<()>>,
+pub(crate) struct ClientMethods<T> {
+    pub(crate) error: Box<dyn FnMut(&T, u32, u32, &str) -> std::io::Result<()>>,
+    pub(crate) update_properties: Box<dyn FnMut(&T, &Properties) -> std::io::Result<()>>,
+    pub(crate) get_permissions: Box<dyn FnMut(&T, u32, u32) -> std::io::Result<()>>,
     pub(crate) update_permissions:
-        Box<dyn FnMut(&Proxy<T>, &[permission::Permission]) -> std::io::Result<()>>,
+        Box<dyn FnMut(&T, &[permission::Permission]) -> std::io::Result<()>>,
 }
 
 bitflags! {
@@ -73,14 +73,8 @@ impl HasProxy for Client {
         3
     }
 
-    fn proxy(&self) -> Proxy<Self> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Client proxy should be initialised on creation")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
@@ -90,13 +84,7 @@ impl Client {
             inner: new_refcounted(InnerClient::new(core)),
         };
 
-        let id = core.next_proxy_id();
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(Proxy::new(id, &this));
-        core.add_proxy(&this, id);
+        core.add_proxy(&this);
 
         this
     }
@@ -113,14 +101,12 @@ impl Client {
 
     /// Signal an error to the client.
     pub fn error(&self, id: u32, res: u32, message: &str) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, error, id, res, message)
+        object_invoke!(self, error, id, res, message)
     }
 
     /// Retrieve permissions of a client.
     pub fn permissions(&self, index: u32, num: u32) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, get_permissions, index, num)
+        object_invoke!(self, get_permissions, index, num)
     }
 
     /// Update permissions of a client.
@@ -128,8 +114,7 @@ impl Client {
         &self,
         permissions: &[permission::Permission],
     ) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, update_permissions, permissions)
+        object_invoke!(self, update_permissions, permissions)
     }
 
     pub(crate) fn methods(&self) -> Arc<Mutex<ClientMethods<Client>>> {
@@ -144,7 +129,7 @@ impl Client {
 impl InnerClient {
     fn new(core: &Core) -> Self {
         Self {
-            proxy: RwLock::new(None),
+            proxy: Proxy::new(core.next_proxy_id()),
             methods: Arc::new(Mutex::new(protocol::marshal::client::Methods::marshal(
                 core.connection(),
             ))),

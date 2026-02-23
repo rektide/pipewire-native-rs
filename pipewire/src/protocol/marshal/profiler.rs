@@ -9,16 +9,13 @@ use pipewire_native_spa::{
 };
 
 use crate::{
-    default_topic, log,
+    default_topic, log, object_notify,
     protocol::connection::Connection,
-    proxy::{
-        profiler::{
-            ClockSample, DriverClockSample, FollowerNodeSample, NodeSample, Profiler,
-            ProfilerSample, SampleInfo,
-        },
-        Proxy,
+    proxy::profiler::{
+        ClockSample, DriverClockSample, FollowerNodeSample, NodeSample, Profiler, ProfilerSample,
+        SampleInfo,
     },
-    proxy_object_notify, trace, warn, Id,
+    trace, warn, Id,
 };
 
 default_topic!(log::topic::PROTOCOL);
@@ -133,7 +130,7 @@ impl Events {
     pub(crate) fn demarshal(
         connection: &Connection,
         header: &super::message::Header,
-        proxy: Proxy<Profiler>,
+        profiler: Profiler,
     ) -> std::io::Result<()> {
         let event = connection.decode_core_message::<Events>(header)?;
 
@@ -141,7 +138,7 @@ impl Events {
 
         match event {
             Events::Profile(profile_event) => {
-                Self::demarshal_profile_event(proxy, profile_event)?;
+                Self::demarshal_profile_event(profiler, profile_event)?;
             }
         }
 
@@ -149,7 +146,7 @@ impl Events {
     }
 
     fn demarshal_profile_event(
-        proxy: Proxy<Profiler>,
+        profiler: Profiler,
         profile_event: ProfileEvent,
     ) -> std::io::Result<()> {
         let mut profile_event_parser = Parser::new(profile_event.pod.data());
@@ -218,7 +215,7 @@ impl Events {
                         follower_clocks: &follower_clocks,
                     };
 
-                    proxy_object_notify!(proxy, profile, &profiler_sample);
+                    object_notify!(profiler, profile, &profiler_sample);
 
                     Ok(())
                 })?;

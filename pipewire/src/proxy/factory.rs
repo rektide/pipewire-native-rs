@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
 use pipewire_native_spa as spa;
@@ -18,7 +18,7 @@ use crate::{
 refcounted! {
     /// Proxy that represents a factory that is loaded on the server.
     pub struct Factory {
-        proxy: RwLock<Option<Proxy<Factory>>>,
+        proxy: Proxy,
         hooks: Arc<Mutex<spa::hook::HookList<FactoryEvents>>>,
     }
 }
@@ -66,30 +66,18 @@ impl HasProxy for Factory {
         3
     }
 
-    fn proxy(&self) -> Proxy<Self> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Factory proxy should be initialised on creation")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
 impl Factory {
     pub(crate) fn new(core: &Core) -> Self {
         let this = Self {
-            inner: new_refcounted(InnerFactory::new()),
+            inner: new_refcounted(InnerFactory::new(core)),
         };
 
-        let id = core.next_proxy_id();
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(Proxy::new(id, &this));
-        core.add_proxy(&this, id);
+        core.add_proxy(&this);
 
         this
     }
@@ -110,9 +98,9 @@ impl Factory {
 }
 
 impl InnerFactory {
-    fn new() -> Self {
+    fn new(core: &Core) -> Self {
         Self {
-            proxy: RwLock::new(None),
+            proxy: Proxy::new(core.next_proxy_id()),
             hooks: spa::hook::HookList::new(),
         }
     }

@@ -2,38 +2,38 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
 use pipewire_native_spa as spa;
 
 use crate::{
     core::Core,
-    new_refcounted,
+    new_refcounted, object_invoke,
     properties::Properties,
     protocol,
     proxy::{HasProxy, Proxy},
-    proxy_object_invoke, refcounted,
+    refcounted,
     types::{self, params::ParamBuilder},
-    HookId, Id, Refcounted,
+    HookId, Id,
 };
 
 refcounted! {
     /// Proxy that represents a device that is connected to the server.
     pub struct Device {
-        proxy: RwLock<Option<Proxy<Device>>>,
+        proxy: Proxy,
         methods: Arc<Mutex<DeviceMethods<Device>>>,
         hooks: Arc<Mutex<spa::hook::HookList<DeviceEvents>>>,
     }
 }
 
 #[allow(clippy::type_complexity)]
-pub(crate) struct DeviceMethods<T: HasProxy + Refcounted> {
+pub(crate) struct DeviceMethods<T> {
     pub(crate) subscribe_params:
-        Box<dyn FnMut(&Proxy<T>, &[spa::param::ParamType]) -> std::io::Result<()>>,
+        Box<dyn FnMut(&T, &[spa::param::ParamType]) -> std::io::Result<()>>,
     pub(crate) enum_params: Box<
         dyn FnMut(
-            &Proxy<T>,
+            &T,
             u32,
             Option<spa::param::ParamType>,
             u32,
@@ -43,7 +43,7 @@ pub(crate) struct DeviceMethods<T: HasProxy + Refcounted> {
     >,
     pub(crate) set_param: Box<
         dyn FnMut(
-            &Proxy<T>,
+            &T,
             spa::param::ParamType,
             spa::pod::types::ObjectType,
             u32,
@@ -97,14 +97,8 @@ impl HasProxy for Device {
         3
     }
 
-    fn proxy(&self) -> Proxy<Self> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Device proxy should be initialised on creation")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
@@ -114,13 +108,7 @@ impl Device {
             inner: new_refcounted(InnerDevice::new(core)),
         };
 
-        let id = core.next_proxy_id();
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(Proxy::new(id, &this));
-        core.add_proxy(&this, id);
+        core.add_proxy(&this);
 
         this
     }
@@ -137,8 +125,7 @@ impl Device {
 
     /// Register for notifications of the specified param types.
     pub fn subscribe_params(&self, ids: &[spa::param::ParamType]) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, subscribe_params, ids)
+        object_invoke!(self, subscribe_params, ids)
     }
 
     /// Enumerate params (via [DeviceEvents::param]). Set `id` to [None] to query all param types.
@@ -150,8 +137,7 @@ impl Device {
         num: u32,
         filter: Option<ParamBuilder>,
     ) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, enum_params, seq, id, start, num, filter)
+        object_invoke!(self, enum_params, seq, id, start, num, filter)
     }
 
     /// Set a parameter on the device.
@@ -164,8 +150,7 @@ impl Device {
             dyn FnOnce(spa::pod::builder::ObjectBuilder) -> spa::pod::builder::ObjectBuilder,
         >,
     ) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, set_param, param_id, object_type, flags, builder)
+        object_invoke!(self, set_param, param_id, object_type, flags, builder)
     }
 
     pub(crate) fn methods(&self) -> Arc<Mutex<DeviceMethods<Device>>> {
@@ -180,7 +165,7 @@ impl Device {
 impl InnerDevice {
     fn new(core: &Core) -> Self {
         Self {
-            proxy: RwLock::new(None),
+            proxy: Proxy::new(core.next_proxy_id()),
             methods: Arc::new(Mutex::new(protocol::marshal::device::Methods::marshal(
                 core.connection(),
             ))),

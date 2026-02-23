@@ -10,14 +10,14 @@ use pipewire_native_spa::{
 };
 
 use crate::{
-    closure, default_topic, log,
+    closure, default_topic, log, object_notify,
     properties::Properties,
     protocol::connection::Connection,
     proxy::{
         node::{Node, NodeChangeMask, NodeInfo, NodeMethods, NodeState},
-        Proxy,
+        HasProxy,
     },
-    proxy_object_notify, trace, warn, Id,
+    trace, warn, Id,
 };
 
 use super::PairList;
@@ -62,15 +62,15 @@ pub(crate) struct SendCommand {
 impl Methods {
     pub(crate) fn marshal(connection: Connection) -> NodeMethods<Node> {
         NodeMethods {
-            subscribe_params: closure!([connection] proxy, ids, {
+            subscribe_params: closure!([connection] node, ids, {
                 connection.push(
-                    proxy.id(),
+                    node.proxy().id(),
                     Methods::SubscribeParams(SubscribeParams {
                         ids: ids.iter().map(|id| SpaId(*id)).collect::<Vec<_>>()
                     })
                 )
             }),
-            enum_params: closure!([connection] proxy, seq, id, index, num, filter, {
+            enum_params: closure!([connection] node, seq, id, index, num, filter, {
                 let id = match id {
                     Some(id) => id as u32,
                     None => crate::ANY_ID,
@@ -103,7 +103,7 @@ impl Methods {
                 let filter = RawPodOwned::wrap(Vec::from(filter_data)).unwrap();
 
                 connection.push(
-                    proxy.id(),
+                    node.proxy().id(),
                     Methods::EnumParams(EnumParams {
                         seq: seq as i32,
                         id: SpaId(id),
@@ -113,7 +113,7 @@ impl Methods {
                     })
                 )
             }),
-            set_param: closure!([connection] proxy, param_id, object_type, flags, param_builder, {
+            set_param: closure!([connection] node, param_id, object_type, flags, param_builder, {
                 let mut param_data = [0u8; 16384];
 
                 let builder = Builder::new(param_data.as_mut_slice());
@@ -134,7 +134,7 @@ impl Methods {
                 let param = RawPodOwned::wrap(Vec::from(param_data)).unwrap();
 
                 connection.push(
-                    proxy.id(),
+                    node.proxy().id(),
                     Methods::SetParam(SetParam {
                         id: SpaId(param_id),
                         flags: flags as i32,
@@ -142,7 +142,7 @@ impl Methods {
                     })
                 )
             }),
-            send_command: closure!([connection] proxy, command_builder, {
+            send_command: closure!([connection] node, command_builder, {
                 let mut command_data = [0u8; 16384];
 
                 let builder = Builder::new(command_data.as_mut_slice());
@@ -157,7 +157,7 @@ impl Methods {
                 let command = RawPodOwned::wrap(Vec::from(command_built)).unwrap();
 
                 connection.push(
-                    proxy.id(),
+                    node.proxy().id(),
                     Methods::SendCommand(SendCommand { command })
                 )
             }),
@@ -198,7 +198,7 @@ impl Events {
     pub(crate) fn demarshal(
         connection: &Connection,
         header: &super::message::Header,
-        proxy: Proxy<Node>,
+        node: Node,
     ) -> std::io::Result<()> {
         let event = connection.decode_core_message::<Events>(header)?;
 
@@ -231,7 +231,7 @@ impl Events {
                     params: param_info.as_slice(),
                 };
 
-                proxy_object_notify!(proxy, info, &node_info);
+                object_notify!(node, info, &node_info);
             }
             Events::Param(param) => {
                 let seq = param.seq as u32;
@@ -239,7 +239,7 @@ impl Events {
                 let index = param.index as u32;
                 let next = param.next as u32;
                 let param_pod = param.param;
-                proxy_object_notify!(proxy, param, seq, param_id, index, next, &param_pod);
+                object_notify!(node, param, seq, param_id, index, next, &param_pod);
             }
         }
 

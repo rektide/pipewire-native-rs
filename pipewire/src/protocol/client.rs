@@ -231,67 +231,77 @@ impl Client {
 
         match object_type {
             types::interface::CORE => {
-                let proxy = core.find_proxy::<Core>(header.id).unwrap();
-                super::marshal::core::Events::demarshal(&self.inner.connection, &header, proxy)?;
+                let core = core.find_object::<Core>(header.id).unwrap();
+                super::marshal::core::Events::demarshal(&self.inner.connection, &header, core)?;
             }
             types::interface::CLIENT => {
-                let proxy = core.find_proxy::<proxy::client::Client>(header.id).unwrap();
-                super::marshal::client::Events::demarshal(&self.inner.connection, &header, proxy)?;
+                let client = core
+                    .find_object::<proxy::client::Client>(header.id)
+                    .unwrap();
+                super::marshal::client::Events::demarshal(&self.inner.connection, &header, client)?;
             }
             types::interface::DEVICE => {
-                let proxy = core.find_proxy::<proxy::device::Device>(header.id).unwrap();
-                super::marshal::device::Events::demarshal(&self.inner.connection, &header, proxy)?;
+                let device = core
+                    .find_object::<proxy::device::Device>(header.id)
+                    .unwrap();
+                super::marshal::device::Events::demarshal(&self.inner.connection, &header, device)?;
             }
             types::interface::FACTORY => {
-                let proxy = core
-                    .find_proxy::<proxy::factory::Factory>(header.id)
+                let factory = core
+                    .find_object::<proxy::factory::Factory>(header.id)
                     .unwrap();
-                super::marshal::factory::Events::demarshal(&self.inner.connection, &header, proxy)?;
+                super::marshal::factory::Events::demarshal(
+                    &self.inner.connection,
+                    &header,
+                    factory,
+                )?;
             }
             types::interface::LINK => {
-                let proxy = core.find_proxy::<proxy::link::Link>(header.id).unwrap();
-                super::marshal::link::Events::demarshal(&self.inner.connection, &header, proxy)?;
+                let link = core.find_object::<proxy::link::Link>(header.id).unwrap();
+                super::marshal::link::Events::demarshal(&self.inner.connection, &header, link)?;
             }
             types::interface::METADATA => {
-                let proxy = core
-                    .find_proxy::<proxy::metadata::Metadata>(header.id)
+                let metadata = core
+                    .find_object::<proxy::metadata::Metadata>(header.id)
                     .unwrap();
                 super::marshal::metadata::Events::demarshal(
                     &self.inner.connection,
                     &header,
-                    proxy,
+                    metadata,
                 )?;
             }
             types::interface::MODULE => {
-                let proxy = core.find_proxy::<proxy::module::Module>(header.id).unwrap();
-                super::marshal::module::Events::demarshal(&self.inner.connection, &header, proxy)?;
+                let module = core
+                    .find_object::<proxy::module::Module>(header.id)
+                    .unwrap();
+                super::marshal::module::Events::demarshal(&self.inner.connection, &header, module)?;
             }
             types::interface::NODE => {
-                let proxy = core.find_proxy::<proxy::node::Node>(header.id).unwrap();
-                super::marshal::node::Events::demarshal(&self.inner.connection, &header, proxy)?;
+                let node = core.find_object::<proxy::node::Node>(header.id).unwrap();
+                super::marshal::node::Events::demarshal(&self.inner.connection, &header, node)?;
             }
             types::interface::PORT => {
-                let proxy = core.find_proxy::<proxy::port::Port>(header.id).unwrap();
-                super::marshal::port::Events::demarshal(&self.inner.connection, &header, proxy)?;
+                let port = core.find_object::<proxy::port::Port>(header.id).unwrap();
+                super::marshal::port::Events::demarshal(&self.inner.connection, &header, port)?;
             }
             types::interface::PROFILER => {
-                let proxy = core
-                    .find_proxy::<proxy::profiler::Profiler>(header.id)
+                let profiler = core
+                    .find_object::<proxy::profiler::Profiler>(header.id)
                     .unwrap();
                 super::marshal::profiler::Events::demarshal(
                     &self.inner.connection,
                     &header,
-                    proxy,
+                    profiler,
                 )?;
             }
             types::interface::REGISTRY => {
-                let proxy = core
-                    .find_proxy::<proxy::registry::Registry>(header.id)
+                let registry = core
+                    .find_object::<proxy::registry::Registry>(header.id)
                     .unwrap();
                 super::marshal::registry::Events::demarshal(
                     &self.inner.connection,
                     &header,
-                    proxy,
+                    registry,
                 )?;
             }
             _ => unreachable!(),

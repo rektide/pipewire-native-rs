@@ -8,11 +8,11 @@ use pipewire_native_spa::{self as spa, pod::Pod};
 use crate::{
     closure,
     core::{Core, CoreChangeMask, CoreInfo, CoreMethods},
-    default_topic, hasproxy_method_call, log,
+    default_topic, hasproxy_method_call, log, object_notify,
     properties::Properties,
     protocol::{connection::Connection, ASYNC_SEQ_BIT, ASYNC_SEQ_MASK},
-    proxy::{self, HasProxy, Proxy},
-    proxy_object_notify, trace, Id,
+    proxy::{self, HasProxy},
+    trace, Id,
 };
 
 use super::PairList;
@@ -79,18 +79,18 @@ pub(crate) struct Destroy {
 impl Methods {
     pub(crate) fn marshal(connection: Connection) -> CoreMethods<Core> {
         CoreMethods {
-            hello: closure!([connection] proxy, version, {
+            hello: closure!([connection] core, version, {
                 connection.push(
-                    proxy.id(),
+                    core.proxy().id(),
                     Methods::Hello(Hello {
                         version: version as i32,
                     }),
                 )
             }),
-            sync: closure!([connection] proxy, id, {
+            sync: closure!([connection] core, id, {
                 let seq = ASYNC_SEQ_BIT | (connection.next_seq() & ASYNC_SEQ_MASK);
                 connection.push(
-                    proxy.id(),
+                    core.proxy().id(),
                     Methods::Sync(Sync {
                         id: id as i32,
                         seq: seq as i32,
@@ -98,32 +98,31 @@ impl Methods {
                 )?;
                 Ok(seq)
             }),
-            pong: closure!([connection] proxy, id, seq, {
+            pong: closure!([connection] core, id, seq, {
                 connection.push(
-                    proxy.id(),
+                    core.proxy().id(),
                     Methods::Pong(Pong {
                         id: id as i32,
                         seq: seq as i32,
                     }),
                 )
             }),
-            error: closure!([connection] proxy, seq, res, message, {
+            error: closure!([connection] core, seq, res, message, {
                 connection.push(
-                    proxy.id(),
+                    core.proxy().id(),
                     Methods::Error(ErrorMethod {
-                        id: proxy.id() as i32,
+                        id: core.proxy().id() as i32,
                         seq: seq as i32,
                         res: res as i32,
                         message: message.to_string(),
                     }),
                 )
             }),
-            get_registry: closure!([connection] proxy, {
-                let core = proxy.object().unwrap();
-                let registry = proxy::registry::Registry::new(&core);
+            get_registry: closure!([connection] core, {
+                let registry = proxy::registry::Registry::new(core);
 
                 connection.push(
-                    proxy.id(),
+                    core.proxy().id(),
                     Methods::GetRegistry(GetRegistry {
                         version: registry.version() as i32,
                         new_id: registry.proxy().id() as i32,
@@ -132,12 +131,11 @@ impl Methods {
 
                 Ok(registry)
             }),
-            create_object: closure!([connection] proxy, factory_name, type_, version, props, {
-                let core = proxy.object().unwrap();
+            create_object: closure!([connection] core, factory_name, type_, version, props, {
                 let new_object = core.new_object(type_)?;
 
                 connection.push(
-                    proxy.id(),
+                    core.proxy().id(),
                     Methods::CreateObject(CreateObject {
                         factory_name: factory_name.to_string(),
                         type_: type_.to_string(),
@@ -154,9 +152,9 @@ impl Methods {
 
                 Ok(new_object)
             }),
-            destroy: closure!([connection] proxy, object, {
+            destroy: closure!([connection] core, object, {
                 connection.push(
-                    proxy.id(),
+                    core.proxy().id(),
                     Methods::Destroy(Destroy {
                         id: hasproxy_method_call!(object, id) as i32,
                     }),
@@ -243,7 +241,7 @@ impl Events {
     pub(crate) fn demarshal(
         connection: &Connection,
         header: &super::message::Header,
-        proxy: Proxy<Core>,
+        core: Core,
     ) -> std::io::Result<()> {
         let event = connection.decode_core_message::<Events>(header)?;
 
@@ -264,17 +262,17 @@ impl Events {
                     props: Some(&props),
                 };
 
-                proxy_object_notify!(proxy, info, &core_info);
+                object_notify!(core, info, &core_info);
             }
             Events::Done(done) => {
-                proxy_object_notify!(proxy, done, done.id as Id, done.seq as u32);
+                object_notify!(core, done, done.id as Id, done.seq as u32);
             }
             Events::Ping(ping) => {
-                proxy_object_notify!(proxy, ping, ping.id as Id, ping.seq as u32);
+                object_notify!(core, ping, ping.id as Id, ping.seq as u32);
             }
             Events::Error(err) => {
-                proxy_object_notify!(
-                    proxy,
+                object_notify!(
+                    core,
                     error,
                     err.id as Id,
                     err.seq as u32,
@@ -283,10 +281,10 @@ impl Events {
                 );
             }
             Events::RemoveId(rem) => {
-                proxy_object_notify!(proxy, remove_id, rem.id as Id);
+                object_notify!(core, remove_id, rem.id as Id);
             }
             Events::BoundId(bound) => {
-                proxy_object_notify!(proxy, bound_id, bound.id as Id, bound.global_id as Id);
+                object_notify!(core, bound_id, bound.id as Id, bound.global_id as Id);
             }
             Events::AddMem(_) => {
                 todo!("Core::AddMem is not yet implemented");
@@ -297,8 +295,8 @@ impl Events {
             Events::BoundProps(bound) => {
                 let props = Properties::new_vec(bound.props.data);
 
-                proxy_object_notify!(
-                    proxy,
+                object_notify!(
+                    core,
                     bound_props,
                     bound.id as Id,
                     bound.global_id as Id,

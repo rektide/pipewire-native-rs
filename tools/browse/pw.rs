@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use pipewire_native as pipewire;
+use pipewire_native::{self as pipewire, core::CoreEvents};
 use pipewire_native_spa as spa;
 
 use std::{
@@ -193,14 +193,15 @@ impl State {
 
         let pw_state = state.clone();
 
-        state.core.proxy().add_listener(ProxyEvents {
-            error: some_closure!([^(state)] _seq, res, _msg, {
-                if std::io::Error::from_raw_os_error(res as i32).kind() == std::io::ErrorKind::BrokenPipe {
-                    state.ui_quit.store(true, Ordering::Relaxed);
-                }
-            }),
-            ..Default::default()
-        });
+        state.core.add_listener(CoreEvents::new(
+                None,
+                None,
+                some_closure!([^(state)] _id, _seq, res, _msg, {
+                    if std::io::Error::from_raw_os_error(res as i32).kind() == std::io::ErrorKind::BrokenPipe {
+                        state.ui_quit.store(true, Ordering::Relaxed);
+                    }
+                }),
+        ));
 
         let registry = &pw_state.registry;
         registry.add_listener(RegistryEvents {

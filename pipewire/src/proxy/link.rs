@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
 use pipewire_native_macros as macros;
@@ -19,7 +19,7 @@ use crate::{
 refcounted! {
     /// Proxy that represents a link that is loaded on the server.
     pub struct Link {
-        proxy: RwLock<Option<Proxy<Link>>>,
+        proxy: Proxy,
         hooks: Arc<Mutex<spa::hook::HookList<LinkEvents>>>,
     }
 }
@@ -95,30 +95,18 @@ impl HasProxy for Link {
         3
     }
 
-    fn proxy(&self) -> Proxy<Self> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Link proxy should be initialised on creation")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
 impl Link {
     pub(crate) fn new(core: &Core) -> Self {
         let this = Self {
-            inner: new_refcounted(InnerLink::new()),
+            inner: new_refcounted(InnerLink::new(core)),
         };
 
-        let id = core.next_proxy_id();
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(Proxy::new(id, &this));
-        core.add_proxy(&this, id);
+        core.add_proxy(&this);
 
         this
     }
@@ -139,9 +127,9 @@ impl Link {
 }
 
 impl InnerLink {
-    fn new() -> Self {
+    fn new(core: &Core) -> Self {
         Self {
-            proxy: RwLock::new(None),
+            proxy: Proxy::new(core.next_proxy_id()),
             hooks: spa::hook::HookList::new(),
         }
     }

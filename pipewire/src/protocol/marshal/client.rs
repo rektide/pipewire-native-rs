@@ -6,15 +6,13 @@ use pipewire_native_macros as macros;
 use pipewire_native_spa::{self as spa, pod::Pod};
 
 use crate::{
-    closure, default_topic, log,
+    closure, default_topic, log, object_notify,
     permission::{self, PermissionBits},
     properties::Properties,
     protocol::connection::Connection,
-    proxy::{
-        client::{Client, ClientChangeMask, ClientInfo, ClientMethods},
-        Proxy,
-    },
-    proxy_object_notify, trace, Id,
+    proxy::client::{Client, ClientChangeMask, ClientInfo, ClientMethods},
+    proxy::HasProxy,
+    trace, Id,
 };
 
 use super::PairList;
@@ -56,9 +54,9 @@ pub(crate) struct UpdatePermissions {
 impl Methods {
     pub(crate) fn marshal(connection: Connection) -> ClientMethods<Client> {
         ClientMethods {
-            error: closure!([connection] proxy, id, res, message, {
+            error: closure!([connection] client, id, res, message, {
                 connection.push(
-                    proxy.id(),
+                    client.proxy().id(),
                     Methods::Error(Error {
                         id: id as i32,
                         res: res as i32,
@@ -66,9 +64,9 @@ impl Methods {
                     }),
                 )
             }),
-            update_properties: closure!([connection] proxy, props, {
+            update_properties: closure!([connection] client, props, {
                 connection.push(
-                    proxy.id(),
+                    client.proxy().id(),
                     Methods::UpdateProperties(UpdateProperties {
                         props: PairList::new(
                             props
@@ -79,16 +77,16 @@ impl Methods {
                     }),
                 )
             }),
-            get_permissions: closure!([connection] proxy, idx, num, {
+            get_permissions: closure!([connection] client, idx, num, {
                 connection.push(
-                    proxy.id(),
+                    client.proxy().id(),
                     Methods::GetPermissions(GetPermissions {
                         index: idx as i32,
                         num: num as i32,
                     }),
                 )
             }),
-            update_permissions: closure!([connection] proxy, permissions, {
+            update_permissions: closure!([connection] client, permissions, {
                 let permissions = PairList::new(
                     permissions
                         .iter()
@@ -97,7 +95,7 @@ impl Methods {
                 );
 
                 connection.push(
-                    proxy.id(),
+                    client.proxy().id(),
                     Methods::UpdatePermissions(UpdatePermissions { permissions }),
                 )
             }),
@@ -128,7 +126,7 @@ impl Events {
     pub(crate) fn demarshal(
         connection: &Connection,
         header: &super::message::Header,
-        proxy: Proxy<Client>,
+        client: Client,
     ) -> std::io::Result<()> {
         let event = connection.decode_core_message::<Events>(header)?;
 
@@ -144,7 +142,7 @@ impl Events {
                     props: &props,
                 };
 
-                proxy_object_notify!(proxy, info, &client_info);
+                object_notify!(client, info, &client_info);
             }
             Events::Permissions(permissions) => {
                 let perms: Vec<permission::Permission> = permissions
@@ -156,7 +154,7 @@ impl Events {
                         permissions: PermissionBits::from_bits_truncate(*p as u32),
                     })
                     .collect();
-                proxy_object_notify!(proxy, permissions, permissions.index as u32, &perms)
+                object_notify!(client, permissions, permissions.index as u32, &perms);
             }
         }
 

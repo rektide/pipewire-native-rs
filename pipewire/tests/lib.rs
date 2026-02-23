@@ -13,7 +13,7 @@ use std::{
 use pipewire_native::{
     self as pipewire, closure,
     context::Context,
-    core::Core,
+    core::{Core, CoreEvents},
     main_loop::MainLoop,
     properties::Properties,
     proxy::{
@@ -191,6 +191,8 @@ fn destroy_nodes(registry: &Registry, objects: &Objects) {
 fn test_lib() {
     let _test_context = start_pipewire();
 
+    std::env::set_var("PIPEWIRE_DEBUG", "5");
+
     pipewire::init();
 
     let objects = Objects {
@@ -209,15 +211,20 @@ fn test_lib() {
 
     let core = context.connect(None).unwrap();
 
-    core.proxy().add_listener(ProxyEvents {
-        done: some_closure!([core ^(objects)] seq, {
+    core.add_listener(CoreEvents::new(
+        None,
+        some_closure!([core ^(objects)] _id, seq, {
+            // done
             if seq == objects.seq.load(Ordering::Relaxed) {
                 create_nodes(&core, objects);
             }
         }),
-        error: some_closure!([] seq, res, msg, {
-            unreachable!("Error: {seq} {res} {msg}");
+        some_closure!([] id, seq, res, msg, {
+            // error
+            println!("Error: {id} {seq} {res} {msg}");
         }),
+    ));
+    core.proxy().add_listener(ProxyEvents {
         destroy: some_closure!([^(objects)] {
             println!("core destroyed, clearing objects");
             objects.map.write().unwrap().clear();
@@ -252,82 +259,88 @@ fn test_lib() {
 
             let object = match type_ {
                 types::interface::CLIENT => {
-                    let client = registry.bind(id, type_, version).unwrap();
-                    let proxy = client.downcast_proxy::<Client>().unwrap();
+                    let object = registry.bind(id, type_, version).unwrap();
+                    let client = object.downcast::<Client>().unwrap();
+                    let proxy = object.downcast_proxy::<Client>().unwrap();
 
                     proxy.add_listener(ProxyEvents {
-                        removed: some_closure!([proxy ^(objects)] {
-                            objects.map.write().unwrap().remove(&proxy.id());
+                        removed: some_closure!([client ^(objects)] {
+                            objects.map.write().unwrap().remove(&client.proxy().id());
                         }),
                         ..Default::default()
                     });
 
-                    client
+                    object
                 }
                 types::interface::DEVICE => {
-                    let device = registry.bind(id, type_, version).unwrap();
-                    let proxy = device.downcast_proxy::<Device>().unwrap();
+                    let object = registry.bind(id, type_, version).unwrap();
+                    let device = object.downcast::<Device>().unwrap();
+                    let proxy = object.downcast_proxy::<Device>().unwrap();
 
                     proxy.add_listener(ProxyEvents {
-                        removed: some_closure!([proxy ^(objects)] {
-                            objects.map.write().unwrap().remove(&proxy.id());
+                        removed: some_closure!([device ^(objects)] {
+                            objects.map.write().unwrap().remove(&device.proxy().id());
                         }),
                         ..Default::default()
                     });
 
-                    device
+                    object
                 }
                 types::interface::FACTORY => {
-                    let factory = registry.bind(id, type_, version).unwrap();
-                    let proxy = factory.downcast_proxy::<Factory>().unwrap();
+                    let object = registry.bind(id, type_, version).unwrap();
+                    let factory = object.downcast::<Factory>().unwrap();
+                    let proxy = object.downcast_proxy::<Factory>().unwrap();
 
                     proxy.add_listener(ProxyEvents {
-                        removed: some_closure!([proxy ^(objects)] {
-                            objects.map.write().unwrap().remove(&proxy.id());
+                        removed: some_closure!([factory ^(objects)] {
+                            objects.map.write().unwrap().remove(&factory.proxy().id());
                         }),
                         ..Default::default()
                     });
 
-                    factory
+                    object
                 }
                 types::interface::LINK => {
-                    let link = registry.bind(id, type_, version).unwrap();
-                    let proxy = link.downcast_proxy::<Link>().unwrap();
+                    let object = registry.bind(id, type_, version).unwrap();
+                    let link = object.downcast::<Link>().unwrap();
+                    let proxy = object.downcast_proxy::<Link>().unwrap();
 
                     proxy.add_listener(ProxyEvents {
-                        removed: some_closure!([proxy ^(objects)] {
-                            objects.map.write().unwrap().remove(&proxy.id());
+                        removed: some_closure!([link ^(objects)] {
+                            objects.map.write().unwrap().remove(&link.proxy().id());
                         }),
                         ..Default::default()
                     });
 
-                    link
+                    object
                 }
                 types::interface::METADATA => {
-                    let metadata = registry.bind(id, type_, version).unwrap();
-                    let proxy = metadata.downcast_proxy::<Metadata>().unwrap();
+                    let object = registry.bind(id, type_, version).unwrap();
+                    let metadata = object.downcast::<Metadata>().unwrap();
+                    let proxy = object.downcast_proxy::<Metadata>().unwrap();
 
                     proxy.add_listener(ProxyEvents {
-                        removed: some_closure!([proxy ^(objects)] {
-                            objects.map.write().unwrap().remove(&proxy.id());
+                        removed: some_closure!([metadata ^(objects)] {
+                            objects.map.write().unwrap().remove(&metadata.proxy().id());
                         }),
                         ..Default::default()
                     });
 
-                    metadata
+                    object
                 }
                 types::interface::MODULE => {
-                    let module = registry.bind(id, type_, version).unwrap();
-                    let proxy = module.downcast_proxy::<Module>().unwrap();
+                    let object = registry.bind(id, type_, version).unwrap();
+                    let module = object.downcast::<Module>().unwrap();
+                    let proxy = object.downcast_proxy::<Module>().unwrap();
 
                     proxy.add_listener(ProxyEvents {
-                        removed: some_closure!([proxy ^(objects)] {
-                            objects.map.write().unwrap().remove(&proxy.id());
+                        removed: some_closure!([module ^(objects)] {
+                            objects.map.write().unwrap().remove(&module.proxy().id());
                         }),
                         ..Default::default()
                     });
 
-                    module
+                    object
                 }
                 types::interface::NODE => {
                     match props.get("node.name") {
@@ -337,30 +350,32 @@ fn test_lib() {
                         _ => (),
                     };
 
-                    let node = registry.bind(id, type_, version).unwrap();
-                    let proxy = node.downcast_proxy::<Node>().unwrap();
+                    let object = registry.bind(id, type_, version).unwrap();
+                    let node = object.downcast::<Node>().unwrap();
+                    let proxy = object.downcast_proxy::<Node>().unwrap();
 
                     proxy.add_listener(ProxyEvents {
-                        removed: some_closure!([proxy ^(objects)] {
-                            objects.map.write().unwrap().remove(&proxy.id());
+                        removed: some_closure!([node ^(objects)] {
+                            objects.map.write().unwrap().remove(&node.proxy().id());
                         }),
                         ..Default::default()
                     });
 
-                    node
+                    object
                 }
                 types::interface::PORT => {
-                    let port = registry.bind(id, type_, version).unwrap();
-                    let proxy = port.downcast_proxy::<Port>().unwrap();
+                    let object = registry.bind(id, type_, version).unwrap();
+                    let port = object.downcast::<Port>().unwrap();
+                    let proxy = object.downcast_proxy::<Port>().unwrap();
 
                     proxy.add_listener(ProxyEvents {
-                        removed: some_closure!([proxy ^(objects)] {
-                            objects.map.write().unwrap().remove(&proxy.id());
+                        removed: some_closure!([port ^(objects)] {
+                            objects.map.write().unwrap().remove(&port.proxy().id());
                         }),
                         ..Default::default()
                     });
 
-                    port
+                    object
                 }
                 _ => return,
             };

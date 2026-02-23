@@ -6,15 +6,15 @@ use pipewire_native_macros as macros;
 use pipewire_native_spa::{self as spa, pod::Pod};
 
 use crate::{
-    closure, default_topic, hasproxy_method_call, log,
+    closure, default_topic, hasproxy_method_call, log, object_notify,
     permission::PermissionBits,
     properties::Properties,
     protocol::connection::Connection,
     proxy::{
         registry::{Registry, RegistryMethods},
-        Proxy,
+        HasProxy,
     },
-    proxy_object_notify, trace, Id,
+    trace, Id,
 };
 
 use super::PairList;
@@ -44,14 +44,13 @@ pub(crate) struct Destroy {
 impl Methods {
     pub(crate) fn marshal(connection: Connection) -> RegistryMethods<Registry> {
         RegistryMethods {
-            bind: closure!([connection] proxy, id, type_, version, {
-                let registry = proxy.object().unwrap();
+            bind: closure!([connection] registry, id, type_, version, {
                 let core = registry.core();
 
                 let new_object = core.new_object(type_)?;
 
                 connection.push(
-                    proxy.id(),
+                    registry.proxy().id(),
                     Methods::Bind(Bind {
                         id: id as i32,
                         type_: type_.to_string(),
@@ -62,8 +61,8 @@ impl Methods {
 
                 Ok(new_object)
             }),
-            destroy: closure!([connection] proxy, id, {
-                connection.push(proxy.id(), Methods::Destroy(Destroy { id: id as i32 }))
+            destroy: closure!([connection] registry, id, {
+                connection.push(registry.proxy().id(), Methods::Destroy(Destroy { id: id as i32 }))
             }),
         }
     }
@@ -93,7 +92,7 @@ impl Events {
     pub(crate) fn demarshal(
         connection: &Connection,
         header: &super::message::Header,
-        proxy: Proxy<Registry>,
+        registry: Registry,
     ) -> std::io::Result<()> {
         let event = connection.decode_core_message::<Events>(header)?;
 
@@ -102,8 +101,8 @@ impl Events {
         match event {
             Events::Global(global) => {
                 let props = Properties::new_vec(global.props.data);
-                proxy_object_notify!(
-                    proxy,
+                object_notify!(
+                    registry,
                     global,
                     global.id as Id,
                     PermissionBits::from_bits_truncate(global.permissions as u32),
@@ -113,7 +112,7 @@ impl Events {
                 )
             }
             Events::GlobalRemove(remove) => {
-                proxy_object_notify!(proxy, global_remove, remove.id as Id)
+                object_notify!(registry, global_remove, remove.id as Id)
             }
         }
 

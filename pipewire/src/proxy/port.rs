@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
 use pipewire_native_macros as macros;
@@ -10,31 +10,31 @@ use pipewire_native_spa as spa;
 
 use crate::{
     core::Core,
-    new_refcounted,
+    new_refcounted, object_invoke,
     properties::Properties,
     protocol,
     proxy::{HasProxy, Proxy},
-    proxy_object_invoke, refcounted,
+    refcounted,
     types::{self, params::ParamBuilder},
-    HookId, Id, Refcounted,
+    HookId, Id,
 };
 
 refcounted! {
     /// Proxy that represents a port that is connected to the server.
     pub struct Port {
-        proxy: RwLock<Option<Proxy<Port>>>,
+        proxy: Proxy,
         methods: Arc<Mutex<PortMethods<Port>>>,
         hooks: Arc<Mutex<spa::hook::HookList<PortEvents>>>,
     }
 }
 
 #[allow(clippy::type_complexity)]
-pub(crate) struct PortMethods<T: HasProxy + Refcounted> {
+pub(crate) struct PortMethods<T> {
     pub(crate) subscribe_params:
-        Box<dyn FnMut(&Proxy<T>, &[spa::param::ParamType]) -> std::io::Result<()>>,
+        Box<dyn FnMut(&T, &[spa::param::ParamType]) -> std::io::Result<()>>,
     pub(crate) enum_params: Box<
         dyn FnMut(
-            &Proxy<T>,
+            &T,
             u32,
             Option<spa::param::ParamType>,
             u32,
@@ -101,14 +101,8 @@ impl HasProxy for Port {
         3
     }
 
-    fn proxy(&self) -> Proxy<Self> {
-        self.inner
-            .proxy
-            .read()
-            .unwrap()
-            .as_ref()
-            .expect("Port proxy should be initialised on creation")
-            .clone()
+    fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
     }
 }
 
@@ -118,13 +112,7 @@ impl Port {
             inner: new_refcounted(InnerPort::new(core)),
         };
 
-        let id = core.next_proxy_id();
-        this.inner
-            .proxy
-            .write()
-            .unwrap()
-            .replace(Proxy::new(id, &this));
-        core.add_proxy(&this, id);
+        core.add_proxy(&this);
 
         this
     }
@@ -141,8 +129,7 @@ impl Port {
 
     /// Register for notifications of the specified param types.
     pub fn subscribe_params(&self, ids: &[spa::param::ParamType]) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, subscribe_params, ids)
+        object_invoke!(self, subscribe_params, ids)
     }
 
     /// Enumerate params (via [PortEvents::param]). Set `id` to [None] to query all param types.
@@ -154,8 +141,7 @@ impl Port {
         num: u32,
         filter: Option<ParamBuilder>,
     ) -> std::io::Result<()> {
-        let proxy = self.proxy();
-        proxy_object_invoke!(proxy, enum_params, seq, id, start, num, filter)
+        object_invoke!(self, enum_params, seq, id, start, num, filter)
     }
 
     pub(crate) fn methods(&self) -> Arc<Mutex<PortMethods<Port>>> {
@@ -170,7 +156,7 @@ impl Port {
 impl InnerPort {
     fn new(core: &Core) -> Self {
         Self {
-            proxy: RwLock::new(None),
+            proxy: Proxy::new(core.next_proxy_id()),
             methods: Arc::new(Mutex::new(protocol::marshal::port::Methods::marshal(
                 core.connection(),
             ))),
