@@ -76,7 +76,7 @@ pub struct NodeSample<'a> {
     /// Time at which processing was completed, against CLOCK_MONOTONIC in nanoseconds.
     pub finish_time_ns: u64,
     /// Node status, as defined near
-    /// https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/master/src/pipewire/private.h#L575
+    /// <https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/master/src/pipewire/private.h#L575>
     pub status: u32,
     /// Node's latency.
     pub latency: Fraction,
@@ -142,10 +142,10 @@ pub struct DriverClockSample<'a> {
     /// Fields common for both driver and follower clocks. [`Self`] dereferences to this field.
     pub clock_sample: ClockSample<'a>,
     /// Driver clock flags, as defined near
-    /// https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/master/spa/include/spa/node/io.h#L130
+    /// <https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/master/spa/include/spa/node/io.h#L130>
     pub flags: u32,
     /// I/O position state, one of spa_io_position_state
-    /// https://docs.pipewire.org/group__spa__node.html#ga12aed5ed2a6ecb69734aa3eb7da4056b
+    /// <https://docs.pipewire.org/group__spa__node.html#ga12aed5ed2a6ecb69734aa3eb7da4056b>
     pub state: u32,
     /// Cycle of the graph, starts at 0, incremented on each graph tick.
     pub cycle: u32,
