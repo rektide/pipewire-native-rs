@@ -12,6 +12,7 @@ pub(crate) mod metadata;
 pub(crate) mod module;
 pub(crate) mod node;
 pub(crate) mod port;
+pub(crate) mod profiler;
 pub(crate) mod registry;
 
 use pipewire_native_spa::{self as spa, pod::Pod};

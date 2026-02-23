@@ -273,7 +273,7 @@ impl<'a> Parser<'a> {
     }
 
     pub fn pop_object<K, I, T>(
-        &'a mut self,
+        &mut self,
         parse_object: impl FnOnce(&mut ObjectParser<'a, K>, I) -> Result<T, Error>,
     ) -> Result<(T, usize), Error>
     where
@@ -333,7 +333,7 @@ impl<'a> Parser<'a> {
     }
 
     pub fn pop_object_raw<I, T>(
-        &'a mut self,
+        &mut self,
         parse_object: impl FnOnce(&mut ObjectParserRaw<'a>, ObjectType, I) -> Result<T, Error>,
     ) -> Result<(T, usize), Error>
     where

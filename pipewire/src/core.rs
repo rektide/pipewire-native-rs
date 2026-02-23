@@ -224,6 +224,7 @@ impl Core {
             types::interface::MODULE => Box::new(proxy::module::Module::new(self)),
             types::interface::NODE => Box::new(proxy::node::Node::new(self)),
             types::interface::PORT => Box::new(proxy::port::Port::new(self)),
+            types::interface::PROFILER => Box::new(proxy::profiler::Profiler::new(self)),
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,

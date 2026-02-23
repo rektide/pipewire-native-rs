@@ -274,6 +274,16 @@ impl Client {
                 let proxy = core.find_proxy::<proxy::port::Port>(header.id).unwrap();
                 super::marshal::port::Events::demarshal(&self.inner.connection, &header, proxy)?;
             }
+            types::interface::PROFILER => {
+                let proxy = core
+                    .find_proxy::<proxy::profiler::Profiler>(header.id)
+                    .unwrap();
+                super::marshal::profiler::Events::demarshal(
+                    &self.inner.connection,
+                    &header,
+                    proxy,
+                )?;
+            }
             types::interface::REGISTRY => {
                 let proxy = core
                     .find_proxy::<proxy::registry::Registry>(header.id)

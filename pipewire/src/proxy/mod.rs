@@ -28,6 +28,8 @@ pub mod module;
 pub mod node;
 /// A proxy representing ports on nodes.
 pub mod port;
+/// A proxy representing the profiler.
+pub mod profiler;
 /// A proxy representing the registry.
 pub mod registry;
 
@@ -249,6 +251,10 @@ macro_rules! hasproxy_method_call_internal {
                 let _proxy = $object.downcast_proxy::<$crate::proxy::port::Port>().unwrap();
                 $unlock
                 _proxy.$method($($($args),*)?)
+            } else if $object.type_() == $crate::types::interface::PROFILER {
+                let _proxy = $object.downcast_proxy::<$crate::proxy::profiler::Profiler>().unwrap();
+                $unlock
+                _proxy.$method($($($args),*)?)
             } else if $object.type_() == $crate::types::interface::REGISTRY {
                 let _proxy = $object.downcast_proxy::<$crate::proxy::registry::Registry>().unwrap();
                 $unlock
@@ -314,6 +320,10 @@ macro_rules! hasproxy_notify_internal {
             spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
         } else if $object.type_() == $crate::types::interface::PORT {
             let _proxy = $object.downcast_proxy::<$crate::proxy::port::Port>().unwrap();
+            $unlock
+            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
+        } else if $object.type_() == $crate::types::interface::PROFILER {
+            let _proxy = $object.downcast_proxy::<$crate::proxy::profiler::Profiler>().unwrap();
             $unlock
             spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
         } else if $object.type_() == $crate::types::interface::REGISTRY {

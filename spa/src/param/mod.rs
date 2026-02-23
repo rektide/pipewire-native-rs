@@ -10,6 +10,7 @@ use crate::pod::types::ObjectType;
 pub mod buffers;
 pub mod format;
 pub mod profile;
+pub mod profiler;
 pub mod props;
 pub mod route;
 

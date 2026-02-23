@@ -25,6 +25,8 @@ pub mod interface {
     pub const NODE: &str = "PipeWire:Interface:Node";
     /// The Port interface
     pub const PORT: &str = "PipeWire:Interface:Port";
+    /// The Profiler interface
+    pub const PROFILER: &str = "PipeWire:Interface:Profiler";
     /// The Registry interface
     pub const REGISTRY: &str = "PipeWire:Interface:Registry";
 }
