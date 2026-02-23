@@ -12,7 +12,7 @@ use pipewire_native_spa as spa;
 
 use crate::{
     context::{Context, WeakContext},
-    debug, default_topic, hasproxy_method_call, hasproxy_notify,
+    debug, default_topic,
     id_map::IdMap,
     keys, log, new_refcounted, object_invoke,
     properties::Properties,
@@ -88,7 +88,7 @@ impl Core {
                 let mut objects = this.inner.objects.write().unwrap();
                 let client = objects.get(1).unwrap();
 
-                hasproxy_notify!(client, destroy);
+                proxy_notify!(client, destroy);
                 objects.clear();
 
                 this.inner.client.disconnect();
@@ -104,7 +104,7 @@ impl Core {
                     .skip(1) // first object is core, so skip it
                     .map(|(_id, object)| object)
                 {
-                    hasproxy_notify!(o, removed)
+                    proxy_notify!(o, removed)
                 }
             }),
             ..Default::default()
@@ -123,7 +123,7 @@ impl Core {
                 let proxies = this.inner.objects.read().unwrap();
 
                 if let Some(object) = proxies.get(id) {
-                    hasproxy_notify!(object, done, seq);
+                    proxy_notify!(object, done, seq);
                 }
             }),
             error: some_closure!([this] id, seq, res, message, {
@@ -131,7 +131,7 @@ impl Core {
                 let proxies = this.inner.objects.read().unwrap();
 
                 if let Some(object) = proxies.get(id) {
-                    hasproxy_notify!(object, error, seq, res, message);
+                    proxy_notify!(object, error, seq, res, message);
                 }
             }),
             ping: some_closure!([this] id, seq, {
@@ -143,7 +143,7 @@ impl Core {
                 let mut proxies = this.inner.objects.write().unwrap();
 
                 if let Some(object) = proxies.get(id) {
-                    hasproxy_notify!(object, removed);
+                    proxy_notify!(object, removed);
                     proxies.remove(id);
                 }
             }),
@@ -152,7 +152,7 @@ impl Core {
                 let proxies = this.inner.objects.read().unwrap();
 
                 if let Some(object) = proxies.get(id) {
-                    hasproxy_method_call!(object, set_bound_id, global_id);
+                    object.proxy().set_bound_id(global_id);
                 }
             }),
             add_mem: some_closure!([] _id, _type_, _fd, _flags, {
@@ -166,7 +166,7 @@ impl Core {
                 let proxies = this.inner.objects.read().unwrap();
 
                 if let Some(object) = proxies.get(id) {
-                    hasproxy_method_call!(object, set_bound_props, global_id, props);
+                    object.proxy().set_bound_props(global_id, props);
                 }
             }),
         });

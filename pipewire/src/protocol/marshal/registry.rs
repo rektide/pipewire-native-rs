@@ -6,7 +6,7 @@ use pipewire_native_macros as macros;
 use pipewire_native_spa::{self as spa, pod::Pod};
 
 use crate::{
-    closure, default_topic, hasproxy_method_call, log, object_notify,
+    closure, default_topic, log, object_notify,
     permission::PermissionBits,
     properties::Properties,
     protocol::connection::Connection,
@@ -55,7 +55,7 @@ impl Methods {
                         id: id as i32,
                         type_: type_.to_string(),
                         version: version as i32,
-                        new_id: hasproxy_method_call!(new_object, id) as i32,
+                        new_id: new_object.proxy().id() as i32,
                     }),
                 )?;
 

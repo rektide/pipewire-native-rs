@@ -142,9 +142,7 @@ pub trait HasProxy: Any + Send + Sync {
     fn version(&self) -> u32;
 
     /// Get a [Proxy] for this object.
-    fn proxy(&self) -> &Proxy
-    where
-        Self: Refcounted;
+    fn proxy(&self) -> &Proxy;
 }
 
 impl dyn HasProxy {
@@ -181,134 +179,6 @@ macro_rules! object_invoke {
 macro_rules! object_notify {
     ($object:ident, $event:ident $(, $($args:tt)*)?) => {
         spa::emit_hook!($object.events(), $event $(, $($args)*)?)
-    };
-}
-
-// To go from an object in dyn HasProxy form to the actual proxy itself, we need to do some dyn Any
-// shenanigans, so let's hide that away in a macro as well.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! hasproxy_method_call_internal {
-    ($object:expr, $unlock:block, $method:ident $(, $($args:tt),*)?) => {
-        {
-            if $object.type_() == $crate::types::interface::CORE {
-                let _proxy = $object.downcast_proxy::<$crate::core::Core>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else if $object.type_() == $crate::types::interface::CLIENT {
-                let _proxy = $object.downcast_proxy::<$crate::proxy::client::Client>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else if $object.type_() == $crate::types::interface::DEVICE {
-                let _proxy = $object.downcast_proxy::<$crate::proxy::device::Device>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else if $object.type_() == $crate::types::interface::FACTORY {
-                let _proxy = $object.downcast_proxy::<$crate::proxy::factory::Factory>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else if $object.type_() == $crate::types::interface::LINK {
-                let _proxy = $object.downcast_proxy::<$crate::proxy::link::Link>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else if $object.type_() == $crate::types::interface::METADATA {
-                let _proxy = $object.downcast_proxy::<$crate::proxy::metadata::Metadata>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else if $object.type_() == $crate::types::interface::MODULE {
-                let _proxy = $object.downcast_proxy::<$crate::proxy::module::Module>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else if $object.type_() == $crate::types::interface::NODE {
-                let _proxy = $object.downcast_proxy::<$crate::proxy::node::Node>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else if $object.type_() == $crate::types::interface::PORT {
-                let _proxy = $object.downcast_proxy::<$crate::proxy::port::Port>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else if $object.type_() == $crate::types::interface::PROFILER {
-                let _proxy = $object.downcast_proxy::<$crate::proxy::profiler::Profiler>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else if $object.type_() == $crate::types::interface::REGISTRY {
-                let _proxy = $object.downcast_proxy::<$crate::proxy::registry::Registry>().unwrap();
-                $unlock
-                _proxy.$method($($($args),*)?)
-            } else {
-                unreachable!("got unexpected proxy type {}", $object.type_())
-            }
-        }
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! hasproxy_method_call {
-    ($object:expr, $method:ident $(, $($args:tt),*)?) => {
-        $crate::hasproxy_method_call_internal!($object, {}, $method $(, $($args),*)?)
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! hasproxy_notify_internal {
-    ($object:ident, $unlock:block, $event:ident $(, $($args:tt),*)?) => {
-        if $object.type_() == $crate::types::interface::CORE {
-            let _proxy = $object.downcast_proxy::<$crate::core::Core>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else if $object.type_() == $crate::types::interface::CLIENT {
-            let _proxy = $object.downcast_proxy::<$crate::proxy::client::Client>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else if $object.type_() == $crate::types::interface::DEVICE {
-            let _proxy = $object.downcast_proxy::<$crate::proxy::device::Device>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else if $object.type_() == $crate::types::interface::FACTORY {
-            let _proxy = $object.downcast_proxy::<$crate::proxy::factory::Factory>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else if $object.type_() == $crate::types::interface::LINK {
-            let _proxy = $object.downcast_proxy::<$crate::proxy::link::Link>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else if $object.type_() == $crate::types::interface::METADATA {
-            let _proxy = $object.downcast_proxy::<$crate::proxy::metadata::Metadata>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else if $object.type_() == $crate::types::interface::MODULE {
-            let _proxy = $object.downcast_proxy::<$crate::proxy::module::Module>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else if $object.type_() == $crate::types::interface::NODE {
-            let _proxy = $object.downcast_proxy::<$crate::proxy::node::Node>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else if $object.type_() == $crate::types::interface::PORT {
-            let _proxy = $object.downcast_proxy::<$crate::proxy::port::Port>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else if $object.type_() == $crate::types::interface::PROFILER {
-            let _proxy = $object.downcast_proxy::<$crate::proxy::profiler::Profiler>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else if $object.type_() == $crate::types::interface::REGISTRY {
-            let _proxy = $object.downcast_proxy::<$crate::proxy::registry::Registry>().unwrap();
-            $unlock
-            spa::emit_hook!(_proxy.events(), $event $(, $($args),*)?)
-        } else {
-            unreachable!("got unexpected proxy type {}", $object.type_())
-        }
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! hasproxy_notify {
-    ($object:ident, $event:ident $(, $($args:tt),*)?) => {
-        $crate::hasproxy_notify_internal!($object, {}, $event $(, $($args),*)?)
     };
 }
 
