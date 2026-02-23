@@ -191,8 +191,6 @@ fn destroy_nodes(registry: &Registry, objects: &Objects) {
 fn test_lib() {
     let _test_context = start_pipewire();
 
-    std::env::set_var("PIPEWIRE_DEBUG", "5");
-
     pipewire::init();
 
     let objects = Objects {
