@@ -50,11 +50,11 @@ pub struct SampleInfo {
     /// Ordinal number of the profiling sample. Monotonically increasing.
     pub counter: i64,
     /// CPU load (short time window).
-    pub cpu_load_short_term: f32,
+    pub cpu_load_fast: f32,
     /// CPU load (medium time window).
-    pub cpu_load_medium_term: f32,
+    pub cpu_load_medium: f32,
     /// CPU load (long time window).
-    pub cpu_load_long_term: f32,
+    pub cpu_load_slow: f32,
     /// Number of XRuns of the driver Node so far.
     pub xrun_count: u32,
 }

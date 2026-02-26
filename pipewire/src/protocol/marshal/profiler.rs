@@ -43,9 +43,9 @@ pub(crate) struct ProfileEvent {
 #[derive(Debug, macros::PodStruct)]
 pub(crate) struct Info {
     counter: i64,
-    cpu_load_0: f32,
-    cpu_load_1: f32,
-    cpu_load_2: f32,
+    cpu_load_fast: f32,
+    cpu_load_medium: f32,
+    cpu_load_slow: f32,
     xrun_count: i32,
 }
 
@@ -241,17 +241,17 @@ impl From<&Info> for SampleInfo {
     fn from(info: &Info) -> Self {
         let &Info {
             counter,
-            cpu_load_0: cpu_load_fast,
-            cpu_load_1: cpu_load_medium,
-            cpu_load_2: cpu_load_slow,
+            cpu_load_fast,
+            cpu_load_medium,
+            cpu_load_slow,
             xrun_count,
         } = info;
 
         SampleInfo {
             counter,
-            cpu_load_short_term: cpu_load_fast,
-            cpu_load_medium_term: cpu_load_medium,
-            cpu_load_long_term: cpu_load_slow,
+            cpu_load_fast,
+            cpu_load_medium,
+            cpu_load_slow,
             // SPA PODs don't have unsigned int types; module-profiler.c passes uint32_t here.
             xrun_count: xrun_count as u32,
         }
