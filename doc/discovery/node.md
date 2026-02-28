@@ -109,6 +109,26 @@ First usable slice means:
 - worker receives eventfd trigger and runs callback.
 - callback can read/write mapped payload bytes and signal completion.
 
+## Progress update (`node/` crate)
+
+Initial implementation landed under [`/node`](/node):
+
+- crate scaffold and module boundaries in [`/node/src/lib.rs`](/node/src/lib.rs)
+- control-plane descriptor state in [`/node/src/control/mod.rs`](/node/src/control/mod.rs)
+- memfd import + mmap helpers in [`/node/src/shm/memfd.rs`](/node/src/shm/memfd.rs)
+- memory registry keyed by `AddMem` id in [`/node/src/shm/registry.rs`](/node/src/shm/registry.rs)
+- async eventfd wrapper based on Tokio `AsyncFd` in [`/node/src/signal/eventfd.rs`](/node/src/signal/eventfd.rs)
+- transport binding and activation mapping in [`/node/src/transport/mod.rs`](/node/src/transport/mod.rs)
+- runtime worker loop (`wait trigger -> callback -> signal complete`) in [`/node/src/runtime/mod.rs`](/node/src/runtime/mod.rs)
+
+What remains:
+
+- wire protocol-side fd passing and `Core::AddMem` decode in `pipewire-native`
+- decode and surface transport/activation events in `pipewire-native`
+- connect that bridge to `node::control::ControlPlaneState`
+- add integration tests that exercise real PipeWire transport setup
+
 ## Implementation log
 
 - 2026-02-28: created initial architecture and implementation plan.
+- 2026-02-28: created initial `node/` crate scaffold with memfd/eventfd/runtime building blocks.
