@@ -120,6 +120,7 @@ Initial implementation landed under [`/node`](/node):
 - async eventfd wrapper based on Tokio `AsyncFd` in [`/node/src/signal/eventfd.rs`](/node/src/signal/eventfd.rs)
 - transport binding and activation mapping in [`/node/src/transport/mod.rs`](/node/src/transport/mod.rs)
 - runtime worker loop (`wait trigger -> callback -> signal complete`) in [`/node/src/runtime/mod.rs`](/node/src/runtime/mod.rs)
+- crate-level transport primitives have first unit tests in [`/node/src/shm/memfd.rs`](/node/src/shm/memfd.rs), [`/node/src/signal/eventfd.rs`](/node/src/signal/eventfd.rs), and [`/node/src/transport/mod.rs`](/node/src/transport/mod.rs)
 
 Early control-plane bridge work also started in `pipewire-native`:
 
@@ -139,3 +140,4 @@ What remains:
 - 2026-02-28: created initial architecture and implementation plan.
 - 2026-02-28: created initial `node/` crate scaffold with memfd/eventfd/runtime building blocks.
 - 2026-02-28: added first-pass SCM_RIGHTS receive + `AddMem` event decode wiring in `pipewire-native`.
+- 2026-02-28: added first `node/` unit tests for memfd mapping, eventfd signaling, and transport binding.

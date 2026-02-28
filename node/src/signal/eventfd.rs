@@ -121,3 +121,24 @@ fn write_eventfd(fd: RawFd, value: u64) -> io::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use tokio::runtime::Builder;
+
+    use super::EventFd;
+
+    #[test]
+    fn signals_and_drains_counter() {
+        let runtime = Builder::new_current_thread().enable_io().build().unwrap();
+
+        runtime.block_on(async {
+            let event = EventFd::new().unwrap();
+
+            event.signal(7).unwrap();
+            let drained = event.wait().await.unwrap();
+
+            assert_eq!(drained, 7);
+        });
+    }
+}

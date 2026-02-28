@@ -119,3 +119,19 @@ impl Drop for MappedRegion {
         let _ = unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsFd;
+
+    use super::{create_memfd, MappedRegion};
+
+    #[test]
+    fn map_and_mutate_memfd_region() {
+        let fd = create_memfd("pipewire-native-node-test", 4096).unwrap();
+        let mut region = MappedRegion::map_shared(fd.as_fd(), 0, 4096, true).unwrap();
+
+        region.as_mut_slice()[0..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(&region.as_slice()[0..4], &[0x11, 0x22, 0x33, 0x44]);
+    }
+}
