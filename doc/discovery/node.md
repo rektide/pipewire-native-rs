@@ -121,6 +121,12 @@ Initial implementation landed under [`/node`](/node):
 - transport binding and activation mapping in [`/node/src/transport/mod.rs`](/node/src/transport/mod.rs)
 - runtime worker loop (`wait trigger -> callback -> signal complete`) in [`/node/src/runtime/mod.rs`](/node/src/runtime/mod.rs)
 
+Early control-plane bridge work also started in `pipewire-native`:
+
+- incoming SCM_RIGHTS fd receive path in [`/pipewire/src/protocol/connection.rs`](/pipewire/src/protocol/connection.rs)
+- `Core::AddMem` / `Core::RemoveMem` event decode in [`/pipewire/src/protocol/marshal/core.rs`](/pipewire/src/protocol/marshal/core.rs)
+- `Core` default callbacks now log instead of `todo!()` panic in [`/pipewire/src/core.rs`](/pipewire/src/core.rs)
+
 What remains:
 
 - wire protocol-side fd passing and `Core::AddMem` decode in `pipewire-native`
@@ -132,3 +138,4 @@ What remains:
 
 - 2026-02-28: created initial architecture and implementation plan.
 - 2026-02-28: created initial `node/` crate scaffold with memfd/eventfd/runtime building blocks.
+- 2026-02-28: added first-pass SCM_RIGHTS receive + `AddMem` event decode wiring in `pipewire-native`.

@@ -155,11 +155,12 @@ impl Core {
                     object.proxy().set_bound_id(global_id);
                 }
             }),
-            add_mem: some_closure!([] _id, _type_, _fd, _flags, {
-                todo!("core.add_mem is not yet implemented")
+            add_mem: some_closure!([] id, type_, fd, flags, {
+                debug!("got add_mem: {id} {type_} {flags}");
+                let _ = unsafe { libc::close(fd) };
             }),
-            remove_mem: some_closure!([] _id, {
-                todo!("core.remove_mem is not yet implemented")
+            remove_mem: some_closure!([] id, {
+                debug!("got remove_mem: {id}");
             }),
             bound_props: some_closure!([this] id, global_id, props, {
                 debug!("got bound_props: {id} {global_id} {props:?}");

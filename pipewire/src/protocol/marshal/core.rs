@@ -4,6 +4,7 @@
 
 use pipewire_native_macros as macros;
 use pipewire_native_spa::{self as spa, pod::Pod};
+use std::os::fd::IntoRawFd;
 
 use crate::{
     closure,
@@ -222,12 +223,14 @@ pub(crate) struct BoundId {
 
 #[derive(Debug, macros::PodStruct)]
 pub(crate) struct AddMem {
-    // TODO
+    id: i32,
+    type_: i32,
+    flags: i32,
 }
 
 #[derive(Debug, macros::PodStruct)]
 pub(crate) struct RemoveMem {
-    // TODO
+    id: i32,
 }
 
 #[derive(Debug, macros::PodStruct)]
@@ -286,11 +289,26 @@ impl Events {
             Events::BoundId(bound) => {
                 object_notify!(core, bound_id, bound.id as Id, bound.global_id as Id);
             }
-            Events::AddMem(_) => {
-                todo!("Core::AddMem is not yet implemented");
+            Events::AddMem(add_mem) => {
+                let fd = connection.pop_fd().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Core::AddMem event did not include SCM_RIGHTS fd",
+                    )
+                })?;
+                let raw_fd = fd.into_raw_fd();
+
+                object_notify!(
+                    core,
+                    add_mem,
+                    add_mem.id as Id,
+                    add_mem.type_ as u32,
+                    raw_fd,
+                    add_mem.flags as u32
+                );
             }
-            Events::RemoveMem(_) => {
-                todo!("Core::RemoveMem is not yet implemented");
+            Events::RemoveMem(rem_mem) => {
+                object_notify!(core, remove_mem, rem_mem.id as Id);
             }
             Events::BoundProps(bound) => {
                 let props = Properties::new_vec(bound.props.data);

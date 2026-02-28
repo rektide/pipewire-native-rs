@@ -3,8 +3,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
 use std::{
-    io::{Read, Write},
-    os::{fd::RawFd, unix::net::UnixStream},
+    collections::VecDeque,
+    io::Write,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        unix::net::UnixStream,
+    },
     sync::{Arc, Mutex, RwLock},
 };
 
@@ -24,6 +28,7 @@ use super::marshal::{
 default_topic!(log::topic::CONNECTION);
 
 const MAX_MESSAGE_SIZE: usize = 16_777_216;
+const MAX_CONTROL_FDS: usize = 16;
 
 refcounted! {
     pub(crate) struct Connection {
@@ -33,12 +38,13 @@ refcounted! {
         in_buf: RwLock<Vec<u8>>,
         in_size: RwLock<usize>,
         in_offset: RwLock<usize>,
+        in_fds: RwLock<VecDeque<OwnedFd>>,
         last_recv_generation: RwLock<i64>,
         // Data to send
         out_seq: RwLock<u32>,
         out_buf: RwLock<Vec<u8>>,
         out_size: RwLock<usize>,
-        out_fds: RwLock<Vec<RawFd>>,
+        out_fds: RwLock<VecDeque<RawFd>>,
         last_sent_generation: RwLock<i64>,
     }
 }
@@ -76,6 +82,7 @@ impl Connection {
         self.inner.in_buf.write().unwrap().fill(0);
         *self.inner.in_size.write().unwrap() = 0;
         *self.inner.in_offset.write().unwrap() = 0;
+        self.inner.in_fds.write().unwrap().clear();
         *self.inner.last_recv_generation.write().unwrap() = 0;
         *self.inner.out_seq.write().unwrap() = 0;
         self.inner.out_buf.write().unwrap().fill(0);
@@ -313,6 +320,10 @@ impl Connection {
         Ok(object)
     }
 
+    pub(crate) fn pop_fd(&self) -> Option<OwnedFd> {
+        self.inner.in_fds.write().unwrap().pop_front()
+    }
+
     // TODO: support CoreGeneration as well when we implement server
     pub fn update_generation(&self, footer: Option<&CoreFooter>) {
         if let Some(footer) = footer {
@@ -355,18 +366,82 @@ impl Connection {
     }
 
     fn read(&self) -> std::io::Result<()> {
-        let mut stream_ref = self.inner.stream.write().unwrap();
-        let stream = stream_ref.as_mut().unwrap();
+        let stream = self.inner.stream.read().unwrap();
+        let stream = stream.as_ref().unwrap();
         let mut buf = self.inner.in_buf.write().unwrap();
         let mut size = self.inner.in_size.write().unwrap();
+        let mut control = vec![
+            0u8;
+            unsafe {
+                libc::CMSG_SPACE((MAX_CONTROL_FDS * std::mem::size_of::<RawFd>()) as u32) as usize
+            }
+        ];
 
-        let read = stream.read(&mut buf[*size..])?;
+        let mut iov = libc::iovec {
+            iov_base: buf[*size..].as_mut_ptr().cast::<libc::c_void>(),
+            iov_len: buf.len() - *size,
+        };
+        let mut msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: control.as_mut_ptr().cast::<libc::c_void>(),
+            msg_controllen: control.len(),
+            msg_flags: 0,
+        };
+
+        let read = loop {
+            let read =
+                unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+            if read < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+
+                return Err(err);
+            }
+
+            break read;
+        };
+
         trace!("read {read} bytes at {size}");
 
-        // TODO: control messages
+        if msg.msg_flags & libc::MSG_CTRUNC == libc::MSG_CTRUNC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control message was truncated",
+            ));
+        }
+
+        let msg_ptr = &msg as *const libc::msghdr;
+        let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg_ptr) };
+        while !cmsg.is_null() {
+            let level = unsafe { (*cmsg).cmsg_level };
+            let type_ = unsafe { (*cmsg).cmsg_type };
+
+            if level == libc::SOL_SOCKET && type_ == libc::SCM_RIGHTS {
+                let data_ptr = unsafe { libc::CMSG_DATA(cmsg) }.cast::<RawFd>();
+                let data_len =
+                    unsafe { (*cmsg).cmsg_len } as usize - unsafe { libc::CMSG_LEN(0) } as usize;
+                let n_fds = data_len / std::mem::size_of::<RawFd>();
+
+                let mut in_fds = self.inner.in_fds.write().unwrap();
+                for idx in 0..n_fds {
+                    let fd = unsafe { *data_ptr.add(idx) };
+                    if fd >= 0 {
+                        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                        in_fds.push_back(fd);
+                    }
+                }
+            }
+
+            cmsg = unsafe { libc::CMSG_NXTHDR(msg_ptr, cmsg) };
+        }
 
         if read > 0 {
-            *size += read;
+            *size += read as usize;
             Ok(())
         } else {
             // Nothing to process, we're done
@@ -383,11 +458,12 @@ impl InnerConnection {
             in_buf: RwLock::new(vec![0; 16384]),
             in_size: RwLock::new(0),
             in_offset: RwLock::new(0),
+            in_fds: RwLock::new(VecDeque::new()),
             last_recv_generation: RwLock::new(0),
             out_seq: RwLock::new(0),
             out_buf: RwLock::new(vec![0; 16384]),
             out_size: RwLock::new(0),
-            out_fds: RwLock::new(Vec::new()),
+            out_fds: RwLock::new(VecDeque::new()),
             last_sent_generation: RwLock::new(0),
         }
     }
