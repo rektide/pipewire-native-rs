@@ -29,7 +29,14 @@ The most promising path is to treat OSC as a control stream payload in existing 
 
 ### Source consistency note
 
-The prior prompt listed [`/node/src/host/mod.rs`](/node/src/host/mod.rs), but that file is not present in the current tree. The source list should use existing modules from [`/node/src/lib.rs`](/node/src/lib.rs).
+The prior prompt listed `node/src/host/mod.rs`, but that file is not present in the current tree. The source list should use existing modules from [`/node/src/lib.rs`](/node/src/lib.rs).
+
+### Upstream findings that shape this plan
+
+- PipeWire already defines `SPA_CONTROL_OSC` in control type declarations ([`pipewire/pipewire` `spa/include/spa/control/control.h`](https://gitlab.com/pipewire/pipewire/-/blob/master/spa/include/spa/control/control.h)).
+- PipeWire's MIDI internals document explicitly describes `application/control` as a generic control stream and notes OSC messages can be interleaved in that stream ([`pipewire/pipewire` `doc/dox/internals/midi.dox`](https://gitlab.com/pipewire/pipewire/-/blob/master/doc/dox/internals/midi.dox)).
+- Filter-side DSP shortcuts currently expose `"8 bit raw midi"`, `"8 bit raw control"`, and `"32 bit raw UMP"`; there is no dedicated `format.dsp` alias for OSC today ([`pipewire/pipewire` `src/pipewire/filter.c`](https://gitlab.com/pipewire/pipewire/-/blob/master/src/pipewire/filter.c)).
+- Stream defaults classify `application/control` as `Midi`, which can mislabel OSC endpoints unless explicit properties are set ([`pipewire/pipewire` `src/pipewire/stream.c`](https://gitlab.com/pipewire/pipewire/-/blob/master/src/pipewire/stream.c), [`pipewire/pipewire` `src/pipewire/keys.h`](https://gitlab.com/pipewire/pipewire/-/blob/master/src/pipewire/keys.h)).
 
 ## MVP boundary for OSC support
 
