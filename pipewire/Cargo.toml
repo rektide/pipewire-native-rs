@@ -16,6 +16,7 @@ pipewire-native-spa.workspace = true
 tinyjson = "2.5.1"
 
 [dev-dependencies]
+pipewire-native-server.workspace = true
 serial_test = "3"
 tempfile = "3"
 

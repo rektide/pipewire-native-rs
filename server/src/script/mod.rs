@@ -117,6 +117,19 @@ pub struct CoreErrorAction {
     pub message: String,
 }
 
+/// Payload for emitting `Core::AddMem`.
+#[derive(Debug, Clone, Builder)]
+pub struct CoreAddMemAction {
+    /// Server memory id announced to the client.
+    pub id: u32,
+    /// Memory type from `spa_data_type`.
+    pub memory_type: u32,
+    /// Extra memory flags.
+    pub flags: u32,
+    /// Allocated memfd size in bytes.
+    pub size: usize,
+}
+
 /// Outbound actions performed when a step expectation is satisfied.
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -133,6 +146,8 @@ pub enum Action {
     },
     /// Emit `Core::Error`.
     SendCoreError(CoreErrorAction),
+    /// Emit `Core::AddMem` with a memfd fd attached via SCM_RIGHTS.
+    SendCoreAddMem(CoreAddMemAction),
     /// Emit `Registry::Global` on last known registry proxy id.
     SendRegistryGlobalOnLastRegistry(RegistryGlobalAction),
     /// Emit `Registry::GlobalRemove` on last known registry proxy id.

@@ -289,11 +289,14 @@ Initial server scaffold now exists under [`/server`](/server):
 - single-client runtime with scripted step execution in [`/server/src/runtime/mod.rs`](/server/src/runtime/mod.rs)
 - run-state tracking in [`/server/src/state/mod.rs`](/server/src/state/mod.rs)
 - test helper utilities in [`/server/src/testkit/mod.rs`](/server/src/testkit/mod.rs)
-- integration tests for bootstrap flow and single-client rejection in [`/server/tests/scripted_server.rs`](/server/tests/scripted_server.rs)
+- integration tests for bootstrap flow, single-client rejection, and `Core::AddMem` fd passing in [`/server/tests/scripted_server.rs`](/server/tests/scripted_server.rs)
+- SCM_RIGHTS send/receive support in frame IO via `read_packet_with_fds` and `write_packet_with_fds` in [`/server/src/protocol/frame.rs`](/server/src/protocol/frame.rs)
+- scripted `Core::AddMem` action with memfd allocation in [`/server/src/script/mod.rs`](/server/src/script/mod.rs) and [`/server/src/runtime/mod.rs`](/server/src/runtime/mod.rs)
+- cross-crate integration test proving `pipewire-native` client can consume scripted `Core::AddMem` + fd passing in [`/pipewire/tests/scripted_server_add_mem.rs`](/pipewire/tests/scripted_server_add_mem.rs)
 
 Current limitations of the initial scaffold:
 
-- no fd send/receive support in server frame IO yet (SCM_RIGHTS path pending)
+- no fd receive handling in runtime step loop yet (runtime currently reads inbound packets without attached fds)
 - no client-node event subset in `server/` protocol helpers yet
 - script matching is intentionally small and focused on core/registry startup flows
 

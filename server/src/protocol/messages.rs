@@ -28,6 +28,26 @@ pub mod core_event {
     pub const DONE: u8 = 1;
     /// Core::Error.
     pub const ERROR: u8 = 3;
+    /// Core::AddMem.
+    pub const ADD_MEM: u8 = 6;
+    /// Core::RemoveMem.
+    pub const REMOVE_MEM: u8 = 7;
+}
+
+/// Values from `enum spa_data_type`.
+pub mod spa_data_type {
+    /// `SPA_DATA_Invalid`.
+    pub const INVALID: u32 = 0;
+    /// `SPA_DATA_MemPtr`.
+    pub const MEM_PTR: u32 = 1;
+    /// `SPA_DATA_MemFd`.
+    pub const MEM_FD: u32 = 2;
+    /// `SPA_DATA_DmaBuf`.
+    pub const DMA_BUF: u32 = 3;
+    /// `SPA_DATA_MemId`.
+    pub const MEM_ID: u32 = 4;
+    /// `SPA_DATA_SyncObj`.
+    pub const SYNC_OBJ: u32 = 5;
 }
 
 /// Client method opcodes.
@@ -219,6 +239,41 @@ pub fn encode_core_error_payload(
     })
 }
 
+/// Decoded `Core::AddMem` payload fields.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CoreAddMemPayload {
+    /// Server memory id.
+    pub id: u32,
+    /// Memory type from `spa_data_type`.
+    pub memory_type: u32,
+    /// Extra memory flags.
+    pub flags: u32,
+}
+
+/// Encodes a `Core::AddMem` payload. The fd is sent out-of-band.
+pub fn encode_core_add_mem_payload(id: u32, memory_type: u32, flags: u32) -> io::Result<Vec<u8>> {
+    encode_struct_payload(|sb| {
+        sb.push_int(id as i32)
+            .push_int(memory_type as i32)
+            .push_int(flags as i32)
+    })
+}
+
+/// Decodes `Core::AddMem` payload fields.
+pub fn decode_core_add_mem_payload(payload: &[u8]) -> io::Result<CoreAddMemPayload> {
+    parse_struct(payload, |sp| {
+        let id = sp.pop_int()?;
+        let memory_type = sp.pop_int()?;
+        let flags = sp.pop_int()?;
+
+        Ok(CoreAddMemPayload {
+            id: id as u32,
+            memory_type: memory_type as u32,
+            flags: flags as u32,
+        })
+    })
+}
+
 /// Encodes a minimal `Core::Info` payload.
 pub fn encode_core_info_payload(
     cookie: u32,
@@ -305,7 +360,10 @@ fn pod_error(err: spa::pod::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_inbound_message, encode_core_sync_payload, InboundMessage, CORE_ID};
+    use super::{
+        decode_core_add_mem_payload, decode_inbound_message, encode_core_add_mem_payload,
+        encode_core_sync_payload, spa_data_type, InboundMessage, CORE_ID,
+    };
 
     #[test]
     fn decodes_core_sync_payload() {
@@ -313,5 +371,15 @@ mod tests {
         let msg = decode_inbound_message(CORE_ID, super::core_method::SYNC, &payload).unwrap();
 
         assert_eq!(msg, InboundMessage::CoreSync { id: 11, seq: 22 });
+    }
+
+    #[test]
+    fn roundtrip_core_add_mem_payload() {
+        let payload = encode_core_add_mem_payload(9, spa_data_type::MEM_FD, 5).unwrap();
+        let decoded = decode_core_add_mem_payload(payload.as_slice()).unwrap();
+
+        assert_eq!(decoded.id, 9);
+        assert_eq!(decoded.memory_type, spa_data_type::MEM_FD);
+        assert_eq!(decoded.flags, 5);
     }
 }

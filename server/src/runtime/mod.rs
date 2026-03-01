@@ -2,8 +2,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Asymptotic Inc.
 
 use std::{
+    ffi::CString,
     io,
-    os::unix::net::{UnixListener, UnixStream},
+    os::{
+        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+        unix::net::{UnixListener, UnixStream},
+    },
     path::PathBuf,
 };
 
@@ -12,9 +16,10 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     protocol::{
-        self, core_event, decode_inbound_message, encode_core_done_payload,
-        encode_core_error_payload, encode_core_info_payload, encode_registry_global_payload,
-        encode_registry_global_remove_payload, NativeHeader, NativePacket,
+        self, core_event, decode_inbound_message, encode_core_add_mem_payload,
+        encode_core_done_payload, encode_core_error_payload, encode_core_info_payload,
+        encode_registry_global_payload, encode_registry_global_remove_payload, NativeHeader,
+        NativePacket,
     },
     script::{Action, Scenario},
     state::{ExecutionState, SyncState},
@@ -65,6 +70,8 @@ pub struct RunReport {
     pub last_sync: Option<SyncState>,
     /// Last registry proxy id requested by client.
     pub last_registry_proxy_id: Option<u32>,
+    /// Memory ids exported through scripted `Core::AddMem` actions.
+    pub exported_mem_ids: Vec<u32>,
 }
 
 impl ScriptedServer {
@@ -150,7 +157,7 @@ impl ScriptedServer {
             update_state_from_inbound(&mut state, &inbound);
 
             for action in &step.actions {
-                let keep_running = apply_action(&mut client, &state, action)?;
+                let keep_running = apply_action(&mut client, &mut state, action)?;
                 if !keep_running {
                     return Ok(to_run_report(state));
                 }
@@ -165,7 +172,7 @@ impl ScriptedServer {
 
 fn apply_action(
     client: &mut UnixStream,
-    state: &ExecutionState,
+    state: &mut ExecutionState,
     action: &Action,
 ) -> io::Result<bool> {
     match action {
@@ -201,6 +208,19 @@ fn apply_action(
         Action::SendCoreError(err) => {
             let payload = encode_core_error_payload(err.id, err.seq, err.res, &err.message)?;
             send_event(client, protocol::CORE_ID, core_event::ERROR, payload)?;
+            Ok(true)
+        }
+        Action::SendCoreAddMem(mem) => {
+            let payload = encode_core_add_mem_payload(mem.id, mem.memory_type, mem.flags)?;
+            let fd = create_memfd_for_add_mem(mem.id, mem.size)?;
+            send_event_with_fds(
+                client,
+                protocol::CORE_ID,
+                core_event::ADD_MEM,
+                payload,
+                &[fd.as_fd()],
+            )?;
+            state.exported_mem_ids.push(mem.id);
             Ok(true)
         }
         Action::SendRegistryGlobalOnLastRegistry(global) => {
@@ -253,18 +273,28 @@ fn send_event(
     opcode: u8,
     payload: Vec<u8>,
 ) -> io::Result<()> {
+    send_event_with_fds(client, object_id, opcode, payload, &[])
+}
+
+fn send_event_with_fds(
+    client: &mut UnixStream,
+    object_id: u32,
+    opcode: u8,
+    payload: Vec<u8>,
+    fds: &[std::os::fd::BorrowedFd<'_>],
+) -> io::Result<()> {
     let packet = NativePacket {
         header: NativeHeader {
             object_id,
             opcode,
             payload_size: payload.len() as u32,
             seq: 0,
-            n_fds: 0,
+            n_fds: fds.len() as u32,
         },
         payload,
     };
 
-    protocol::write_packet(client, &packet)
+    protocol::write_packet_with_fds(client, &packet, fds)
 }
 
 fn update_state_from_inbound(state: &mut ExecutionState, inbound: &protocol::InboundMessage) {
@@ -300,7 +330,33 @@ fn to_run_report(state: ExecutionState) -> RunReport {
         rejected_clients: state.rejected_clients,
         last_sync: state.last_sync,
         last_registry_proxy_id: state.last_registry_proxy_id,
+        exported_mem_ids: state.exported_mem_ids,
     }
+}
+
+fn create_memfd_for_add_mem(id: u32, size: usize) -> io::Result<OwnedFd> {
+    if size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Core::AddMem size must be greater than zero",
+        ));
+    }
+
+    let name = CString::new(format!("pipewire-native-server-add-mem-{id}"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "memfd name contained NUL"))?;
+
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let res = unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(fd)
 }
 
 struct SocketPathGuard {

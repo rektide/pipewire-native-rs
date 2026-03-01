@@ -3,6 +3,6 @@
 
 pub use crate::runtime::{ScriptedServerBuilder, ServerConfigBuilder};
 pub use crate::script::{
-    CoreErrorActionBuilder, CoreInfoActionBuilder, RegistryGlobalActionBuilder, ScenarioBuilder,
-    ScriptStepBuilder,
+    CoreAddMemActionBuilder, CoreErrorActionBuilder, CoreInfoActionBuilder,
+    RegistryGlobalActionBuilder, ScenarioBuilder, ScriptStepBuilder,
 };

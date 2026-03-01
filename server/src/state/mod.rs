@@ -23,4 +23,6 @@ pub struct ExecutionState {
     pub accepted_clients: usize,
     /// Number of rejected additional client connections.
     pub rejected_clients: usize,
+    /// Memory ids announced via `Core::AddMem` by scripted actions.
+    pub exported_mem_ids: Vec<u32>,
 }

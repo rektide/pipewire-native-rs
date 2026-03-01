@@ -820,6 +820,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "pipewire-native-macros",
+ "pipewire-native-server",
  "pipewire-native-spa",
  "pkg-config",
  "serial_test",
@@ -850,6 +851,7 @@ name = "pipewire-native-server"
 version = "0.1.4"
 dependencies = [
  "bon",
+ "libc",
  "pipewire-native-spa",
  "tempfile",
  "tracing",

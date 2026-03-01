@@ -5,12 +5,12 @@ use std::os::unix::net::UnixStream;
 
 use pipewire_native_server::{
     protocol::{
-        self, encode_client_update_properties_empty_payload, encode_core_get_registry_payload,
-        encode_core_hello_payload, encode_core_sync_payload, read_packet, NativeHeader,
-        NativePacket,
+        self, decode_core_add_mem_payload, encode_client_update_properties_empty_payload,
+        encode_core_get_registry_payload, encode_core_hello_payload, encode_core_sync_payload,
+        read_packet, read_packet_with_fds, NativeHeader, NativePacket,
     },
     runtime::{ScriptedServer, ServerConfig},
-    script::{Action, Expectation, RegistryGlobalAction, Scenario, ScriptStep},
+    script::{Action, CoreAddMemAction, Expectation, RegistryGlobalAction, Scenario, ScriptStep},
     testkit,
 };
 
@@ -165,6 +165,84 @@ fn second_client_is_rejected_in_single_client_mode() {
     let report = handle.join().unwrap().unwrap();
     assert_eq!(report.accepted_clients, 1);
     assert!(report.rejected_clients >= 1);
+}
+
+#[test]
+fn core_add_mem_emits_fd_and_payload() {
+    let socket_path = testkit::unique_socket_path("pipewire-native-server-addmem");
+
+    let scenario = Scenario::builder()
+        .steps(vec![
+            ScriptStep::builder()
+                .expect(Expectation::CoreHello)
+                .actions(vec![])
+                .build(),
+            ScriptStep::builder()
+                .expect(Expectation::CoreSync)
+                .actions(vec![
+                    Action::SendCoreAddMem(
+                        CoreAddMemAction::builder()
+                            .id(321)
+                            .memory_type(protocol::spa_data_type::MEM_FD)
+                            .flags(0)
+                            .size(4096)
+                            .build(),
+                    ),
+                    Action::SendCoreDoneFromLastSync,
+                ])
+                .build(),
+        ])
+        .build();
+
+    let server = ScriptedServer::builder()
+        .config(
+            ServerConfig::builder()
+                .socket_path(socket_path.clone())
+                .single_client(true)
+                .build(),
+        )
+        .scenario(scenario)
+        .build();
+
+    let handle = testkit::spawn(server);
+
+    let mut stream = connect_with_retry(&socket_path);
+    send_client_method(
+        &mut stream,
+        protocol::CORE_ID,
+        protocol::core_method::HELLO,
+        0,
+        encode_core_hello_payload(3).unwrap(),
+    );
+    send_client_method(
+        &mut stream,
+        protocol::CORE_ID,
+        protocol::core_method::SYNC,
+        1,
+        encode_core_sync_payload(0, 777).unwrap(),
+    );
+
+    let (add_mem, fds) = read_packet_with_fds(&mut stream).unwrap();
+    assert_eq!(add_mem.header.object_id, protocol::CORE_ID);
+    assert_eq!(add_mem.header.opcode, protocol::core_event::ADD_MEM);
+    assert_eq!(fds.len(), 1);
+
+    let payload = decode_core_add_mem_payload(add_mem.payload.as_slice()).unwrap();
+    assert_eq!(payload.id, 321);
+    assert_eq!(payload.memory_type, protocol::spa_data_type::MEM_FD);
+    assert_eq!(payload.flags, 0);
+
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    let fstat_res = unsafe { libc::fstat(std::os::fd::AsRawFd::as_raw_fd(&fds[0]), &mut stat) };
+    assert_eq!(fstat_res, 0);
+    assert_eq!(stat.st_size, 4096);
+
+    let done = read_packet(&mut stream).unwrap();
+    assert_eq!(done.header.opcode, protocol::core_event::DONE);
+
+    let report = handle.join().unwrap().unwrap();
+    assert_eq!(report.exported_mem_ids, vec![321]);
+    assert_eq!(report.last_sync.unwrap().seq, 777);
 }
 
 fn send_client_method(
