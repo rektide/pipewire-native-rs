@@ -277,6 +277,26 @@ All must be true:
 - traces clearly identify step ordering and failure location
 - docs describe constraints and non-goals accurately
 
+## Progress update (`server/` crate)
+
+Initial server scaffold now exists under [`/server`](/server):
+
+- crate + workspace wiring in [`/server/Cargo.toml`](/server/Cargo.toml) and [`/Cargo.toml`](/Cargo.toml)
+- domain-grouped modules in [`/server/src/lib.rs`](/server/src/lib.rs)
+- native protocol frame helpers in [`/server/src/protocol/frame.rs`](/server/src/protocol/frame.rs)
+- minimal inbound decode and outbound payload encoders in [`/server/src/protocol/messages.rs`](/server/src/protocol/messages.rs)
+- deterministic scenario model and `bon` builders in [`/server/src/script/mod.rs`](/server/src/script/mod.rs)
+- single-client runtime with scripted step execution in [`/server/src/runtime/mod.rs`](/server/src/runtime/mod.rs)
+- run-state tracking in [`/server/src/state/mod.rs`](/server/src/state/mod.rs)
+- test helper utilities in [`/server/src/testkit/mod.rs`](/server/src/testkit/mod.rs)
+- integration tests for bootstrap flow and single-client rejection in [`/server/tests/scripted_server.rs`](/server/tests/scripted_server.rs)
+
+Current limitations of the initial scaffold:
+
+- no fd send/receive support in server frame IO yet (SCM_RIGHTS path pending)
+- no client-node event subset in `server/` protocol helpers yet
+- script matching is intentionally small and focused on core/registry startup flows
+
 ## References
 
 - [`/README.md`](/README.md)
