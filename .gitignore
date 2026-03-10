@@ -10,3 +10,7 @@
 # already existing elements were commented out
 
 #/target
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
