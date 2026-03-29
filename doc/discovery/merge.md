@@ -1,277 +1,359 @@
-# Merge `server/` Into `pipewire/` and Complete Node Integration
+# Final Merge Picture: Unify `server/`, `pipewire/`, and Node Integration
 
-## Why this document exists
+## Executive view
 
-The current [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs) is the clearest statement of our real gap.
+We are not doing two separate efforts.
 
-It already loads audio, connects to PipeWire, and sketches the intended data-path. The TODO block in that file is not just an example note; it is a concrete checklist of missing integration:
+- Effort A: merge the standalone [`/server`](/server) crate into [`/pipewire`](/pipewire).
+- Effort B: make node/data-plane support actually usable from `pipewire` clients (as shown by [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs)).
 
-- receive and retain `Core::AddMem` fds instead of closing them
-- capture transport signaling fds and activation region metadata
-- bind those into `pipewire-native-node` control/runtime primitives
-- run a process callback that writes PCM into shared buffers each cycle
+These are one effort because both require a single, correct, shared protocol path for:
 
-That story was underrepresented in the earlier merge note. This version makes it explicit: **the `server/` merge and node-capable `pipewire/` are the same effort**, because both require a single canonical protocol/data-plane integration path.
+- header framing
+- SCM_RIGHTS fd transport
+- event decode/dispatch
+- memory/transport lifecycle ordering
 
-## Big picture
+If we keep `server/` separate, we keep duplicating exactly the code that must be trustworthy for node bring-up.
 
-Today we have three important pieces:
+## Why this rewrite
 
-1. **`pipewire/` crate**: strong client/control-plane and marshal foundation.
-2. **`node/` crate**: memfd/eventfd/runtime building blocks (`ControlPlaneState`, `BoundTransport`, `NodeRuntime`).
-3. **`server/` crate**: deterministic scripted peer for testing, but with duplicated protocol framing and parsing.
+Previous merge docs described crate consolidation well, but underplayed the strongest evidence: the integration TODOs in [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs) and the detailed gap analysis in [`/doc/discovery/node-integration.md`](/doc/discovery/node-integration.md).
 
-The target state is:
+This version uses those as primary requirements.
 
-- `pipewire/` remains the canonical protocol implementation.
-- `node/` primitives are fed directly from `pipewire` events (not a parallel ad-hoc path).
-- deterministic scripted-peer testing lives inside `pipewire` test support, not in a separate protocol crate.
+## Current reality
 
-In short: one protocol stack, one event decoding path, one node integration path.
+### What is already true
 
-## The core insight from `wav-player`
+- `pipewire` decodes `Core::AddMem` / `Core::RemoveMem` and receives fd payloads in [`/pipewire/src/protocol/marshal/core.rs`](/pipewire/src/protocol/marshal/core.rs).
+- `pipewire` receives SCM_RIGHTS fds in [`/pipewire/src/protocol/connection.rs`](/pipewire/src/protocol/connection.rs).
+- `node` crate has working data-plane primitives:
+  - control bridge state in [`/node/src/control/mod.rs`](/node/src/control/mod.rs)
+  - memory registry in [`/node/src/shm/registry.rs`](/node/src/shm/registry.rs)
+  - transport binding in [`/node/src/transport/mod.rs`](/node/src/transport/mod.rs)
+  - runtime loop in [`/node/src/runtime/mod.rs`](/node/src/runtime/mod.rs)
+- `server` provides deterministic scripted scenarios in [`/server/src`](/server/src).
 
-The TODO in [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs) demonstrates that node playback is blocked by integration seams, not by missing low-level primitives:
+### What is still broken for real node usage
 
-- `ControlPlaneState::on_add_mem()` exists in [`/node/src/control/mod.rs`](/node/src/control/mod.rs).
-- `ControlPlaneState::on_transport()` and `try_bind_transport()` exist in [`/node/src/control/mod.rs`](/node/src/control/mod.rs).
-- `NodeRuntime` and `ProcessCallback` exist in [`/node/src/runtime/mod.rs`](/node/src/runtime/mod.rs).
-- `BoundTransport` exists in [`/node/src/transport/mod.rs`](/node/src/transport/mod.rs).
+- Default `Core::add_mem` handling closes the fd instead of forwarding it in [`/pipewire/src/core.rs`](/pipewire/src/core.rs).
+- `Core::remove_mem` default path is effectively a no-op for data-plane state in [`/pipewire/src/core.rs`](/pipewire/src/core.rs).
+- `pipewire` lacks full client-node transport/setup event coverage, so there is no path to build `TransportEvent` from protocol events.
+- There is no integrated bridge from protocol events to `ControlPlaneState`.
+- The deterministic test harness lives in a separate crate that duplicates protocol framing/parsing concerns.
 
-What is missing is plumbing in `pipewire`:
+## The key product requirement
 
-- convert protocol events into those node control events
-- hold fd ownership correctly
-- expose client-node transport/setup events
-- provide lifecycle-safe runtime orchestration
+The wav player should be able to do this with first-class APIs:
 
-So the real work is integration and unification.
+1. Create adapter node.
+2. Receive AddMem/transport setup through normal listeners.
+3. Bind transport.
+4. Spawn runtime.
+5. Fill buffers in process callback.
 
-## How node actually works (conceptual model)
+Today the primitives exist, but the connective tissue is missing.
 
-Node operation spans two planes:
-
-- **Control plane** (protocol messages): object creation, format negotiation, transport descriptors, memory announcements.
-- **Data plane** (shared memory + eventfds): server triggers process cycle, client writes/reads audio, client acknowledges completion.
-
-`pipewire` already does most control-plane work for normal proxies. `node/` already does most data-plane mechanics. The missing bridge is where those meet.
+## High-level architecture target
 
 ```mermaid
 flowchart LR
-    App[Application code]
-    PipewireCore[pipewire core/proxy events]
-    NodeBridge[node integration bridge]
-    ControlState[ControlPlaneState]
-    MemReg[MemoryRegistry]
-    Bound[BoundTransport]
+    App[App / example]
+    PipewireAPI[pipewire public APIs]
+    CoreNodeEvents[Core + Node event surfaces]
+    NodeBridge[internal node bridge]
+    CPState[ControlPlaneState]
+    ProtoIO[protocol io and scm_rights]
+    Marshal[marshal modules]
     Runtime[NodeRuntime]
-    Callback[Audio process callback]
-    Shm[memfd shared buffers]
-    Trigger[eventfd trigger]
-    Ack[eventfd complete]
+    ScriptedPeer[internal scripted peer test support]
+    Tests[pipewire tests]
 
-    App --> PipewireCore
-    PipewireCore --> NodeBridge
-    NodeBridge --> ControlState
-    ControlState --> MemReg
-    ControlState --> Bound
-    Bound --> Runtime
-    Runtime --> Callback
-    Callback --> Shm
-    Trigger --> Runtime
-    Runtime --> Ack
+    App --> PipewireAPI
+    PipewireAPI --> CoreNodeEvents
+    CoreNodeEvents --> NodeBridge
+    NodeBridge --> CPState
+    CPState --> Runtime
+
+    PipewireAPI --> Marshal
+    PipewireAPI --> ProtoIO
+    ScriptedPeer --> Marshal
+    ScriptedPeer --> ProtoIO
+    Tests --> ScriptedPeer
 ```
 
-## Why `server/` merge is directly related
+Principle: **one protocol implementation, many consumers** (runtime client path and test peer path).
 
-If `server/` stays separate, we keep duplicating:
+## Why merging `server/` is required for node correctness
 
-- native header encode/decode
-- SCM_RIGHTS send/recv behavior
-- opcode + message-shape parsing
+Node bring-up is sensitive to protocol ordering and fd ownership. The exact parts `server/` duplicates are the parts where tiny differences can break node startup:
 
-Those are exactly the parts that must be correct for node/data-plane setup ordering (`AddMem`, transport fds, activation mapping). Duplicating them across crates increases drift risk and makes node debugging harder.
+- header fields (`id`, `opcode`, `size`, `seq`, `n_fds`)
+- fd receive/send semantics and truncation behavior
+- message decode paths and opcode routing
 
-So we should:
+So the merge is not housekeeping; it reduces semantic split-brain in the node-critical path.
 
-- keep one canonical protocol implementation in `pipewire`
-- move scripted peer support to `pipewire` test modules
-- reuse marshal definitions and shared I/O helpers everywhere
+## Integration gap map (from node-integration + wav-player)
 
-## Current state snapshot
+### Gap 1: AddMem ownership boundary
 
-What is already in place:
+Current behavior:
 
-- `Core::AddMem` / `Core::RemoveMem` decode in [`/pipewire/src/protocol/marshal/core.rs`](/pipewire/src/protocol/marshal/core.rs)
-- SCM_RIGHTS receive in [`/pipewire/src/protocol/connection.rs`](/pipewire/src/protocol/connection.rs)
-- node control/runtime primitives in [`/node/src/control/mod.rs`](/node/src/control/mod.rs), [`/node/src/transport/mod.rs`](/node/src/transport/mod.rs), and [`/node/src/runtime/mod.rs`](/node/src/runtime/mod.rs)
-- scripted deterministic server behavior in [`/server/src`](/server/src)
+- protocol decode receives fd
+- core callback closes fd
 
-What still blocks end-to-end node playback:
+Needed behavior:
 
-- default core `add_mem` path closes received fd in [`/pipewire/src/core.rs`](/pipewire/src/core.rs)
-- missing client-node marshal/event coverage in `pipewire`
-- no in-crate bridge that feeds protocol events into `ControlPlaneState`
-- no integrated runtime lifecycle glue for spawning/stopping `NodeRuntime`
-- scripted-peer harness still sits in separate `server/` crate with duplicated protocol internals
+- convert `RawFd` to `OwnedFd`
+- forward to `ControlPlaneState::on_add_mem()`
+- retain until `RemoveMem` or teardown
 
-## Work required to add node to `pipewire/`
+### Gap 2: RemoveMem lifecycle
 
-### A. Complete protocol surface for client-node setup
+Current behavior:
 
-High concept:
+- logs id, no registry update
 
-- `pipewire` must decode all control-plane information needed to configure data-plane runtime.
+Needed behavior:
 
-Detailed work:
+- forward `RemoveMemEvent { id }`
+- drop/unmap memory deterministically
 
-- add `client_node` marshal module under [`/pipewire/src/protocol/marshal`](/pipewire/src/protocol/marshal) for events/methods needed by node setup
-- ensure fd-bearing events (transport-related) correctly receive and attach fds
-- expose typed events through `proxy::node` listener surfaces
-- keep opcode and pod layouts aligned with upstream protocol-native definitions
+### Gap 3: Missing transport setup event surface
 
-### B. Add a node integration bridge inside `pipewire`
+Current behavior:
 
-High concept:
+- node transport descriptors are not fully decoded/surfaced in `pipewire`
 
-- convert protocol events into node control-state transitions.
+Needed behavior:
 
-Detailed work:
+- complete marshal coverage for client-node setup events
+- map fd-bearing transport events to `TransportEvent`
+- feed `ControlPlaneState::on_transport()`
 
-- introduce internal bridge state in `pipewire` that owns a `ControlPlaneState`
-- on `Core::AddMem`, transform to `node::control::AddMemEvent` and call `on_add_mem`
-- on `Core::RemoveMem`, call `on_remove_mem`
-- on transport/setup events from node/client-node protocol, call `on_transport`
-- call `try_bind_transport()` when state changes might satisfy binding
+### Gap 4: Runtime orchestration bridge
 
-### C. Fix fd ownership and lifecycle semantics
+Current behavior:
 
-High concept:
+- `node::runtime::NodeRuntime` exists but no managed integration path from `pipewire`
 
-- received fds must be retained until explicitly released, not closed immediately.
+Needed behavior:
 
-Detailed work:
+- when control state becomes bindable, create `BoundTransport`
+- spawn and supervise `NodeRuntime`
+- clean shutdown on disconnect/error
 
-- remove close-on-receive default behavior for integration paths that need retained mem fds
-- use `OwnedFd` boundaries end-to-end
-- ensure remove/teardown paths drop fds deterministically
-- verify no double-close and no leaked fds in success/error/shutdown paths
+### Gap 5: Negotiation-to-buffer contract
 
-### D. Integrate runtime orchestration
+Current behavior:
 
-High concept:
+- app can receive some node events, but no complete integrated pathway from param negotiation to process callback expectations
 
-- once transport is bound, start cycle processing and keep shutdown safe.
+Needed behavior:
 
-Detailed work:
+- capture node format/buffer negotiation outputs
+- provide callback with usable activation/buffer context
+- ensure sample format assumptions are explicit and validated
 
-- create an internal runtime handle abstraction in `pipewire` that can spawn `node::runtime::NodeRuntime`
-- define thread/runtime policy (Tokio executor ownership, shutdown signal wiring)
-- provide deterministic stop semantics on core disconnect and errors
-- ensure callback errors propagate clearly to caller and/or events
+## Detailed technical plan
 
-### E. Translate activation/buffer state into usable callback data
+### 1) Consolidate protocol I/O inside `pipewire`
 
-High concept:
+Changes:
 
-- process callback needs enough structured context to fill audio buffers correctly.
+- add shared internal module under `pipewire/src/protocol` for header and SCM_RIGHTS helpers
+- reuse from both `Connection` and scripted-peer runtime code
 
-Detailed work:
+Expected result:
 
-- parse or map activation/buffer metadata from shared memory regions
-- expose stable process-cycle context API for app callbacks
-- wire sample format/buffer negotiation outputs into callback expectations
-- use the `wav-player` loop as first real consumer and remove its integration TODOs
+- one source of truth for frame/fd mechanics
 
-### F. Merge scripted peer testing into `pipewire`
+### 2) Complete client-node marshal support
 
-High concept:
+Changes:
 
-- node integration must be tested against deterministic protocol sequences without duplicate protocol stacks.
+- add `client_node` marshal module under [`/pipewire/src/protocol/marshal`](/pipewire/src/protocol/marshal)
+- implement decode for transport/setup events needed by data-plane bootstrap
+- ensure fd extraction and event payload assembly are exact
 
-Detailed work:
+Expected result:
 
-- move scripted runtime/model from [`/server/src`](/server/src) to `pipewire` internal testing modules
-- centralize native frame + SCM_RIGHTS helpers in `pipewire` protocol I/O
-- migrate server tests into `pipewire/tests` support
+- protocol layer can represent all setup information needed by `node` control state
+
+### 3) Add a node bridge in `pipewire`
+
+Changes:
+
+- internal state object that owns `ControlPlaneState`
+- adapter methods:
+  - `on_core_add_mem`
+  - `on_core_remove_mem`
+  - `on_node_transport`
+- binding trigger path calling `try_bind_transport()` after each relevant update
+
+Expected result:
+
+- protocol events can drive node state machine directly
+
+### 4) Fix fd lifecycle semantics
+
+Changes:
+
+- stop default immediate close for AddMem in integration path
+- adopt `OwnedFd`-first handling through bridge boundaries
+- make teardown idempotent and deterministic
+
+Expected result:
+
+- no premature closes, no leaks, no double-close hazards
+
+### 5) Runtime lifecycle integration
+
+Changes:
+
+- introduce internal runtime supervisor for `NodeRuntimeHandle`
+- define who owns Tokio runtime context for worker tasks
+- connect shutdown to core disconnect and error events
+
+Expected result:
+
+- robust start/stop behavior around process cycle worker
+
+### 6) Migrate scripted peer into `pipewire` test support
+
+Changes:
+
+- move scenario/runtime/state/testkit model from [`/server/src`](/server/src) to internal `pipewire` test support modules
+- ensure it uses shared protocol I/O and marshal definitions
+- migrate tests into `pipewire/tests`
+
+Expected result:
+
+- deterministic testing without protocol duplication
+
+### 7) Remove standalone `server/` crate
+
+Changes:
+
+- remove workspace membership and dependencies from [`/Cargo.toml`](/Cargo.toml)
 - remove `pipewire-native-server` dependency from [`/pipewire/Cargo.toml`](/pipewire/Cargo.toml)
-- then remove `server` from workspace in [`/Cargo.toml`](/Cargo.toml)
+- delete crate once parity tests pass
 
-### G. Validate with real app flow (`wav-player`)
+Expected result:
 
-High concept:
+- single protocol stack in workspace
 
-- success means we can actually drive audio callback cycles, not just parse packets.
+### 8) Close the loop with `wav-player`
 
-Detailed work:
+Changes:
 
-- update [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs) to use the integrated bridge/runtime path
-- replace TODO block with working node bootstrap path
-- verify callback cadence and buffer writes are observable
-- keep deterministic scripted tests as regression safety for protocol ordering and fd behavior
+- replace integration TODO in [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs) with real node bootstrap path
+- wire callback to mapped buffer writes
+- validate behavior under deterministic scripted tests and real daemon scenario
 
-## Proposed execution phases (no timeline)
+Expected result:
 
-### Phase 1: Unify protocol mechanics
+- example demonstrates end-to-end node data-plane operation
 
-- shared protocol I/O helpers in `pipewire`
-- connection + scripted peer both consume same I/O helpers
+## Execution phases
 
-### Phase 2: Land node control-plane completeness
+### Phase A: Protocol unification
 
-- client-node marshal coverage
-- event surfacing and fd-safe handling
+- shared protocol I/O helpers
+- connection and scripted peer both consume shared helpers
 
-### Phase 3: Bridge to `node` runtime
+### Phase B: Node control-plane completeness
 
-- `ControlPlaneState` integration
-- transport binding and runtime lifecycle
+- client-node marshal decode and event surfacing
+- AddMem/RemoveMem ownership-correct forwarding
 
-### Phase 4: App-level validation
+### Phase C: Runtime bridge
 
-- `wav-player` integration TODOs removed
-- callback-based PCM writes functioning
+- transport binding + runtime spawn/supervision
 
-### Phase 5: Remove standalone `server/`
+### Phase D: Test harness consolidation
 
-- tests migrated
-- workspace cleaned
+- scripted peer moved into `pipewire`
+- parity tests migrated
 
-## Risks and guardrails
+### Phase E: Product validation + cleanup
 
-Key risks:
+- `wav-player` integration path implemented
+- remove standalone `server/`
 
-- event ordering bugs between `AddMem`, transport, and runtime start
-- fd ownership mistakes (leak/early close/double close)
-- hidden drift between test harness protocol behavior and client protocol behavior
-- runtime shutdown races between thread loop and Tokio tasks
+## Decision points and API shape concerns
 
-Guardrails:
+### Data-plane events API placement
 
-- one protocol stack in `pipewire`
-- all fd-bearing paths use explicit `OwnedFd` lifetimes
-- deterministic scripted tests for ordering-sensitive flows
-- app-level validation via `wav-player`
+Options:
+
+- extend `CoreEvents`
+- add dedicated `CoreDataPlaneEvents`
+- expose node-specific setup events via `NodeEvents`
+
+Recommended direction:
+
+- keep protocol-origin events near existing object model (`Core` and `Node` listeners), but avoid forcing all users to pay complexity for data-plane paths.
+
+### Bridge ownership model
+
+Options:
+
+- user-managed bridge object
+- `Core`-managed optional integration state
+- per-node managed state attached to proxy
+
+Recommended direction:
+
+- explicit user-managed bridge integration first (predictable ownership), with optional higher-level helper API later.
+
+### Tokio runtime relationship
+
+Risk:
+
+- `ThreadLoop` model and async worker model can deadlock or race if lifecycle is unclear.
+
+Requirement:
+
+- document and enforce runtime ownership contract at API boundaries.
+
+## Risks
+
+- protocol drift if scripted peer and connection paths diverge again
+- fd lifecycle bugs under reconnect/error races
+- incorrect event ordering assumptions around AddMem vs transport setup
+- format-negotiation mismatch between app PCM and negotiated buffer format
+
+## Guardrails
+
+- no duplicate protocol framing/parsing implementations
+- explicit `OwnedFd` semantics across boundaries
+- deterministic scenario tests for every ordering-sensitive path
+- integration validation with `wav-player` as acceptance reference
 
 ## Definition of done
 
-All of these are true:
+All must be true:
 
-- `pipewire` can configure and run node data-plane cycles through integrated control/runtime bridge.
-- [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs) no longer carries the node integration TODO block and can use the implemented path.
-- deterministic scripted tests for bootstrap, `AddMem`, transport setup, and cycle signaling run from `pipewire/tests`.
-- standalone `server/` crate is removed from workspace after parity.
-- no duplicate native header or SCM_RIGHTS protocol logic remains in separate crates.
+- `pipewire` can run node data-plane cycles via integrated bridge/runtime path.
+- AddMem/RemoveMem events are ownership-safe and feed node control state.
+- client-node transport/setup events are decoded and surfaced where needed.
+- deterministic scripted peer tests run from `pipewire/tests` with shared protocol internals.
+- `wav-player` TODO block is replaced by real wiring.
+- standalone `server/` crate is removed after parity.
 
 ## References
 
-- Node integration gap narrative: [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs)
-- Previous unification analysis: [`/doc/discovery/server-unification.md`](/doc/discovery/server-unification.md)
-- Earlier node discovery context: [`/doc/discovery/node.md`](/doc/discovery/node.md)
-- Initial implementation plan file: [`/doc/discovery/merge-impl-plan.md`](/doc/discovery/merge-impl-plan.md)
-- Current client protocol implementation: [`/pipewire/src/protocol`](/pipewire/src/protocol)
-- Current node primitives: [`/node/src`](/node/src)
-- Current standalone scripted server: [`/server/src`](/server/src)
+- Node integration gap baseline: [`/doc/discovery/node-integration.md`](/doc/discovery/node-integration.md)
+- Application-level evidence: [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs)
+- Initial unification analysis: [`/doc/discovery/server-unification.md`](/doc/discovery/server-unification.md)
+- Earlier node discovery: [`/doc/discovery/node.md`](/doc/discovery/node.md)
+- Implementation phase draft: [`/doc/discovery/merge-impl-plan.md`](/doc/discovery/merge-impl-plan.md)
+- Client protocol code: [`/pipewire/src/protocol`](/pipewire/src/protocol)
+- Node primitives: [`/node/src`](/node/src)
+- Standalone scripted server: [`/server/src`](/server/src)
 - Upstream protocol internals: [`pipewire/pipewire` `doc/dox/internals/protocol.dox`](https://gitlab.com/pipewire/pipewire/-/blob/master/doc/dox/internals/protocol.dox)
-- Upstream native protocol implementation: [`pipewire/pipewire` `src/modules/module-protocol-native/protocol-native.c`](https://gitlab.com/pipewire/pipewire/-/blob/master/src/modules/module-protocol-native/protocol-native.c)
-- Upstream client-node protocol implementation: [`pipewire/pipewire` `src/modules/module-client-node/protocol-native.c`](https://gitlab.com/pipewire/pipewire/-/blob/master/src/modules/module-client-node/protocol-native.c)
+- Upstream native protocol: [`pipewire/pipewire` `src/modules/module-protocol-native/protocol-native.c`](https://gitlab.com/pipewire/pipewire/-/blob/master/src/modules/module-protocol-native/protocol-native.c)
+- Upstream client-node protocol: [`pipewire/pipewire` `src/modules/module-client-node/protocol-native.c`](https://gitlab.com/pipewire/pipewire/-/blob/master/src/modules/module-client-node/protocol-native.c)
