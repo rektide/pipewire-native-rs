@@ -283,6 +283,139 @@ Expected result:
 - `wav-player` integration path implemented
 - remove standalone `server/`
 
+## Implementation path options
+
+This section captures practical ways to execute the merge, with explicit trade-offs.
+
+### Path 1: Product-first vertical slice
+
+Intent:
+
+- prove end-to-end node playback quickly, then harden architecture.
+
+Detailed sequence:
+
+1. Change AddMem/RemoveMem handling in [`/pipewire/src/core.rs`](/pipewire/src/core.rs) to forward ownership-safe events instead of closing/discarding.
+2. Add minimal transport/setup decode in `pipewire` sufficient for one node startup flow.
+3. Wire an internal bridge to feed `ControlPlaneState` and spawn `NodeRuntime`.
+4. Make [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs) run callback cycles and fill shared buffers.
+5. Backfill protocol-unification cleanup and test harness migration.
+
+Strengths:
+
+- fastest route to user-visible success
+- quickly validates real assumptions (ordering, format, callback behavior)
+
+Costs/Risks:
+
+- temporary glue code likely
+- higher chance of rework while unifying `server/`
+
+Best fit:
+
+- when immediate product proof is more valuable than early structural cleanliness
+
+### Path 2: Foundation-first unification
+
+Intent:
+
+- eliminate protocol duplication first, then layer node integration on top.
+
+Detailed sequence:
+
+1. Introduce shared protocol I/O module in [`/pipewire/src/protocol`](/pipewire/src/protocol) for header + SCM_RIGHTS.
+2. Refactor [`/pipewire/src/protocol/connection.rs`](/pipewire/src/protocol/connection.rs) to use shared helpers.
+3. Move scripted peer runtime from [`/server/src`](/server/src) into `pipewire` internal test support.
+4. Complete client-node marshal/event coverage.
+5. Add bridge/runtime wiring and then update wav-player.
+
+Strengths:
+
+- cleanest long-term architecture
+- lowest drift risk between runtime path and tests
+
+Costs/Risks:
+
+- slower to first audible end-to-end result
+- integration surprises discovered later in the sequence
+
+Best fit:
+
+- when maintainability and upstream-ready shape are top priority
+
+### Path 3: Hybrid staged progression (recommended)
+
+Intent:
+
+- get early behavior proof while still converging quickly on unified internals.
+
+Detailed sequence:
+
+1. First unify protocol I/O helpers in `pipewire` (small, high-leverage foundation).
+2. Immediately land AddMem/RemoveMem forwarding with `OwnedFd` semantics.
+3. Add minimal transport decode and bridge path to start `NodeRuntime`.
+4. Remove TODO path in wav-player by wiring real process callback flow.
+5. Expand marshal coverage and migrate scripted tests into `pipewire/tests`.
+6. Remove standalone `server/` crate after test parity.
+
+Strengths:
+
+- balanced speed and architecture
+- de-risks fd/protocol correctness early
+- gives a fast confidence checkpoint via wav-player
+
+Costs/Risks:
+
+- requires strict phase boundaries to avoid partial migrations lingering
+
+Best fit:
+
+- when both product proof and maintainable structure matter equally
+
+### Path 4: Full API redesign first
+
+Intent:
+
+- redesign data-plane API surfaces before implementation migration.
+
+Detailed sequence:
+
+1. Redesign how data-plane events are represented (`CoreEvents` extension vs separate data-plane API vs node-level API).
+2. Redesign bridge/runtime ownership model and lifecycle API.
+3. Implement new model end-to-end in one coordinated migration.
+4. Migrate tests/examples and remove legacy paths.
+
+Strengths:
+
+- potentially most elegant API end state
+
+Costs/Risks:
+
+- largest blast radius
+- highest delivery risk and longest feedback loop
+
+Best fit:
+
+- when existing event API is fundamentally inadequate and breakage is acceptable
+
+### Recommendation and near-term commitment
+
+Recommended path: **Path 3 (Hybrid staged progression)**.
+
+Why:
+
+- it directly addresses the `wav-player` integration blockers in [`/examples/wav-player/src/main.rs`](/examples/wav-player/src/main.rs)
+- it quickly reduces protocol drift by sharing I/O internals
+- it keeps us on-track to remove `server/` without delaying functional validation
+
+Near-term commitment under Path 3:
+
+1. Shared protocol I/O helper extraction in `pipewire`.
+2. AddMem/RemoveMem ownership-safe forwarding into node bridge state.
+3. Minimal transport event path to bind and run one processing loop.
+4. Wav-player callback path runs with real shared-memory/eventfd cycle.
+5. Scripted peer migration and `server/` removal after parity.
+
 ## Decision points and API shape concerns
 
 ### Data-plane events API placement
