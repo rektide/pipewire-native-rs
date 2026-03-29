@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["macros", "node", "pipewire", "server", "spa", "tools"]
+members = ["examples/wav-player", "macros", "node", "pipewire", "server", "spa", "tools"]
 default-members = ["macros", "node", "pipewire", "server", "spa", "tools"]
 
 [workspace.package]
@@ -18,3 +18,4 @@ pipewire-native-server = { path = "server", version = "0.1" }
 pipewire-native-spa = { path = "spa", version = "0.1" }
 pipewire-native = { path = "pipewire", version = "0.1" }
 pipewire-native-tools = { path = "tools", version = "0.1" }
+pipewire-native-wav-player = { path = "examples/wav-player", version = "0.1" }

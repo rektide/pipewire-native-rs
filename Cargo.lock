@@ -883,6 +883,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pipewire-native-wav-player"
+version = "0.1.4"
+dependencies = [
+ "pipewire-native",
+ "pipewire-native-node",
+ "pipewire-native-spa",
+ "tokio",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
