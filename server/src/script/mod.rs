@@ -124,6 +124,8 @@ pub struct CoreAddMemAction {
     pub id: u32,
     /// Memory type from `spa_data_type`.
     pub memory_type: u32,
+    /// Index of the descriptor in the outbound frame's FD table.
+    pub fd_index: i32,
     /// Extra memory flags.
     pub flags: u32,
     /// Allocated memfd size in bytes.

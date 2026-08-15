@@ -193,6 +193,7 @@ fn core_add_mem_emits_fd_and_payload() {
                         CoreAddMemAction::builder()
                             .id(321)
                             .memory_type(protocol::spa_data_type::MEM_FD)
+                            .fd_index(0)
                             .flags(0)
                             .size(4096)
                             .build(),
@@ -239,6 +240,7 @@ fn core_add_mem_emits_fd_and_payload() {
     let payload = decode_core_add_mem_payload(add_mem.payload.as_slice()).unwrap();
     assert_eq!(payload.id, 321);
     assert_eq!(payload.memory_type, protocol::spa_data_type::MEM_FD);
+    assert_eq!(payload.fd_index, 0);
     assert_eq!(payload.flags, 0);
 
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };

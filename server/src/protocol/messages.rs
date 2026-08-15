@@ -142,8 +142,8 @@ pub fn decode_inbound_message(
         }
         (CLIENT_ID, client_method::UPDATE_PROPERTIES) => {
             // Shape check only: Struct(Struct(PairList))
-            let _ = parse_struct(payload, |sp| {
-                let _ = sp.pop_struct(|sp| {
+            parse_struct(payload, |sp| {
+                sp.pop_struct(|sp| {
                     let n_items = sp.pop_int()?;
                     for _ in 0..n_items {
                         let _ = sp.pop_string()?;
@@ -232,15 +232,23 @@ pub struct CoreAddMemPayload {
     pub id: u32,
     /// Memory type from `spa_data_type`.
     pub memory_type: u32,
+    /// Index of the descriptor in the frame's FD table.
+    pub fd_index: i32,
     /// Extra memory flags.
     pub flags: u32,
 }
 
-/// Encodes a `Core::AddMem` payload. The fd is sent out-of-band.
-pub fn encode_core_add_mem_payload(id: u32, memory_type: u32, flags: u32) -> io::Result<Vec<u8>> {
+/// Encodes a `Core::AddMem` payload. The indexed fd is sent out-of-band.
+pub fn encode_core_add_mem_payload(
+    id: u32,
+    memory_type: u32,
+    fd_index: i32,
+    flags: u32,
+) -> io::Result<Vec<u8>> {
     encode_struct_payload(|sb| {
         sb.push_int(id as i32)
-            .push_int(memory_type as i32)
+            .push_id(spa::pod::types::Id(memory_type))
+            .push_fd(fd_index)
             .push_int(flags as i32)
     })
 }
@@ -249,12 +257,14 @@ pub fn encode_core_add_mem_payload(id: u32, memory_type: u32, flags: u32) -> io:
 pub fn decode_core_add_mem_payload(payload: &[u8]) -> io::Result<CoreAddMemPayload> {
     parse_struct(payload, |sp| {
         let id = sp.pop_int()?;
-        let memory_type = sp.pop_int()?;
+        let memory_type = sp.pop_id::<u32>()?;
+        let fd_index = sp.pop_fd()?;
         let flags = sp.pop_int()?;
 
         Ok(CoreAddMemPayload {
             id: id as u32,
-            memory_type: memory_type as u32,
+            memory_type: memory_type.0,
+            fd_index: fd_index.0,
             flags: flags as u32,
         })
     })
@@ -361,11 +371,12 @@ mod tests {
 
     #[test]
     fn roundtrip_core_add_mem_payload() {
-        let payload = encode_core_add_mem_payload(9, spa_data_type::MEM_FD, 5).unwrap();
+        let payload = encode_core_add_mem_payload(9, spa_data_type::MEM_FD, 2, 5).unwrap();
         let decoded = decode_core_add_mem_payload(payload.as_slice()).unwrap();
 
         assert_eq!(decoded.id, 9);
         assert_eq!(decoded.memory_type, spa_data_type::MEM_FD);
+        assert_eq!(decoded.fd_index, 2);
         assert_eq!(decoded.flags, 5);
     }
 }

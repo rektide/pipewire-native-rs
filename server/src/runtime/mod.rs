@@ -437,7 +437,8 @@ fn apply_action(
             Ok(true)
         }
         Action::SendCoreAddMem(mem) => {
-            let payload = encode_core_add_mem_payload(mem.id, mem.memory_type, mem.flags)?;
+            let payload =
+                encode_core_add_mem_payload(mem.id, mem.memory_type, mem.fd_index, mem.flags)?;
             let fd = create_memfd_for_add_mem(mem.id, mem.size)?;
             send_event_with_fds(
                 client,
