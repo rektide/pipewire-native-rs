@@ -10,3 +10,6 @@ edition.workspace = true
 libc.workspace = true
 pipewire-native-spa.workspace = true
 tokio = { version = "1.44.1", features = ["macros", "net", "rt", "sync"] }
+
+[dev-dependencies]
+static_assertions = "1.1.0"

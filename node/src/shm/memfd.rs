@@ -61,8 +61,10 @@ pub struct MappedRegion {
     len: usize,
 }
 
+// SAFETY: an mmap mapping may be accessed and unmapped from a thread other than
+// the one that created it. Moving this value transfers its only Rust owner, and
+// mutable slice access requires an exclusive borrow.
 unsafe impl Send for MappedRegion {}
-unsafe impl Sync for MappedRegion {}
 
 impl MappedRegion {
     /// Maps a region from an fd with `MAP_SHARED`.
@@ -203,7 +205,12 @@ impl Drop for MappedRegion {
 mod tests {
     use std::{io::ErrorKind, os::fd::AsFd};
 
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
+
     use super::{create_memfd, MappedRegion};
+
+    assert_impl_all!(MappedRegion: Send);
+    assert_not_impl_any!(MappedRegion: Sync);
 
     #[test]
     fn map_and_mutate_memfd_region() {

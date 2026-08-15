@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright (c) 2026 Asymptotic Inc.
 
-use std::{io, os::fd::OwnedFd};
+use std::{future::Future, io, os::fd::OwnedFd};
 
 use crate::{
     shm::{MappedRegion, MemoryRegistry},
@@ -56,8 +56,8 @@ impl BoundTransport {
     }
 
     /// Waits for a processing trigger.
-    pub async fn wait_cycle(&self) -> io::Result<u64> {
-        self.trigger.wait().await
+    pub fn wait_cycle(&self) -> impl Future<Output = io::Result<u64>> + Send + '_ {
+        self.trigger.wait()
     }
 
     /// Signals processing completion.

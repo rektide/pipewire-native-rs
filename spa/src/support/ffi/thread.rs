@@ -86,12 +86,15 @@ static THREAD_UTILS_METHODS: CThreadUtilsMethods = CThreadUtilsMethods {
 
 struct ThreadUtilsCIface {}
 
-// We need this because raw pointers are not `Send` by default
+// Transfers a C-owned argument into the newly created thread, or its return
+// value back to the thread that successfully joins it.
 struct SendablePtr {
     value: *mut c_void,
 }
 
-unsafe impl Sync for SendablePtr {}
+// SAFETY: each pointer is moved across a thread boundary exactly once. The
+// creating side does not dereference the argument after successful creation,
+// and the returned pointer stays in the joined thread's owned result until join.
 unsafe impl Send for SendablePtr {}
 
 impl ThreadUtilsCIface {
@@ -194,4 +197,14 @@ impl ThreadUtilsCIface {
             Err(e) => e.raw_os_error().unwrap_or(-1),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
+
+    use super::SendablePtr;
+
+    assert_impl_all!(SendablePtr: Send);
+    assert_not_impl_any!(SendablePtr: Sync);
 }

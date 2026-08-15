@@ -844,6 +844,7 @@ version = "0.1.4"
 dependencies = [
  "libc",
  "pipewire-native-spa",
+ "static_assertions",
  "tokio",
 ]
 
@@ -877,6 +878,7 @@ dependencies = [
  "num",
  "pipewire-native-macros",
  "pkg-config",
+ "static_assertions",
 ]
 
 [[package]]
