@@ -84,7 +84,13 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 
 fn read_eventfd(fd: RawFd) -> io::Result<u64> {
     let mut value = 0u64;
-    let read = unsafe { libc::read(fd, (&mut value as *mut u64).cast(), std::mem::size_of::<u64>()) };
+    let read = unsafe {
+        libc::read(
+            fd,
+            (&mut value as *mut u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
 
     if read < 0 {
         let err = io::Error::last_os_error();
@@ -106,7 +112,13 @@ fn read_eventfd(fd: RawFd) -> io::Result<u64> {
 }
 
 fn write_eventfd(fd: RawFd, value: u64) -> io::Result<()> {
-    let written = unsafe { libc::write(fd, (&value as *const u64).cast(), std::mem::size_of::<u64>()) };
+    let written = unsafe {
+        libc::write(
+            fd,
+            (&value as *const u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
 
     if written < 0 {
         return Err(io::Error::last_os_error());
