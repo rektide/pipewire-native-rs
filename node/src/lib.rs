@@ -11,6 +11,8 @@
 pub mod control;
 /// Runtime worker that drives process callbacks from transport signals.
 pub mod runtime;
+/// ClientNode session-domain primitives.
+pub mod session;
 /// Shared memory helpers for memfd import and mapping.
 pub mod shm;
 /// Eventfd signal wrappers.
