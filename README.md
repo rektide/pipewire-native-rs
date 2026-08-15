@@ -53,6 +53,10 @@ cargo test --workspace --exclude pipewire-native
 cargo test -p pipewire-native --test scripted_server_add_mem
 ```
 
+The node crate's private activation ABI support and opt-in upstream differential
+probe are documented in [`node/README.md`](/node/README.md). Normal builds do not
+require a PipeWire source checkout.
+
 The complete `pipewire-native` integration suite also exercises an external
 `pipewire` executable and installed SPA modules. These tests have bounded waits but
 remain environment-dependent:

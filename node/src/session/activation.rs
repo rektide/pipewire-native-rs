@@ -11,9 +11,13 @@ use std::{
     sync::atomic::{AtomicI32, AtomicU32, Ordering},
 };
 
-mod abi {
-    include!(concat!(env!("OUT_DIR"), "/activation_abi.rs"));
-}
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")))]
+compile_error!(
+    "pipewire-native-node activation ABI is currently supported only on x86_64-unknown-linux-gnu; add and differentially verify a target-specific ABI table before enabling another target"
+);
+
+#[path = "abi/x86_64_unknown_linux_gnu.rs"]
+mod abi;
 
 /// The activation shared-memory ABI version used by ClientNode v6.
 pub const ACTIVATION_VERSION: u32 = 1;
@@ -369,20 +373,6 @@ mod tests {
     assert_impl_all!(ActivationView<'static>: Send);
     assert_not_impl_any!(ActivationView<'static>: Sync);
 
-    unsafe extern "C" {
-        static pw_activation_abi_size: usize;
-        static pw_activation_abi_align: usize;
-        static pw_activation_abi_status: usize;
-        static pw_activation_abi_state0_status: usize;
-        static pw_activation_abi_state0_required: usize;
-        static pw_activation_abi_state0_pending: usize;
-        static pw_activation_abi_signal_time: usize;
-        static pw_activation_abi_awake_time: usize;
-        static pw_activation_abi_finish_time: usize;
-        static pw_activation_abi_client_version: usize;
-        static pw_activation_abi_server_version: usize;
-    }
-
     struct Fixture {
         words: Vec<u64>,
     }
@@ -406,23 +396,6 @@ mod tests {
             unsafe {
                 ActivationView::from_raw_parts(self.words.as_mut_ptr().cast(), abi::SIZE).unwrap()
             }
-        }
-    }
-
-    #[test]
-    fn c_abi_matches_generated_rust_layout() {
-        unsafe {
-            assert_eq!(pw_activation_abi_size, abi::SIZE);
-            assert_eq!(pw_activation_abi_align, abi::ALIGN);
-            assert_eq!(pw_activation_abi_status, abi::STATUS);
-            assert_eq!(pw_activation_abi_state0_status, abi::STATE0_STATUS);
-            assert_eq!(pw_activation_abi_state0_required, abi::STATE0_REQUIRED);
-            assert_eq!(pw_activation_abi_state0_pending, abi::STATE0_PENDING);
-            assert_eq!(pw_activation_abi_signal_time, abi::SIGNAL_TIME);
-            assert_eq!(pw_activation_abi_awake_time, abi::AWAKE_TIME);
-            assert_eq!(pw_activation_abi_finish_time, abi::FINISH_TIME);
-            assert_eq!(pw_activation_abi_client_version, abi::CLIENT_VERSION);
-            assert_eq!(pw_activation_abi_server_version, abi::SERVER_VERSION);
         }
     }
 
