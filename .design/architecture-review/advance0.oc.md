@@ -48,7 +48,7 @@ safe Rust and protocol interfaces.
 This wave moved the repository from architecture review into implementation:
 
 1. Malformed POD shapes now have checked size and progress invariants plus targeted regressions.
-2. Shared mappings validate ranges and support unaligned logical regions safely.
+2. Shared mappings validate ranges and correctly support unaligned logical regions; raw shared access now retains an explicit unsafe contract.
 3. SPA memory-kind values now have one canonical definition and node decoding is correct.
 4. SPA plugin callbacks now use the C ABI and retain their dynamic owners.
 5. Hook callbacks no longer run under the hook-list mutex.
@@ -104,6 +104,15 @@ The normal SPA test suite now sends reproducibly generated and structured-invali
 byte slices through typed and raw POD entry points. This is a persistent broad
 no-panic/no-hang sweep, not a substitute for coverage-guided mutation or an explicit
 peer-allocation policy.
+
+Commit: `770c2e0c` (`Add persistent SPA POD fuzz harness`)
+
+[`/fuzz`](/fuzz) is an independent `cargo-fuzz` workspace that exercises typed POD
+decoders, typed parser methods, and raw array/choice/object parsing. Its checked-in
+corpus includes truncated headers and bodies, zero-child containers, undersized
+objects/choices/arrays, padding failures, and valid nested forms. Inputs are capped
+at 64 KiB; normal compilation succeeds with `cargo check --manifest-path
+fuzz/Cargo.toml`.
 
 ### Canonical SPA memory kinds
 
@@ -293,15 +302,15 @@ goal; the new epic makes shared framing one prerequisite of the ClientNode outco
 
 ### Frame consumer migration
 
-The scripted peer and client outbound paths now use the shared transport. Client
-inbound dispatch still uses its original byte/global-FD state until the owned-frame
-migration lands. Session and scenario interfaces remain outside the frame crate.
+The scripted peer and both client directions now use the shared transport. Session
+and scenario interfaces remain outside the frame crate. The remaining compatibility
+gap is the scripted peer's legacy AddMem payload adapter.
 
 ### AddMem importer
 
-`Core::AddMem` still converts an owned descriptor into one raw owning integer and
-the built-in listener closes it. The new `FrameFds::take` operation is the mechanism
-for transferring it exactly once, but client inbound framing must migrate first.
+Core AddMem now decodes an explicit frame-local FD index and transfers one `OwnedFd`
+through a single-owner importer. The private owning-raw-FD multicast is removed.
+The scripted server's AddMem action still needs the same canonical explicit index.
 
 ### Minimum ClientNode protocol
 
@@ -387,8 +396,17 @@ byte and raw-FD queues are gone. Sequence allocation, generation footers, and
 `need_flush` remain session behavior. Existing callers still observe `EAGAIN` for
 would-block, and no-FD wire bytes remain identical.
 
-Inbound framing remains on the old buffer/global-FD path pending the owned-frame
-migration.
+Follow-up commits `28493dc5fa5e` and `a1b6c27b5983` complete inbound migration.
+`Connection` now owns a `FrameReceiver`; client routing receives one complete owned
+frame before object lookup; demarshallers consume payload and indexed `FrameFds`;
+unknown objects drop one frame and its FDs; final frames drain before HUP. The old
+inbound byte buffers, global FD queue, `next_message`, connection-coupled decode, and
+`pop_fd` are removed.
+
+Core AddMem now decodes its explicit SPA FD index and transfers one `OwnedFd` through
+the additive single-owner `CoreMemoryImporter` interface. With no importer installed,
+the descriptor is logged and dropped. Importer teardown receives deterministic
+removal cleanup.
 
 ### Scripted peer framing migrated
 
@@ -488,11 +506,28 @@ expose lengths, seal metadata, and raw pointers only. This does not yet provide 
 desired safe typed activation API; it prevents the temporary raw substrate from
 claiming guarantees it cannot prove.
 
+### Activation v1 atomics implemented with explicit ABI support
+
+Commit: `82a042ac9687` (`Implement activation ABI view`)
+
+The new node session activation module provides an unsafe-to-construct, `Send` but
+not `Sync` view with exact statuses and SeqCst transitions for v6 readiness, trigger,
+claim, finish, required/pending/result state, and volatile timing fields. It never
+forms a Rust reference over the complete externally mutated C record. Tests compare
+size, alignment, and selected offsets with an upstream C probe and cover invalid
+regions/transitions.
+
+Follow-up commit `c7530ef2ce9c` removes the first non-portable build probe. Normal
+builds use checked-in constants for the explicitly supported
+`x86_64-unknown-linux-gnu` ABI and fail clearly on unsupported targets. Upstream
+private-header differential validation is an opt-in developer tool under
+[`/node/tools`](/node/tools), not a package-build dependency. Builds and tests pass
+with both `HOME` and `PIPEWIRE_SOURCE_DIR` unset.
+
 ### Work continuing from this wave
 
-- migrate client inbound dispatch to owned frames and frame-local FDs;
-- replace AddMem raw-FD broadcast with one importer;
-- implement the typed session and activation ABI from the accepted design.
+- canonicalize the scripted server's explicit AddMem frame-FD index and integration test;
+- implement the remaining typed memory/port/buffer/cycle session on the activation foundation.
 
 ## Cross-references
 
