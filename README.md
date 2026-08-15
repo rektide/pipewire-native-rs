@@ -23,9 +23,9 @@ This workspace contains several layers at different maturity levels:
 |---|---|---|
 | SPA primitives and support interfaces | `spa/` | Implements POD codecs, parameter types, hooks, and hybrid Rust/C SPA support. Safety hardening is ongoing. |
 | Native PipeWire client | `pipewire/` | Connects to a daemon, manages proxies, enumerates the graph, and creates server-side objects. |
-| Native frame transport | `protocol/` | Implements incremental native frames with frame-owned SCM_RIGHTS descriptors. Client and scripted-peer migration is in progress. |
+| Native frame transport | `protocol/` | Implements incremental native frames with frame-owned SCM_RIGHTS descriptors. Both client directions and the scripted peer use it. Deterministic EINTR injection remains a test gap. |
 | Deterministic scripted peer | `server/` | Exercises native-protocol behavior over real Unix sockets without requiring a full daemon. It is test infrastructure, not a production server. |
-| Node data-plane substrate | `node/` | Provides imported-memory, mapping, eventfd, and worker primitives. It is not yet a complete ClientNode implementation. |
+| Node data-plane substrate | `node/` | Provides imported-memory, eventfd, activation-v1 atomics, and typed synchronous output-buffer publication. It is not yet a complete ClientNode session. |
 | WAV playback target | `examples/wav-player/` | Parses PCM WAV files and connects to PipeWire; typed ClientNode buffer processing remains under development. |
 | Object browser | `tools/` | Provides the experimental `pw-browse` TUI. |
 
