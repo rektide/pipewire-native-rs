@@ -28,6 +28,7 @@ This workspace contains several layers at different maturity levels:
 | Node data-plane substrate | `node/` | Provides imported-memory, eventfd, activation-v1 atomics, and typed synchronous output-buffer publication. It is not yet a complete ClientNode session. |
 | WAV playback target | `examples/wav-player/` | Parses PCM WAV files and connects to PipeWire; typed ClientNode buffer processing remains under development. |
 | Object browser | `tools/` | Provides the experimental `pw-browse` TUI. |
+| Correctness-first stress harness | `stress/` | Reuses parameterized frame, POD, and session-memory workloads as fast tests, direct load runs, and release-mode Hyperfine matrices. |
 
 The next product milestone is one ownership-safe ClientNode v6 process cycle with
 typed activation, port IO, and media buffers. The architecture and active work are
@@ -51,6 +52,15 @@ Run deterministic workspace tests that do not launch a host PipeWire daemon with
 ```sh
 cargo test --workspace --exclude pipewire-native
 cargo test -p pipewire-native --test scripted_server_add_mem
+```
+
+Parameterized subsystem load and Hyperfine benchmarks are documented in the
+[`stress` harness](/stress/README.md). The harness verifies deterministic checksums,
+counts, FD ownership, and lifecycle state before reporting a successful sample:
+
+```sh
+cargo test --manifest-path stress/Cargo.toml
+stress/hyperfine.sh
 ```
 
 The node crate's private activation ABI support and opt-in upstream differential
