@@ -13,6 +13,10 @@
 - [`inventory0.gpt56.md`](/.design/client-node-protocol/inventory0.gpt56.md): upstream ClientNode v6 opcode, POD, activation, buffer, processing, and peer-signaling inventory for the minimum playback path.
 - [`session0.gpt56s.md`](/.design/client-node-session/session0.gpt56s.md): typed per-node session, generation retirement, activation atomics, port IO/buffer cycle, peer signaling, teardown, and runtime-adapter design.
 
+## Developer Harnesses
+
+- [`SPA POD fuzzing`](/fuzz/README.md): persistent coverage-guided harness and regression corpus for typed and raw POD decoding.
+
 ## Historical Discovery
 
 - [`node.md`](/doc/discovery/node.md): initial node data-plane plan. Its opening current-state claims predate receive-side SCM_RIGHTS and AddMem decoding.
