@@ -13,24 +13,47 @@ pub(crate) struct InboundMessage<'a> {
     payload: &'a [u8],
     fds: &'a mut FrameFds,
     footer: Option<CoreFooter>,
+    footer_handler: Option<&'a dyn Fn(&CoreFooter)>,
 }
 
 impl<'a> InboundMessage<'a> {
+    #[cfg(test)]
     pub(crate) fn new(opcode: u8, payload: &'a [u8], fds: &'a mut FrameFds) -> Self {
         Self {
             opcode,
             payload,
             fds,
             footer: None,
+            footer_handler: None,
+        }
+    }
+
+    pub(crate) fn with_footer_handler(
+        opcode: u8,
+        payload: &'a [u8],
+        fds: &'a mut FrameFds,
+        footer_handler: &'a dyn Fn(&CoreFooter),
+    ) -> Self {
+        Self {
+            opcode,
+            payload,
+            fds,
+            footer: None,
+            footer_handler: Some(footer_handler),
         }
     }
 
     pub(crate) fn decode<T: Marshallable>(&mut self) -> std::io::Result<T> {
         let (body, body_size) = T::decode(self.opcode, self.payload).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("could not decode message body: {error:?}"),
-            )
+            let kind = match &error {
+                spa::pod::Error::Invalid(message)
+                    if message == &format!("Could not decode opcode {}", self.opcode) =>
+                {
+                    std::io::ErrorKind::Unsupported
+                }
+                _ => std::io::ErrorKind::InvalidData,
+            };
+            std::io::Error::new(kind, format!("could not decode message body: {error:?}"))
         })?;
         let (footer, footer_size) = if body_size < self.payload.len() {
             let (footer, size) =
@@ -54,6 +77,9 @@ impl<'a> InboundMessage<'a> {
             ));
         }
         self.footer = footer;
+        if let (Some(handler), Some(footer)) = (self.footer_handler, self.footer.as_ref()) {
+            handler(footer);
+        }
         Ok(body)
     }
 
@@ -61,10 +87,6 @@ impl<'a> InboundMessage<'a> {
         self.fds
             .take(index)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(crate) fn footer(&self) -> Option<&CoreFooter> {
-        self.footer.as_ref()
     }
 }
 

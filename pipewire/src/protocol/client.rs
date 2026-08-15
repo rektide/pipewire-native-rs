@@ -232,78 +232,96 @@ impl Client {
             }
         };
         let (_, payload, mut fds) = frame.into_parts();
-        let mut message =
-            super::marshal::message::InboundMessage::new(header.opcode, &payload, &mut fds);
+        let update_generation = |footer: &super::marshal::message::CoreFooter| {
+            self.inner.connection.update_generation(Some(footer));
+        };
+        let mut message = super::marshal::message::InboundMessage::with_footer_handler(
+            header.opcode,
+            &payload,
+            &mut fds,
+            &update_generation,
+        );
 
-        match object_type {
+        let result = match object_type {
             types::interface::CORE => {
                 let core = core.find_object::<Core>(header.object_id).unwrap();
-                super::marshal::core::Events::demarshal(&mut message, core)?;
+                super::marshal::core::Events::demarshal(&mut message, core)
             }
             types::interface::CLIENT => {
                 let client = core
                     .find_object::<proxy::client::Client>(header.object_id)
                     .unwrap();
-                super::marshal::client::Events::demarshal(&mut message, client)?;
+                super::marshal::client::Events::demarshal(&mut message, client)
             }
             types::interface::DEVICE => {
                 let device = core
                     .find_object::<proxy::device::Device>(header.object_id)
                     .unwrap();
-                super::marshal::device::Events::demarshal(&mut message, device)?;
+                super::marshal::device::Events::demarshal(&mut message, device)
             }
             types::interface::FACTORY => {
                 let factory = core
                     .find_object::<proxy::factory::Factory>(header.object_id)
                     .unwrap();
-                super::marshal::factory::Events::demarshal(&mut message, factory)?;
+                super::marshal::factory::Events::demarshal(&mut message, factory)
             }
             types::interface::LINK => {
                 let link = core
                     .find_object::<proxy::link::Link>(header.object_id)
                     .unwrap();
-                super::marshal::link::Events::demarshal(&mut message, link)?;
+                super::marshal::link::Events::demarshal(&mut message, link)
             }
             types::interface::METADATA => {
                 let metadata = core
                     .find_object::<proxy::metadata::Metadata>(header.object_id)
                     .unwrap();
-                super::marshal::metadata::Events::demarshal(&mut message, metadata)?;
+                super::marshal::metadata::Events::demarshal(&mut message, metadata)
             }
             types::interface::MODULE => {
                 let module = core
                     .find_object::<proxy::module::Module>(header.object_id)
                     .unwrap();
-                super::marshal::module::Events::demarshal(&mut message, module)?;
+                super::marshal::module::Events::demarshal(&mut message, module)
             }
             types::interface::NODE => {
                 let node = core
                     .find_object::<proxy::node::Node>(header.object_id)
                     .unwrap();
-                super::marshal::node::Events::demarshal(&mut message, node)?;
+                super::marshal::node::Events::demarshal(&mut message, node)
             }
             types::interface::PORT => {
                 let port = core
                     .find_object::<proxy::port::Port>(header.object_id)
                     .unwrap();
-                super::marshal::port::Events::demarshal(&mut message, port)?;
+                super::marshal::port::Events::demarshal(&mut message, port)
             }
             types::interface::PROFILER => {
                 let profiler = core
                     .find_object::<proxy::profiler::Profiler>(header.object_id)
                     .unwrap();
-                super::marshal::profiler::Events::demarshal(&mut message, profiler)?;
+                super::marshal::profiler::Events::demarshal(&mut message, profiler)
             }
             types::interface::REGISTRY => {
                 let registry = core
                     .find_object::<proxy::registry::Registry>(header.object_id)
                     .unwrap();
-                super::marshal::registry::Events::demarshal(&mut message, registry)?;
+                super::marshal::registry::Events::demarshal(&mut message, registry)
             }
             _ => unreachable!(),
+        };
+
+        if let Err(error) = result {
+            if error.kind() == std::io::ErrorKind::Unsupported {
+                warn!(
+                    "Ignoring unknown opcode {} for object {} ({object_type})",
+                    header.opcode, header.object_id
+                );
+                *self.inner.last_in_seq.write().unwrap() = header.seq;
+                return Ok(());
+            }
+            return Err(error);
         }
 
-        self.inner.connection.update_generation(message.footer());
         *self.inner.last_in_seq.write().unwrap() = header.seq;
 
         Ok(())
@@ -429,7 +447,7 @@ impl InnerClient {
 mod tests {
     use std::{
         io::{pipe, Read},
-        os::fd::AsRawFd,
+        os::fd::{AsFd, AsRawFd},
         os::unix::net::{UnixListener, UnixStream},
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -438,12 +456,23 @@ mod tests {
     };
 
     use serial_test::serial;
+    use spa::pod::Pod;
 
     use crate::{
         context::Context,
+        core::CoreEvents,
         properties::Properties,
-        protocol::marshal::Marshallable,
+        protocol::marshal::{
+            core::Methods,
+            message::{
+                ClientFooter, ClientFooterPayload, CoreFooter, CoreFooterPayload, CoreGeneration,
+            },
+            Marshallable,
+        },
         proxy::{HasProxy, ProxyEvents},
+    };
+    use pipewire_native_protocol::native::frame::{
+        FrameLimits, FrameReceiver, FrameSender, OutboundFrame, ReceiveOutcome,
     };
 
     use super::*;
@@ -492,6 +521,28 @@ mod tests {
         }
     }
 
+    fn two_int_payload(first: i32, second: i32) -> Vec<u8> {
+        let mut payload = vec![0; 128];
+        let size = spa::pod::builder::Builder::new(&mut payload)
+            .push_struct(|builder| builder.push_int(first).push_int(second))
+            .build()
+            .unwrap()
+            .len();
+        payload.truncate(size);
+        payload
+    }
+
+    fn append_generation(payload: &mut Vec<u8>, generation: i64) {
+        let mut footer = CoreFooter::new();
+        footer.push(CoreFooterPayload::Generation(CoreGeneration {
+            registry_generation: generation,
+        }));
+        let offset = payload.len();
+        payload.resize(offset + 128, 0);
+        let size = footer.encode(&mut payload[offset..]).unwrap();
+        payload.truncate(offset + size);
+    }
+
     fn test_core() -> (
         tempfile::TempDir,
         main_loop::MainLoop,
@@ -522,6 +573,95 @@ mod tests {
         }
 
         (runtime, main_loop, context, core, peer)
+    }
+
+    #[test]
+    #[serial]
+    fn generation_bearing_ping_yields_generation_bearing_pong() {
+        let (_runtime, main_loop, _context, core, mut peer) = test_core();
+        core.connection().flush().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut drain = [0; 4096];
+        loop {
+            match peer.read(&mut drain) {
+                Ok(0) => panic!("client connection closed"),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to drain setup frames: {error}"),
+            }
+        }
+
+        let limits = FrameLimits::default();
+        let mut payload = two_int_payload(0, 73);
+        append_generation(&mut payload, 19);
+        let mut sender = FrameSender::new(limits);
+        sender
+            .enqueue(OutboundFrame::new(0, 2, 8, payload, Vec::new(), limits).unwrap())
+            .unwrap();
+        sender.flush(peer.as_fd()).unwrap();
+
+        main_loop
+            .iterate(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        core.connection().flush().unwrap();
+
+        let mut receiver = FrameReceiver::new(limits);
+        let frame = loop {
+            match receiver.receive(peer.as_fd()).unwrap() {
+                ReceiveOutcome::Frame(frame) => break frame,
+                ReceiveOutcome::WouldBlock => continue,
+                ReceiveOutcome::Closed => panic!("client connection closed before Pong"),
+            }
+        };
+        assert_eq!(frame.header().opcode, 3);
+        let (_, payload, _) = frame.into_parts();
+        let (_, body_size) = Methods::decode(3, &payload).unwrap();
+        let (footer, footer_size) = ClientFooter::decode(&payload[body_size..]).unwrap();
+        assert_eq!(body_size + footer_size, payload.len());
+        let ClientFooterPayload::Generation(generation) = &footer.payloads[0];
+        assert_eq!(generation.client_generation, 19);
+    }
+
+    #[test]
+    #[serial]
+    fn unknown_opcode_drops_its_fds_and_following_done_dispatches() {
+        let (_runtime, _main_loop, _context, core, _core_peer) = test_core();
+        let client = Client::new();
+        client.set_core(core.downgrade());
+        let (stream, peer) = UnixStream::pair().unwrap();
+        client.set_stream(stream).unwrap();
+
+        let done_count = Arc::new(AtomicUsize::new(0));
+        let done_count_cb = done_count.clone();
+        core.add_listener(CoreEvents::new(
+            None,
+            Some(Box::new(move |_, _| {
+                done_count_cb.fetch_add(1, Ordering::Relaxed);
+            })),
+            None,
+        ));
+
+        let (mut fd_reader, fd_writer) = pipe().unwrap();
+        let limits = FrameLimits::default();
+        let mut sender = FrameSender::new(limits);
+        sender
+            .enqueue(
+                OutboundFrame::new(0, 255, 10, Vec::new(), vec![fd_writer.into()], limits).unwrap(),
+            )
+            .unwrap();
+        sender
+            .enqueue(
+                OutboundFrame::new(0, 1, 11, two_int_payload(0, 74), Vec::new(), limits).unwrap(),
+            )
+            .unwrap();
+        sender.flush(peer.as_fd()).unwrap();
+
+        client.process_messages().unwrap();
+        let mut byte = [0];
+        assert_eq!(fd_reader.read(&mut byte).unwrap(), 0);
+        client.process_messages().unwrap();
+        assert_eq!(done_count.load(Ordering::Relaxed), 1);
+        assert_eq!(*client.inner.last_in_seq.read().unwrap(), 11);
     }
 
     #[test]

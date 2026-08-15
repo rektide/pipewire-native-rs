@@ -103,16 +103,15 @@ impl Connection {
     ) -> std::io::Result<()> {
         let seq = *self.inner.out_seq.read().unwrap();
 
-        let recv_generation = self.inner.last_recv_generation.read().unwrap();
-        let mut sent_generation = self.inner.last_sent_generation.write().unwrap();
+        let recv_generation = *self.inner.last_recv_generation.read().unwrap();
+        let sent_generation = *self.inner.last_sent_generation.read().unwrap();
 
         // TODO: support CoreGeneration as well when we implement server
-        let footer = if *recv_generation > *sent_generation {
-            *sent_generation = *recv_generation;
-            trace!("sending client generation {}", *recv_generation);
+        let footer = if recv_generation > sent_generation {
+            trace!("sending client generation {recv_generation}");
             let mut footer = ClientFooter::new();
             footer.push(ClientFooterPayload::Generation(ClientGeneration {
-                client_generation: *recv_generation,
+                client_generation: recv_generation,
             }));
             Some(footer)
         } else {
@@ -156,6 +155,10 @@ impl Connection {
             .unwrap()
             .enqueue(frame)
             .map_err(frame_error)?;
+
+        if footer.is_some() {
+            *self.inner.last_sent_generation.write().unwrap() = recv_generation;
+        }
 
         trace!("pushed message id:{id} opcode:{opcode} seq:{seq} payload:{object:?}");
 
@@ -260,6 +263,8 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     use pipewire_native_protocol::native::frame::{Header, HEADER_LEN};
+
+    use crate::protocol::marshal::message::CoreGeneration;
 
     use super::*;
 
@@ -396,6 +401,38 @@ mod tests {
             "queued frame did not drain after socket became writable"
         );
         assert!(connection.inner.sender.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn enqueue_rejection_preserves_generation_for_the_next_frame() {
+        let (tx, rx) = UnixStream::pair().unwrap();
+        let connection = connection(tx);
+        let mut footer = CoreFooter::new();
+        footer.push(CoreFooterPayload::Generation(CoreGeneration {
+            registry_generation: 41,
+        }));
+        connection.update_generation(Some(&footer));
+
+        *connection.inner.sender.write().unwrap() = FrameSender::new(FrameLimits {
+            max_queued_bytes: 0,
+            ..FrameLimits::default()
+        });
+        assert!(connection.push(3, TestMessage(vec![0x5a])).is_err());
+        assert_eq!(*connection.inner.last_sent_generation.read().unwrap(), 0);
+
+        *connection.inner.sender.write().unwrap() = FrameSender::new(FrameLimits::default());
+        connection.push(3, TestMessage(vec![0x5a])).unwrap();
+        connection.flush().unwrap();
+
+        let mut receiver = FrameReceiver::new(FrameLimits::default());
+        let ReceiveOutcome::Frame(frame) = receiver.receive(rx.as_fd()).unwrap() else {
+            panic!("expected queued frame");
+        };
+        let (_, payload, _) = frame.into_parts();
+        let (footer, size) = ClientFooter::decode(&payload[1..]).unwrap();
+        assert_eq!(size, payload.len() - 1);
+        let ClientFooterPayload::Generation(generation) = &footer.payloads[0];
+        assert_eq!(generation.client_generation, 41);
     }
 
     #[test]
