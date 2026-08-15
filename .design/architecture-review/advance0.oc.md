@@ -558,6 +558,22 @@ finally `HAVE_DATA`. Public-header ABI differential checks live under
 [`/node/tools`](/node/tools). Metadata interpretation, multiple data planes, and
 async two-slot IO remain deferred.
 
+### Generational session memory pool implemented
+
+Commit: `86cc4b9b9780` (`Add generational ClientNode memory pool`)
+
+The node session now has a sole-owner `MemoryPool` with typed IDs, generation keys,
+regions, mappings, and errors. It accepts canonical `SPA_DATA_MemFd`, enforces the
+selected shrink policy, rejects duplicate active IDs, retires removed generations,
+rejects stale keys, and permits ID reuse only with a new generation. Existing
+mapping guards keep the retired FD alive until their final drop; new bindings fail.
+
+Tests cover unsupported and unknown memory types, checked ranges, duplicate IDs,
+active removal, generation reuse, clear/disconnect, seal policy, and repeated
+`/proc/self/fd` baseline cycles. Shared bytes remain behind raw pointers or explicit
+unsafe guard methods. The `CoreMemoryImporter` adapter and full per-node configurator
+remain the next integration seam.
+
 ### Post-migration ownership review fixes
 
 The independent frame review found several defects after the initial consumer
@@ -578,13 +594,15 @@ the first green tests as sufficient:
   socket owners, updates connection state, and is covered with close-observable
   buffered/queued descriptor tests.
 
-The remaining session-compatibility findings are tracked by
-`SU-client-node-cycle-session-dispatch`: generation footer ordering, enqueue commit
-semantics, and unknown-opcode continuation.
+`5efed7ceff33` closes the session-compatibility findings: validated inbound
+generation is applied before callback dispatch, outbound generation advances only
+after successful enqueue, and an FD-bearing unknown opcode is dropped frame-locally
+while the following valid event still dispatches. Malformed known payloads, footers,
+trailing bytes, and FD indices remain terminal by policy.
 
 ### Work continuing from this wave
 
-- implement the remaining memory-pool, metadata, peer, generation, and session state on the typed activation/port foundation.
+- connect Core imports to the memory pool, then implement metadata, peer activation, per-node configuration, and complete cycle/session state.
 
 ## Cross-references
 
