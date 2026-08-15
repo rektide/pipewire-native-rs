@@ -267,9 +267,9 @@ the files intentionally changed by this wave.
 Final verification after the follow-up fixes supersedes that earlier snapshot:
 
 - `cargo test --workspace --exclude pipewire-native`: passed;
-- client library unit tests: 14 passed;
+- client library unit tests: 19 passed;
 - client main-loop tests: 3 passed;
-- canonical scripted AddMem/RemoveMem integration: 2 passed;
+- canonical scripted AddMem/RemoveMem integration: 4 passed in three consecutive runs;
 - strict `cargo clippy --workspace --all-targets -- -D warnings`: passed;
 - `cargo fmt --all -- --check`: passed;
 - `cargo check --manifest-path fuzz/Cargo.toml`: passed;
@@ -571,8 +571,16 @@ mapping guards keep the retired FD alive until their final drop; new bindings fa
 Tests cover unsupported and unknown memory types, checked ranges, duplicate IDs,
 active removal, generation reuse, clear/disconnect, seal policy, and repeated
 `/proc/self/fd` baseline cycles. Shared bytes remain behind raw pointers or explicit
-unsafe guard methods. The `CoreMemoryImporter` adapter and full per-node configurator
-remain the next integration seam.
+unsafe guard methods. The Core importer adapter is the immediate integration seam;
+the full per-node configurator remains downstream.
+
+Follow-up commit `8d0ab0850bfb` adds that adapter. `MemoryPoolHandle::install`
+privately installs a Core importer and gives session code generation-safe
+`resolve`/`bind`/`map` access. AddMem and RemoveMem now drive the pool directly;
+importer replacement and Core disconnect terminally clear it. Scripted integration
+tests inspect live and retired generations and cover duplicate IDs, unsupported
+types, wrong FD indices, candidate closure, later-frame ownership isolation, and
+terminal cleanup.
 
 ### Post-migration ownership review fixes
 
@@ -602,7 +610,7 @@ trailing bytes, and FD indices remain terminal by policy.
 
 ### Work continuing from this wave
 
-- connect Core imports to the memory pool, then implement metadata, peer activation, per-node configuration, and complete cycle/session state.
+- implement metadata, peer activation, per-node configuration, and complete cycle/session state over the installed memory-pool handle.
 
 ## Cross-references
 
