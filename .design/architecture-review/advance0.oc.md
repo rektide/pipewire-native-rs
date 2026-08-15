@@ -264,6 +264,22 @@ existing server clippy warnings remain in scripted message parsing and a test br
 Workspace formatting also reports pre-existing node formatting differences outside
 the files intentionally changed by this wave.
 
+Final verification after the follow-up fixes supersedes that earlier snapshot:
+
+- `cargo test --workspace --exclude pipewire-native`: passed;
+- client library unit tests: 14 passed;
+- client main-loop tests: 3 passed;
+- canonical scripted AddMem/RemoveMem integration: 2 passed;
+- strict `cargo clippy --workspace --all-targets -- -D warnings`: passed;
+- `cargo fmt --all -- --check`: passed;
+- `cargo check --manifest-path fuzz/Cargo.toml`: passed;
+- activation and SPA buffer ABI differential tools: passed.
+
+The complete host-daemon suite remains bounded but red in this environment. It
+enumerates the graph and reaches link setup, then times out after eight seconds at
+`phase=helper-execution`. The helper process group is terminated and reaped; this is
+the known real-daemon `create_link`/callback stall, not a deterministic test hang.
+
 ## Roadmap reset
 
 The active beads epic is `SU-client-node-cycle`: **Prove one ownership-safe
@@ -303,14 +319,16 @@ goal; the new epic makes shared framing one prerequisite of the ClientNode outco
 ### Frame consumer migration
 
 The scripted peer and both client directions now use the shared transport. Session
-and scenario interfaces remain outside the frame crate. The remaining compatibility
-gap is the scripted peer's legacy AddMem payload adapter.
+and scenario interfaces remain outside the frame crate. Deterministic syscall-level
+EINTR injection remains the last explicit frame-transport acceptance gap.
 
 ### AddMem importer
 
 Core AddMem now decodes an explicit frame-local FD index and transfers one `OwnedFd`
 through a single-owner importer. The private owning-raw-FD multicast is removed.
-The scripted server's AddMem action still needs the same canonical explicit index.
+The scripted server emits the canonical four-field payload; explicit RemoveMem,
+disconnect cleanup, wrong-index rejection, and named memfd closure are covered.
+Duplicate-ID and importer-failure policy still need registry-level tests.
 
 ### Minimum ClientNode protocol
 
@@ -524,10 +542,49 @@ private-header differential validation is an opt-in developer tool under
 [`/node/tools`](/node/tools), not a package-build dependency. Builds and tests pass
 with both `HOME` and `PIPEWIRE_SOURCE_DIR` unset.
 
+### Typed output buffer IO implemented
+
+Commit: `44c09215109a` (`Add cycle-scoped SPA output buffer views`)
+
+The node session foundation now has target-validated views for synchronous
+`SPA_IO_Buffers`, `spa_chunk`, one checked media plane, and cycle-scoped output
+publication. Unsafe constructors validate record layout, mapping bounds,
+`map_offset + max_size`, current chunk wrap, representability, and stride. Async IO
+is rejected explicitly.
+
+A cycle exposes media only when IO requests `NEED_DATA` and selects a configured
+buffer. Publication writes chunk fields, then buffer ID, then a release fence, and
+finally `HAVE_DATA`. Public-header ABI differential checks live under
+[`/node/tools`](/node/tools). Metadata interpretation, multiple data planes, and
+async two-slot IO remain deferred.
+
+### Post-migration ownership review fixes
+
+The independent frame review found several defects after the initial consumer
+migration. This wave fixed the high-severity ownership cases rather than treating
+the first green tests as sufficient:
+
+- `e8f64a637bf9` replaces stateless public packet-read helpers with a persistent
+  `NativePacketReader`; a coalesced second frame and its FD now survive the first
+  read.
+- `70c87ebe4e11` adopts every safely visible SCM_RIGHTS descriptor before malformed
+  control validation can fail, preserves terminal truncation behavior, and enforces
+  sender-local per-frame limits.
+- `9fe61ecf3910` releases the importer slot and core destruction locks before user
+  importer callbacks, importer drops, proxy callbacks, and object destruction.
+- `52f006affa85` adds scripted `RemoveMem` and verifies explicit importer removal and
+  descriptor closure rather than relying only on disconnect cleanup.
+- `66b06101034a` terminal client cleanup clears both frame directions, closes both
+  socket owners, updates connection state, and is covered with close-observable
+  buffered/queued descriptor tests.
+
+The remaining session-compatibility findings are tracked by
+`SU-client-node-cycle-session-dispatch`: generation footer ordering, enqueue commit
+semantics, and unknown-opcode continuation.
+
 ### Work continuing from this wave
 
-- canonicalize the scripted server's explicit AddMem frame-FD index and integration test;
-- implement the remaining typed memory/port/buffer/cycle session on the activation foundation.
+- implement the remaining memory-pool, metadata, peer, generation, and session state on the typed activation/port foundation.
 
 ## Cross-references
 
