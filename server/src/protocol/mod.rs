@@ -5,8 +5,7 @@ mod frame;
 mod messages;
 
 pub use frame::{
-    read_packet, read_packet_with_fds, write_packet, write_packet_with_fds, NativeHeader,
-    NativePacket, HEADER_LEN,
+    write_packet, write_packet_with_fds, NativeHeader, NativePacket, NativePacketReader, HEADER_LEN,
 };
 pub use messages::{
     client_method, core_event, core_method, decode_core_add_mem_payload, decode_inbound_message,

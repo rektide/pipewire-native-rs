@@ -77,45 +77,71 @@ pub struct NativePacket {
     pub payload: Vec<u8>,
 }
 
-/// Reads one packet from a Unix stream.
-pub fn read_packet(stream: &mut UnixStream) -> io::Result<NativePacket> {
-    let (packet, fds) = read_packet_with_fds(stream)?;
-    if !fds.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("expected packet without fds but received {} fds", fds.len()),
-        ));
-    }
-
-    Ok(packet)
+/// Stateful reader for native protocol packets on one Unix stream.
+///
+/// A reader must be retained for the lifetime of its stream so bytes and file
+/// descriptors buffered beyond the current packet remain available to later
+/// reads.
+pub struct NativePacketReader {
+    receiver: FrameReceiver,
 }
 
-/// Reads one packet and any SCM_RIGHTS file descriptors attached to it.
-pub fn read_packet_with_fds(stream: &mut UnixStream) -> io::Result<(NativePacket, Vec<OwnedFd>)> {
-    let mut receiver = FrameReceiver::new(FrameLimits::default());
-    loop {
-        match receiver.receive(stream.as_fd()).map_err(frame_error)? {
-            ReceiveOutcome::Frame(frame) => {
-                let (header, payload, mut frame_fds) = frame.into_parts();
-                let fds = (0..frame_fds.len())
-                    .map(|index| frame_fds.take(index as u32).map_err(frame_error))
-                    .collect::<io::Result<Vec<_>>>()?;
-                return Ok((
-                    NativePacket {
-                        header: header.into(),
-                        payload,
-                    },
-                    fds,
-                ));
-            }
-            ReceiveOutcome::WouldBlock => wait(stream.as_fd(), libc::POLLIN)?,
-            ReceiveOutcome::Closed => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "socket closed while reading native frame",
-                ));
+impl NativePacketReader {
+    /// Creates a reader using the default native frame limits.
+    pub fn new() -> Self {
+        Self {
+            receiver: FrameReceiver::new(FrameLimits::default()),
+        }
+    }
+
+    /// Reads one packet, rejecting packets with attached file descriptors.
+    pub fn read_packet(&mut self, stream: &mut UnixStream) -> io::Result<NativePacket> {
+        let (packet, fds) = self.read_packet_with_fds(stream)?;
+        if !fds.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected packet without fds but received {} fds", fds.len()),
+            ));
+        }
+
+        Ok(packet)
+    }
+
+    /// Reads one packet and any SCM_RIGHTS file descriptors attached to it.
+    pub fn read_packet_with_fds(
+        &mut self,
+        stream: &mut UnixStream,
+    ) -> io::Result<(NativePacket, Vec<OwnedFd>)> {
+        loop {
+            match self.receiver.receive(stream.as_fd()).map_err(frame_error)? {
+                ReceiveOutcome::Frame(frame) => {
+                    let (header, payload, mut frame_fds) = frame.into_parts();
+                    let fds = (0..frame_fds.len())
+                        .map(|index| frame_fds.take(index as u32).map_err(frame_error))
+                        .collect::<io::Result<Vec<_>>>()?;
+                    return Ok((
+                        NativePacket {
+                            header: header.into(),
+                            payload,
+                        },
+                        fds,
+                    ));
+                }
+                ReceiveOutcome::WouldBlock => wait(stream.as_fd(), libc::POLLIN)?,
+                ReceiveOutcome::Closed => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "socket closed while reading native frame",
+                    ));
+                }
             }
         }
+    }
+}
+
+impl Default for NativePacketReader {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -185,7 +211,7 @@ fn frame_error(error: FrameError) -> io::Error {
 mod tests {
     use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 
-    use super::{read_packet_with_fds, write_packet_with_fds, NativeHeader, NativePacket};
+    use super::{write_packet_with_fds, NativeHeader, NativePacket, NativePacketReader};
 
     #[test]
     fn roundtrip_header_encoding() {
@@ -220,7 +246,9 @@ mod tests {
         };
 
         write_packet_with_fds(&mut tx, &packet, &[fd.as_fd()]).unwrap();
-        let (decoded, fds) = read_packet_with_fds(&mut rx).unwrap();
+        let (decoded, fds) = NativePacketReader::new()
+            .read_packet_with_fds(&mut rx)
+            .unwrap();
 
         assert_eq!(decoded.header.object_id, 7);
         assert_eq!(decoded.header.opcode, 8);
@@ -231,6 +259,97 @@ mod tests {
         let res = unsafe { libc::fstat(fds[0].as_raw_fd(), &mut stat) };
         assert_eq!(res, 0);
         assert_eq!(stat.st_size, 4096);
+    }
+
+    #[test]
+    fn retains_coalesced_second_frame_and_its_fd() {
+        let (mut tx, mut rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        let first = packet(1, vec![1, 2, 3]);
+        let mut second = packet(2, vec![4, 5, 6]);
+        second.header.n_fds = 1;
+        let fd = create_memfd(8192).unwrap();
+        let mut wire = first.header.encode().unwrap().to_vec();
+        wire.extend_from_slice(&first.payload);
+        wire.extend_from_slice(&second.header.encode().unwrap());
+        wire.extend_from_slice(&second.payload);
+
+        send_with_fd(&mut tx, &wire, &fd);
+
+        let mut reader = NativePacketReader::new();
+        let (decoded_first, first_fds) = reader.read_packet_with_fds(&mut rx).unwrap();
+        let (decoded_second, second_fds) = reader.read_packet_with_fds(&mut rx).unwrap();
+
+        assert_eq!(decoded_first, first);
+        assert!(first_fds.is_empty());
+        assert_eq!(decoded_second, second);
+        assert_eq!(second_fds.len(), 1);
+
+        let received_raw_fd = second_fds[0].as_raw_fd();
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        assert_eq!(unsafe { libc::fstat(received_raw_fd, &mut stat) }, 0);
+        assert_eq!(stat.st_size, 8192);
+        drop(second_fds);
+        assert_eq!(unsafe { libc::fcntl(received_raw_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    fn packet(seq: u32, payload: Vec<u8>) -> NativePacket {
+        NativePacket {
+            header: NativeHeader {
+                object_id: 7,
+                opcode: 8,
+                payload_size: payload.len() as u32,
+                seq,
+                n_fds: 0,
+            },
+            payload,
+        }
+    }
+
+    fn send_with_fd(
+        stream: &mut std::os::unix::net::UnixStream,
+        bytes: &[u8],
+        fd: &std::os::fd::OwnedFd,
+    ) {
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut control = [0_usize; 4];
+        let header_len = std::mem::size_of::<libc::cmsghdr>();
+        unsafe {
+            std::ptr::write(
+                control.as_mut_ptr().cast::<libc::cmsghdr>(),
+                libc::cmsghdr {
+                    cmsg_len: header_len + std::mem::size_of::<libc::c_int>(),
+                    cmsg_level: libc::SOL_SOCKET,
+                    cmsg_type: libc::SCM_RIGHTS,
+                },
+            );
+            std::ptr::write_unaligned(
+                control
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(header_len)
+                    .cast::<libc::c_int>(),
+                fd.as_raw_fd(),
+            );
+        }
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen =
+            (header_len + std::mem::size_of::<libc::c_int>() + std::mem::size_of::<usize>() - 1)
+                & !(std::mem::size_of::<usize>() - 1);
+
+        assert_eq!(
+            unsafe { libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL) },
+            bytes.len() as isize
+        );
     }
 
     fn create_memfd(size: usize) -> std::io::Result<std::os::fd::OwnedFd> {

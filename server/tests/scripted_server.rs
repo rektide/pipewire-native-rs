@@ -13,7 +13,7 @@ use pipewire_native_server::{
     protocol::{
         self, decode_core_add_mem_payload, encode_client_update_properties_empty_payload,
         encode_core_get_registry_payload, encode_core_hello_payload, encode_core_sync_payload,
-        read_packet, read_packet_with_fds, NativeHeader, NativePacket,
+        NativeHeader, NativePacket, NativePacketReader,
     },
     runtime::{ScriptedServer, ServerConfig},
     script::{Action, CoreAddMemAction, Expectation, RegistryGlobalAction, Scenario, ScriptStep},
@@ -69,6 +69,7 @@ fn scripted_bootstrap_flow_is_deterministic() {
     let handle = testkit::spawn(server);
 
     let mut stream = deadline.connect(&socket_path).unwrap();
+    let mut reader = NativePacketReader::new();
 
     send_client_method(
         &mut stream,
@@ -94,7 +95,7 @@ fn scripted_bootstrap_flow_is_deterministic() {
         encode_core_get_registry_payload(3, 77).unwrap(),
     );
 
-    let global = read_packet(&mut stream).unwrap();
+    let global = reader.read_packet(&mut stream).unwrap();
     assert_eq!(global.header.object_id, 77);
     assert_eq!(global.header.opcode, protocol::registry_event::GLOBAL);
 
@@ -106,7 +107,7 @@ fn scripted_bootstrap_flow_is_deterministic() {
         encode_core_sync_payload(0, 0xBEEF).unwrap(),
     );
 
-    let done = read_packet(&mut stream).unwrap();
+    let done = reader.read_packet(&mut stream).unwrap();
     assert_eq!(done.header.object_id, protocol::CORE_ID);
     assert_eq!(done.header.opcode, protocol::core_event::DONE);
 
@@ -149,6 +150,7 @@ fn second_client_is_rejected_in_single_client_mode() {
     let handle = testkit::spawn(server);
 
     let mut primary = deadline.connect(&socket_path).unwrap();
+    let mut reader = NativePacketReader::new();
     send_client_method(
         &mut primary,
         protocol::CORE_ID,
@@ -168,7 +170,7 @@ fn second_client_is_rejected_in_single_client_mode() {
         encode_core_sync_payload(0, 99).unwrap(),
     );
 
-    let _ = read_packet(&mut primary).unwrap();
+    let _ = reader.read_packet(&mut primary).unwrap();
 
     let report = handle.wait(deadline).unwrap();
     assert_eq!(report.accepted_clients, 1);
@@ -217,6 +219,7 @@ fn core_add_mem_emits_fd_and_payload() {
     let handle = testkit::spawn(server);
 
     let mut stream = deadline.connect(&socket_path).unwrap();
+    let mut reader = NativePacketReader::new();
     send_client_method(
         &mut stream,
         protocol::CORE_ID,
@@ -232,7 +235,7 @@ fn core_add_mem_emits_fd_and_payload() {
         encode_core_sync_payload(0, 777).unwrap(),
     );
 
-    let (add_mem, fds) = read_packet_with_fds(&mut stream).unwrap();
+    let (add_mem, fds) = reader.read_packet_with_fds(&mut stream).unwrap();
     assert_eq!(add_mem.header.object_id, protocol::CORE_ID);
     assert_eq!(add_mem.header.opcode, protocol::core_event::ADD_MEM);
     assert_eq!(fds.len(), 1);
@@ -248,7 +251,7 @@ fn core_add_mem_emits_fd_and_payload() {
     assert_eq!(fstat_res, 0);
     assert_eq!(stat.st_size, 4096);
 
-    let done = read_packet(&mut stream).unwrap();
+    let done = reader.read_packet(&mut stream).unwrap();
     assert_eq!(done.header.opcode, protocol::core_event::DONE);
 
     let report = handle.wait(deadline).unwrap();
