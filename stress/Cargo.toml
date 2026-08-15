@@ -1,0 +1,19 @@
+[package]
+name = "pipewire-native-stress"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+pipewire-native-node = { path = "../node" }
+pipewire-native-protocol = { path = "../protocol" }
+pipewire-native-spa = { path = "../spa" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "pw-stress"
+path = "src/main.rs"
