@@ -380,25 +380,18 @@ impl InnerMainLoop {
             .load_spa_handle(None, spa::interface::plugin::LOOP_FACTORY, None)
             .ok()?;
 
-        let loop_ = handle.get_interface(spa::interface::LOOP).and_then(|i| {
-            Arc::new(Box::into_pin(i))
-                .downcast_arc_pin_box::<spa::interface::r#loop::LoopImpl>()
-                .ok()
-        })?;
-        let loop_utils = handle
-            .get_interface(spa::interface::LOOP_UTILS)
-            .and_then(|i| {
-                Arc::new(Box::into_pin(i))
-                    .downcast_arc_pin_box::<spa::interface::r#loop::LoopUtilsImpl>()
-                    .ok()
-            })?;
-        let loop_control = handle
-            .get_interface(spa::interface::LOOP_CONTROL)
-            .and_then(|i| {
-                Arc::new(Box::into_pin(i))
-                    .downcast_arc_pin_box::<spa::interface::r#loop::LoopControlImpl>()
-                    .ok()
-            })?;
+        let loop_ = handle.get_interface(spa::interface::LOOP).ok()??;
+        let loop_ = Arc::new(Box::into_pin(loop_))
+            .downcast_arc_pin_box::<spa::interface::r#loop::LoopImpl>()
+            .ok()?;
+        let loop_utils = handle.get_interface(spa::interface::LOOP_UTILS).ok()??;
+        let loop_utils = Arc::new(Box::into_pin(loop_utils))
+            .downcast_arc_pin_box::<spa::interface::r#loop::LoopUtilsImpl>()
+            .ok()?;
+        let loop_control = handle.get_interface(spa::interface::LOOP_CONTROL).ok()??;
+        let loop_control = Arc::new(Box::into_pin(loop_control))
+            .downcast_arc_pin_box::<spa::interface::r#loop::LoopControlImpl>()
+            .ok()?;
 
         let name = if let Some(n) = props.get("loop.name") {
             n.to_string()

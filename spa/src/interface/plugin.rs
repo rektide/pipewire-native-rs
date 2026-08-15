@@ -93,7 +93,7 @@ pub trait HandleFactory {
         info: Option<Dict>,
         support: &super::Support,
     ) -> std::io::Result<Box<dyn Handle + Send + Sync>>;
-    fn enum_interface_info(&self) -> Vec<InterfaceInfo>;
+    fn enum_interface_info(&self) -> std::io::Result<Vec<InterfaceInfo>>;
 }
 
 pub trait Handle {
@@ -105,5 +105,5 @@ pub trait Handle {
     ///
     /// C-backed implementations retain shared ownership of the handle because SPA interface
     /// pointers become invalid when the handle is cleared.
-    fn get_interface(&self, type_: &str) -> Option<Box<dyn Interface>>;
+    fn get_interface(&self, type_: &str) -> std::io::Result<Option<Box<dyn Interface>>>;
 }

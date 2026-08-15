@@ -49,10 +49,10 @@ impl HandleFactory for Plugin {
         Ok(Box::new(PluginHandle {}))
     }
 
-    fn enum_interface_info(&self) -> Vec<InterfaceInfo> {
-        vec![InterfaceInfo {
+    fn enum_interface_info(&self) -> std::io::Result<Vec<InterfaceInfo>> {
+        Ok(vec![InterfaceInfo {
             type_: interface::SYSTEM.to_string(),
-        }]
+        }])
     }
 }
 
@@ -61,11 +61,11 @@ impl Handle for PluginHandle {
         0
     }
 
-    fn get_interface(&self, type_: &str) -> Option<Box<dyn Interface>> {
-        match type_ {
+    fn get_interface(&self, type_: &str) -> std::io::Result<Option<Box<dyn Interface>>> {
+        Ok(match type_ {
             interface::SYSTEM => Some(Box::new(system::new())),
             interface::THREAD_UTILS => Some(Box::new(thread::new_utils())),
             _ => None,
-        }
+        })
     }
 }

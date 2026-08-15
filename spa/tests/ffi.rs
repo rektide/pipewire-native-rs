@@ -51,7 +51,7 @@ fn setup_log(
 
     assert!(log_factory.info().is_none());
 
-    let interfaces = log_factory.enum_interface_info();
+    let interfaces = log_factory.enum_interface_info().unwrap();
     assert_eq!(interfaces.len(), 1);
 
     let log_handle = log_factory
@@ -67,6 +67,7 @@ fn setup_log(
 
     let log_iface = log_handle
         .get_interface(interface::LOG)
+        .expect("Interface query should succeed")
         .expect("Log factory should produce an interface");
 
     let log = log_iface
@@ -101,7 +102,7 @@ fn setup_system(
         .find_factory(interface::plugin::SYSTEM_FACTORY)
         .expect("Should find system factory");
 
-    let interfaces = system_factory.enum_interface_info();
+    let interfaces = system_factory.enum_interface_info().unwrap();
     assert_eq!(interfaces.len(), 1);
 
     let system_handle = system_factory
@@ -110,6 +111,7 @@ fn setup_system(
 
     let system_iface = system_handle
         .get_interface(interface::SYSTEM)
+        .expect("Interface query should succeed")
         .expect("System factory should produce an interface");
 
     let system = system_iface
@@ -129,7 +131,7 @@ fn setup_cpu(
         .find_factory(interface::plugin::CPU_FACTORY)
         .expect("Should find cpu factory");
 
-    let interfaces = cpu_factory.enum_interface_info();
+    let interfaces = cpu_factory.enum_interface_info().unwrap();
     assert_eq!(interfaces.len(), 1);
 
     let cpu_handle = cpu_factory
@@ -138,6 +140,7 @@ fn setup_cpu(
 
     let cpu_iface = cpu_handle
         .get_interface(interface::CPU)
+        .expect("Interface query should succeed")
         .expect("CPU factory should produce an interface");
 
     let cpu = cpu_iface
@@ -157,7 +160,7 @@ fn setup_loop(
         .find_factory(interface::plugin::LOOP_FACTORY)
         .expect("Should find loop factory");
 
-    let interfaces = loop_factory.enum_interface_info();
+    let interfaces = loop_factory.enum_interface_info().unwrap();
     assert_eq!(interfaces.len(), 3);
 
     let loop_handle = loop_factory
@@ -166,6 +169,7 @@ fn setup_loop(
 
     let loop_iface = loop_handle
         .get_interface(interface::LOOP)
+        .expect("Interface query should succeed")
         .expect("Loop factory should produce an interface");
 
     let r#loop = loop_iface
@@ -180,6 +184,7 @@ fn setup_loop(
 fn setup_loop_ctrl(support: &mut interface::Support, loop_handle: &dyn interface::plugin::Handle) {
     let loop_ctrl_iface = loop_handle
         .get_interface(interface::LOOP_CONTROL)
+        .expect("Interface query should succeed")
         .expect("Loop factory should produce control interface");
 
     let loop_ctrl = loop_ctrl_iface
@@ -192,6 +197,7 @@ fn setup_loop_ctrl(support: &mut interface::Support, loop_handle: &dyn interface
 fn setup_loop_utils(support: &mut interface::Support, loop_handle: &dyn interface::plugin::Handle) {
     let loop_utils_iface = loop_handle
         .get_interface(interface::LOOP_UTILS)
+        .expect("Interface query should succeed")
         .expect("Loop factory should produce utils interface");
 
     let loop_utils = loop_utils_iface
@@ -227,6 +233,7 @@ fn ffi_interface_retains_handle_factory_and_plugin() {
         .expect("Factory should retain its plugin library");
     let cpu = handle
         .get_interface(interface::CPU)
+        .expect("Interface query should succeed")
         .expect("CPU factory should produce an interface")
         .downcast_box::<CpuImpl>()
         .expect("CPU interface should be a CpuImpl");

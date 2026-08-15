@@ -20,6 +20,7 @@ fn test_thread() {
         .expect("Plugin should be able to provide a handle");
     let iface = handle
         .get_interface(interface::THREAD_UTILS)
+        .expect("Interface query should succeed")
         .expect("Handle should be able to provide a thread utils iface");
 
     let thread_utils = iface

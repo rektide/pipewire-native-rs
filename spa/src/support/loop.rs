@@ -27,6 +27,7 @@ impl Loop {
             .init(None, support)
             .unwrap()
             .get_interface(interface::SYSTEM)
+            .unwrap()
             .unwrap();
         let system = system_iface.downcast_box::<SystemImpl>().unwrap();
         let pollfd = system.pollfd_create(flags::Fd::CLOEXEC)?;

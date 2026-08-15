@@ -200,7 +200,7 @@ impl Support {
         let mut inner = self.inner.lock().unwrap();
 
         for iface_type in iface_types {
-            let iface = handle.get_interface(iface_type).ok_or_else(|| {
+            let iface = handle.get_interface(iface_type)?.ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!("Interface not found: {}", iface_type),
