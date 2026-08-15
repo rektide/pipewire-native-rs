@@ -12,6 +12,7 @@ libc.workspace = true
 parking_lot = { version = "0.12.4", features = ["arc_lock"] }
 paste = "1.0.15"
 pipewire-native-macros.workspace = true
+pipewire-native-protocol.workspace = true
 pipewire-native-spa.workspace = true
 tinyjson = "2.5.1"
 

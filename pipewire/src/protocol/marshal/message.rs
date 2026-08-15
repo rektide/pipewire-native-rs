@@ -5,86 +5,12 @@
 use pipewire_native_macros as macros;
 use pipewire_native_spa as spa;
 
-use super::{Marshallable, HEADER_LEN};
-
-pub(crate) struct Message<T: Marshallable, F: spa::pod::Pod> {
-    pub(crate) header: Header,
-    pub(crate) object: T,
-    pub(crate) footer: Option<F>,
-}
-
 pub(crate) struct Header {
     pub(crate) id: u32,
     pub(crate) opcode: u8,
     pub(crate) size: u32, // actually 24 bytes
     pub(crate) seq: u32,
     pub(crate) n_fds: u32,
-}
-
-impl<T: Marshallable, F: spa::pod::Pod<DecodesTo = F>> spa::pod::Pod for Message<T, F> {
-    type DecodesTo = Self;
-
-    fn encode(&self, data: &mut [u8]) -> Result<usize, spa::pod::Error> {
-        // Header + at least one byte for data
-        if data.len() < HEADER_LEN + 1 {
-            return Err(spa::pod::Error::NoSpace);
-        }
-
-        let payload_size = self.object.encode(&mut data[HEADER_LEN..])?;
-
-        let footer_size = if let Some(footer) = &self.footer {
-            footer.encode(&mut data[HEADER_LEN + payload_size..])?
-        } else {
-            0
-        };
-
-        let size = payload_size + footer_size;
-        let header = Header {
-            size: size as u32,
-            ..self.header
-        };
-
-        header.encode(data)?;
-
-        Ok(HEADER_LEN + size)
-    }
-
-    fn decode(data: &[u8]) -> Result<(Self::DecodesTo, usize), spa::pod::Error> {
-        if data.len() < HEADER_LEN {
-            return Err(spa::pod::Error::Invalid(
-                "Not enough data for header".to_string(),
-            ));
-        }
-
-        let (header, header_size) = Header::decode(data)?;
-        let size = header.size as usize;
-        let (object, payload_size) = T::decode(header.opcode, &data[header_size..])?;
-
-        let (footer, footer_size) = if size > header_size + payload_size {
-            let (f, s) = F::decode(&data[header_size + payload_size..size])?;
-            (Some(f), s)
-        } else {
-            (None, 0)
-        };
-
-        if size != header_size + payload_size + footer_size {
-            Ok((
-                Message {
-                    header,
-                    object,
-                    footer,
-                },
-                size,
-            ))
-        } else {
-            // We should not have leftover data
-            Err(spa::pod::Error::Invalid(format!(
-                "Data left over in message: {} != {}",
-                size,
-                header_size + payload_size + footer_size
-            )))
-        }
-    }
 }
 
 impl spa::pod::Pod for Header {

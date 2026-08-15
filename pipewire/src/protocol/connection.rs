@@ -4,14 +4,16 @@
 
 use std::{
     collections::VecDeque,
-    io::Write,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::net::UnixStream,
     },
     sync::{Arc, Mutex, RwLock},
 };
 
+use pipewire_native_protocol::native::frame::{
+    FlushOutcome, FrameError, FrameLimits, FrameSender, OutboundFrame,
+};
 use pipewire_native_spa::{self as spa, pod::Pod};
 
 use crate::{
@@ -20,7 +22,7 @@ use crate::{
 
 use super::marshal::{
     self,
-    message::{ClientFooter, Header, Message},
+    message::{ClientFooter, Header},
     message::{ClientFooterPayload, ClientGeneration, CoreFooter, CoreFooterPayload},
     Marshallable,
 };
@@ -42,9 +44,7 @@ refcounted! {
         last_recv_generation: RwLock<i64>,
         // Data to send
         out_seq: RwLock<u32>,
-        out_buf: RwLock<Vec<u8>>,
-        out_size: RwLock<usize>,
-        out_fds: RwLock<VecDeque<RawFd>>,
+        sender: RwLock<FrameSender>,
         last_sent_generation: RwLock<i64>,
     }
 }
@@ -85,9 +85,7 @@ impl Connection {
         self.inner.in_fds.write().unwrap().clear();
         *self.inner.last_recv_generation.write().unwrap() = 0;
         *self.inner.out_seq.write().unwrap() = 0;
-        self.inner.out_buf.write().unwrap().fill(0);
-        *self.inner.out_size.write().unwrap() = 0;
-        self.inner.out_fds.write().unwrap().clear();
+        *self.inner.sender.write().unwrap() = FrameSender::new(FrameLimits::default());
         *self.inner.last_sent_generation.write().unwrap() = 0;
     }
 
@@ -103,6 +101,15 @@ impl Connection {
         &self,
         id: Id,
         object: T,
+    ) -> std::io::Result<()> {
+        self.push_with_owned_fds(id, object, Vec::new())
+    }
+
+    pub(crate) fn push_with_owned_fds<T: Marshallable + std::fmt::Debug>(
+        &self,
+        id: Id,
+        object: T,
+        fds: Vec<OwnedFd>,
     ) -> std::io::Result<()> {
         let seq = *self.inner.out_seq.read().unwrap();
 
@@ -122,48 +129,45 @@ impl Connection {
             None
         };
 
-        let message = Message {
-            header: Header {
-                id,
-                opcode: object.opcode(),
-                seq,
-                size: 0,  // filled by encode
-                n_fds: 0, // TOOO
-            },
-            object,
-            footer,
-        };
-
-        let mut buf = self.inner.out_buf.write().unwrap();
-        let mut size = self.inner.out_size.write().unwrap();
+        let opcode = object.opcode();
+        let mut payload = vec![0; 16384];
 
         loop {
-            let rest = &mut buf.as_mut_slice()[*size..];
-            match message.encode(rest) {
-                Ok(written) => {
-                    *size += written;
+            match object.encode(&mut payload) {
+                Ok(object_size) => {
+                    let footer_size = if let Some(footer) = &footer {
+                        match footer.encode(&mut payload[object_size..]) {
+                            Ok(size) => size,
+                            Err(spa::pod::Error::NoSpace) => {
+                                grow_payload_buffer(&mut payload)?;
+                                continue;
+                            }
+                            Err(error) => return Err(pod_encode_error(error)),
+                        }
+                    } else {
+                        0
+                    };
+                    payload.truncate(object_size + footer_size);
                     break;
                 }
                 Err(spa::pod::Error::NoSpace) => {
-                    let capacity = buf.len();
-                    if capacity > MAX_MESSAGE_SIZE {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("cannot send message > {MAX_MESSAGE_SIZE}"),
-                        ));
-                    }
-                    buf.resize(capacity * 2, 0);
-                    // And now we try again
+                    grow_payload_buffer(&mut payload)?;
                 }
-                _ => unreachable!(),
+                Err(error) => return Err(pod_encode_error(error)),
             }
         }
 
-        trace!(
-            "pushed message id:{id} opcode:{} seq:{seq} payload:{:?} (filled: {size})",
-            message.header.opcode,
-            message.object
-        );
+        let limits = FrameLimits::default();
+        let frame =
+            OutboundFrame::new(id, opcode, seq, payload, fds, limits).map_err(frame_error)?;
+        self.inner
+            .sender
+            .write()
+            .unwrap()
+            .enqueue(frame)
+            .map_err(frame_error)?;
+
+        trace!("pushed message id:{id} opcode:{opcode} seq:{seq} payload:{object:?}");
 
         *self.inner.out_seq.write().unwrap() = (seq + 1) & ASYNC_SEQ_MASK;
         spa::emit_hook!(self.inner.hooks, need_flush);
@@ -172,40 +176,16 @@ impl Connection {
     }
 
     pub(crate) fn flush(&self) -> std::io::Result<()> {
-        let mut o_stream = self.inner.stream.write().unwrap();
-        let stream = o_stream.as_mut().unwrap();
-        let mut buf = self.inner.out_buf.write().unwrap();
-        let mut size = self.inner.out_size.write().unwrap();
-        let mut idx = 0;
-        let mut res = Ok(());
+        let stream = self.inner.stream.read().unwrap();
+        let stream = stream.as_ref().unwrap();
+        let mut sender = self.inner.sender.write().unwrap();
 
-        trace!("flushing {} bytes", *size);
+        trace!("flushing {} bytes", sender.queued_bytes());
 
-        while idx < *size {
-            let sent = match stream.write(&buf[idx..*size]) {
-                Ok(size) => size,
-                Err(err) => {
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    } else {
-                        res = Err(err);
-                        break;
-                    }
-                }
-            };
-
-            idx += sent;
+        match sender.flush(stream.as_fd()).map_err(frame_error)? {
+            FlushOutcome::Drained => Ok(()),
+            FlushOutcome::WouldBlock => Err(std::io::Error::from_raw_os_error(libc::EAGAIN)),
         }
-
-        if idx == buf.len() {
-            buf.clear();
-            *size = 0;
-        } else {
-            buf.copy_within(idx.., 0);
-            *size -= idx;
-        }
-
-        res
     }
 
     pub(crate) fn next_message(&self) -> std::io::Result<Header> {
@@ -461,10 +441,152 @@ impl InnerConnection {
             in_fds: RwLock::new(VecDeque::new()),
             last_recv_generation: RwLock::new(0),
             out_seq: RwLock::new(0),
-            out_buf: RwLock::new(vec![0; 16384]),
-            out_size: RwLock::new(0),
-            out_fds: RwLock::new(VecDeque::new()),
+            sender: RwLock::new(FrameSender::new(FrameLimits::default())),
             last_sent_generation: RwLock::new(0),
         }
+    }
+}
+
+fn grow_payload_buffer(payload: &mut Vec<u8>) -> std::io::Result<()> {
+    let capacity = payload.len();
+    if capacity > MAX_MESSAGE_SIZE / 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cannot send message > {MAX_MESSAGE_SIZE}"),
+        ));
+    }
+    payload.resize(capacity * 2, 0);
+    Ok(())
+}
+
+fn pod_encode_error(error: spa::pod::Error) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("could not encode message payload: {error:?}"),
+    )
+}
+
+fn frame_error(error: FrameError) -> std::io::Error {
+    match error {
+        FrameError::Io(error) => error,
+        error => std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestMessage(Vec<u8>);
+
+    fn connection(stream: UnixStream) -> Connection {
+        crate::init();
+        Connection {
+            inner: new_refcounted(InnerConnection::new(Some(stream))),
+        }
+    }
+
+    impl Marshallable for TestMessage {
+        fn opcode(&self) -> u8 {
+            7
+        }
+
+        fn encode(&self, data: &mut [u8]) -> Result<usize, spa::pod::Error> {
+            if data.len() < self.0.len() {
+                return Err(spa::pod::Error::NoSpace);
+            }
+            data[..self.0.len()].copy_from_slice(&self.0);
+            Ok(self.0.len())
+        }
+
+        fn decode(_opcode: u8, _data: &[u8]) -> Result<(Self, usize), spa::pod::Error> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn sender_wire_bytes_match_legacy_message_header() {
+        let (tx, mut rx) = UnixStream::pair().unwrap();
+        let connection = connection(tx);
+        let payload = vec![0x11, 0x22, 0x33, 0x44, 0x55];
+
+        connection.push(42, TestMessage(payload.clone())).unwrap();
+        connection.flush().unwrap();
+
+        let mut expected = vec![0; marshal::HEADER_LEN + payload.len()];
+        Header {
+            id: 42,
+            opcode: 7,
+            size: payload.len() as u32,
+            seq: 0,
+            n_fds: 0,
+        }
+        .encode(&mut expected)
+        .unwrap();
+        expected[marshal::HEADER_LEN..].copy_from_slice(&payload);
+
+        let mut actual = vec![0; expected.len()];
+        rx.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(connection.next_seq(), 1);
+    }
+
+    #[test]
+    fn would_block_preserves_queued_frame_for_later_flush() {
+        let (tx, mut rx) = UnixStream::pair().unwrap();
+        let fill = [0_u8; 8192];
+        loop {
+            let sent = unsafe {
+                libc::send(
+                    tx.as_raw_fd(),
+                    fill.as_ptr().cast(),
+                    fill.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if sent < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                break;
+            }
+        }
+
+        let connection = connection(tx);
+        connection.push(3, TestMessage(vec![0x5a; 64])).unwrap();
+        assert_eq!(
+            connection.flush().unwrap_err().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        assert!(!connection.inner.sender.read().unwrap().is_empty());
+
+        rx.set_nonblocking(true).unwrap();
+        let mut drain = vec![0; 64 * 1024];
+        let mut drained = false;
+        for _ in 0..16 {
+            match rx.read(&mut drain) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("failed to drain socket: {error}"),
+            }
+            match connection.flush() {
+                Ok(()) => {
+                    drained = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("failed to resume flush: {error}"),
+            }
+        }
+
+        assert!(
+            drained,
+            "queued frame did not drain after socket became writable"
+        );
+        assert!(connection.inner.sender.read().unwrap().is_empty());
     }
 }
