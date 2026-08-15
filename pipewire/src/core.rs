@@ -27,6 +27,8 @@ const VERSION: u32 = 4;
 
 const DEFAULT_REMOTE: &str = "pipewire-0";
 
+type MemoryImporter = Arc<Mutex<Box<dyn CoreMemoryImporter>>>;
+
 pub(crate) fn get_remote(props: Option<&spa::dict::Dict>) -> String {
     std::env::var("PIPEWIRE_REMOTE")
         .ok()
@@ -51,7 +53,7 @@ refcounted! {
         objects: RwLock<IdMap<Box<dyn HasProxy>>>,
         methods: Arc<Mutex<CoreMethods<Core>>>,
         hooks: Arc<Mutex<spa::hook::HookList<CoreEvents>>>,
-        memory_importer: Mutex<Option<Box<dyn CoreMemoryImporter>>>,
+        memory_importer: Mutex<Option<MemoryImporter>>,
     }
 }
 
@@ -77,23 +79,7 @@ impl Core {
 
         this.proxy().add_listener(ProxyEvents {
             destroy: some_closure!([this] {
-                debug!("core destroy");
-                let mut destroyed = this.inner.destroyed.write().unwrap();
-
-                if *destroyed {
-                    return;
-                }
-
-                *destroyed = true;
-
-                let mut objects = this.inner.objects.write().unwrap();
-                let client = objects.get(1).unwrap();
-
-                proxy_notify!(client, destroy);
-                objects.clear();
-
-                this.inner.client.disconnect();
-                this.set_memory_importer(None);
+                this.handle_destroy();
             }),
             removed: some_closure!([this] {
                 debug!("core removed");
@@ -262,8 +248,17 @@ impl Core {
 
     /// Installs the sole owner of memory descriptors announced by Core `AddMem` events.
     /// Replacing an importer drops the previous importer and all resources it still owns.
+    ///
+    /// Importer callbacks may replace the importer or call other Core APIs. Delivery to one
+    /// importer is serialized, so a callback must not recursively deliver an `AddMem` or
+    /// `RemoveMem` event to the same importer.
     pub fn set_memory_importer(&self, importer: Option<Box<dyn CoreMemoryImporter>>) {
-        *self.inner.memory_importer.lock().unwrap() = importer;
+        let importer = importer.map(|importer| Arc::new(Mutex::new(importer)));
+        let previous =
+            std::mem::replace(&mut *self.inner.memory_importer.lock().unwrap(), importer);
+
+        // Importer destructors may call back into Core, including replacing the importer again.
+        drop(previous);
     }
 
     pub(crate) fn import_memory(
@@ -273,9 +268,9 @@ impl Core {
         fd: OwnedFd,
         flags: u32,
     ) -> std::io::Result<()> {
-        let mut importer = self.inner.memory_importer.lock().unwrap();
-        if let Some(importer) = importer.as_mut() {
-            importer.add_memory(id, type_, fd, flags)
+        let importer = self.inner.memory_importer.lock().unwrap().clone();
+        if let Some(importer) = importer {
+            importer.lock().unwrap().add_memory(id, type_, fd, flags)
         } else {
             debug!("dropping unhandled add_mem: {id} {type_} {flags}");
             Ok(())
@@ -283,9 +278,9 @@ impl Core {
     }
 
     pub(crate) fn remove_memory(&self, id: Id) -> std::io::Result<()> {
-        let mut importer = self.inner.memory_importer.lock().unwrap();
-        if let Some(importer) = importer.as_mut() {
-            importer.remove_memory(id)
+        let importer = self.inner.memory_importer.lock().unwrap().clone();
+        if let Some(importer) = importer {
+            importer.lock().unwrap().remove_memory(id)
         } else {
             debug!("ignoring unhandled remove_mem: {id}");
             Ok(())
@@ -325,6 +320,34 @@ impl Core {
 
     pub(crate) fn events(&self) -> Arc<Mutex<spa::hook::HookList<CoreEvents>>> {
         self.inner.hooks.clone()
+    }
+
+    fn handle_destroy(&self) {
+        debug!("core destroy");
+        {
+            let mut destroyed = self.inner.destroyed.write().unwrap();
+
+            if *destroyed {
+                return;
+            }
+
+            *destroyed = true;
+        }
+
+        let (client, mut objects) = {
+            let mut objects = self.inner.objects.write().unwrap();
+            let client = objects
+                .get(1)
+                .and_then(|object| object.downcast::<proxy::client::Client>())
+                .expect("core client proxy should be registered");
+            let objects = std::mem::replace(&mut *objects, IdMap::new());
+            (client, objects)
+        };
+
+        proxy_notify!(client, destroy);
+        objects.clear();
+        self.inner.client.disconnect();
+        self.set_memory_importer(None);
     }
 }
 
@@ -449,5 +472,226 @@ impl InnerCore {
             hooks: spa::hook::HookList::new(),
             memory_importer: Mutex::new(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs::File, sync::mpsc, time::Duration};
+
+    use super::*;
+    use crate::{main_loop::MainLoop, proxy::ProxyEvents};
+
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+
+    struct NoopImporter;
+
+    impl CoreMemoryImporter for NoopImporter {
+        fn add_memory(
+            &mut self,
+            _id: Id,
+            _type_: u32,
+            _fd: OwnedFd,
+            _flags: u32,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn remove_memory(&mut self, _id: Id) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ReplacingImporter {
+        core: Core,
+        replace_on_add: bool,
+        replace_on_remove: bool,
+        completed: mpsc::Sender<()>,
+    }
+
+    impl CoreMemoryImporter for ReplacingImporter {
+        fn add_memory(
+            &mut self,
+            _id: Id,
+            _type_: u32,
+            _fd: OwnedFd,
+            _flags: u32,
+        ) -> std::io::Result<()> {
+            if self.replace_on_add {
+                self.core.set_memory_importer(Some(Box::new(NoopImporter)));
+                self.completed.send(()).unwrap();
+            }
+            Ok(())
+        }
+
+        fn remove_memory(&mut self, _id: Id) -> std::io::Result<()> {
+            if self.replace_on_remove {
+                self.core.set_memory_importer(Some(Box::new(NoopImporter)));
+                self.completed.send(()).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    struct ReentrantDropImporter {
+        core: Core,
+        dropped: mpsc::Sender<()>,
+    }
+
+    impl CoreMemoryImporter for ReentrantDropImporter {
+        fn add_memory(
+            &mut self,
+            _id: Id,
+            _type_: u32,
+            _fd: OwnedFd,
+            _flags: u32,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn remove_memory(&mut self, _id: Id) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for ReentrantDropImporter {
+        fn drop(&mut self) {
+            self.core.add_listener(CoreEvents::default());
+            self.dropped.send(()).unwrap();
+        }
+    }
+
+    fn new_disconnected_core() -> (MainLoop, Context, Core) {
+        crate::init();
+        let main_loop = MainLoop::new(&Properties::new()).unwrap();
+        let context = Context::new(&main_loop, Properties::new()).unwrap();
+        let core = Core {
+            inner: new_refcounted(InnerCore::new(&context, Properties::new())),
+        };
+        core.inner.client.set_core(core.downgrade());
+        (main_loop, context, core)
+    }
+
+    fn new_destroyable_core() -> (MainLoop, Context, Core, proxy::client::Client) {
+        let (main_loop, context, core) = new_disconnected_core();
+        let core_id = core.inner.objects.write().unwrap().reserve();
+        core.inner
+            .objects
+            .write()
+            .unwrap()
+            .insert_at(core_id, Box::new(core.clone()));
+
+        let client = proxy::client::Client::new(&core);
+        let client_id = core.inner.objects.write().unwrap().reserve();
+        core.inner
+            .objects
+            .write()
+            .unwrap()
+            .insert_at(client_id, Box::new(client.clone()));
+        (main_loop, context, core, client)
+    }
+
+    #[test]
+    fn add_memory_callback_can_replace_importer() {
+        let (_main_loop, _context, core) = new_disconnected_core();
+        let (completed, completion) = mpsc::channel();
+        core.set_memory_importer(Some(Box::new(ReplacingImporter {
+            core: core.clone(),
+            replace_on_add: true,
+            replace_on_remove: false,
+            completed,
+        })));
+
+        let operation_core = core.clone();
+        let (operation_done, operation_completion) = mpsc::channel();
+        std::thread::spawn(move || {
+            let fd: OwnedFd = File::open("/dev/null").unwrap().into();
+            operation_core.import_memory(1, 2, fd, 3).unwrap();
+            operation_done.send(()).unwrap();
+        });
+
+        completion
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .expect("add_memory callback deadlocked while replacing importer");
+        operation_completion
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .expect("add_memory delivery did not complete after importer replacement");
+    }
+
+    #[test]
+    fn remove_memory_callback_can_replace_importer() {
+        let (_main_loop, _context, core) = new_disconnected_core();
+        let (completed, completion) = mpsc::channel();
+        core.set_memory_importer(Some(Box::new(ReplacingImporter {
+            core: core.clone(),
+            replace_on_add: false,
+            replace_on_remove: true,
+            completed,
+        })));
+
+        let operation_core = core.clone();
+        let (operation_done, operation_completion) = mpsc::channel();
+        std::thread::spawn(move || {
+            operation_core.remove_memory(1).unwrap();
+            operation_done.send(()).unwrap();
+        });
+
+        completion
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .expect("remove_memory callback deadlocked while replacing importer");
+        operation_completion
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .expect("remove_memory delivery did not complete after importer replacement");
+    }
+
+    #[test]
+    fn replaced_importer_drop_can_call_core_api() {
+        let (_main_loop, _context, core) = new_disconnected_core();
+        let (dropped, drop_complete) = mpsc::channel();
+        core.set_memory_importer(Some(Box::new(ReentrantDropImporter {
+            core: core.clone(),
+            dropped,
+        })));
+
+        let operation_core = core.clone();
+        let (operation_done, operation_completion) = mpsc::channel();
+        std::thread::spawn(move || {
+            operation_core.set_memory_importer(Some(Box::new(NoopImporter)));
+            operation_done.send(()).unwrap();
+        });
+
+        drop_complete
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .expect("importer destructor deadlocked while calling Core API");
+        operation_completion
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .expect("importer replacement did not complete after destructor callback");
+    }
+
+    #[test]
+    fn destroy_callback_can_call_object_api() {
+        let (_main_loop, _context, core, client) = new_destroyable_core();
+        let (completed, completion) = mpsc::channel();
+        let callback_core = core.clone();
+        client.proxy().add_listener(ProxyEvents {
+            destroy: Some(Box::new(move || {
+                assert_eq!(callback_core.find_proxy_type(0), None);
+                completed.send(()).unwrap();
+            })),
+            ..Default::default()
+        });
+
+        let (operation_done, operation_completion) = mpsc::channel();
+        std::thread::spawn(move || {
+            core.handle_destroy();
+            operation_done.send(()).unwrap();
+        });
+
+        completion
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .expect("client destroy callback deadlocked on the Core object map");
+        operation_completion
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .expect("Core destruction did not complete after client callback");
     }
 }
