@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright (c) 2026 Asymptotic Inc.
 
-use std::os::unix::net::UnixStream;
+use std::{
+    os::unix::net::UnixStream,
+    time::{Duration, Instant},
+};
 
 use pipewire_native_server::{
     protocol::{
@@ -16,6 +19,7 @@ use pipewire_native_server::{
 
 #[test]
 fn scripted_bootstrap_flow_is_deterministic() {
+    let deadline = testkit::TestDeadline::after(Duration::from_secs(2));
     let socket_path = testkit::unique_socket_path("pipewire-native-server-bootstrap");
 
     let scenario = Scenario::builder()
@@ -61,7 +65,7 @@ fn scripted_bootstrap_flow_is_deterministic() {
 
     let handle = testkit::spawn(server);
 
-    let mut stream = connect_with_retry(&socket_path);
+    let mut stream = deadline.connect(&socket_path).unwrap();
 
     send_client_method(
         &mut stream,
@@ -103,7 +107,7 @@ fn scripted_bootstrap_flow_is_deterministic() {
     assert_eq!(done.header.object_id, protocol::CORE_ID);
     assert_eq!(done.header.opcode, protocol::core_event::DONE);
 
-    let report = handle.join().unwrap().unwrap();
+    let report = handle.wait(deadline).unwrap();
     assert_eq!(report.completed_steps, 4);
     assert_eq!(report.accepted_clients, 1);
     assert_eq!(report.rejected_clients, 0);
@@ -113,6 +117,7 @@ fn scripted_bootstrap_flow_is_deterministic() {
 
 #[test]
 fn second_client_is_rejected_in_single_client_mode() {
+    let deadline = testkit::TestDeadline::after(Duration::from_secs(2));
     let socket_path = testkit::unique_socket_path("pipewire-native-server-reject");
 
     let scenario = Scenario::builder()
@@ -140,7 +145,7 @@ fn second_client_is_rejected_in_single_client_mode() {
 
     let handle = testkit::spawn(server);
 
-    let mut primary = connect_with_retry(&socket_path);
+    let mut primary = deadline.connect(&socket_path).unwrap();
     send_client_method(
         &mut primary,
         protocol::CORE_ID,
@@ -149,7 +154,7 @@ fn second_client_is_rejected_in_single_client_mode() {
         encode_core_hello_payload(3).unwrap(),
     );
 
-    let secondary = connect_with_retry(&socket_path);
+    let secondary = deadline.connect(&socket_path).unwrap();
     drop(secondary);
 
     send_client_method(
@@ -162,13 +167,14 @@ fn second_client_is_rejected_in_single_client_mode() {
 
     let _ = read_packet(&mut primary).unwrap();
 
-    let report = handle.join().unwrap().unwrap();
+    let report = handle.wait(deadline).unwrap();
     assert_eq!(report.accepted_clients, 1);
     assert!(report.rejected_clients >= 1);
 }
 
 #[test]
 fn core_add_mem_emits_fd_and_payload() {
+    let deadline = testkit::TestDeadline::after(Duration::from_secs(2));
     let socket_path = testkit::unique_socket_path("pipewire-native-server-addmem");
 
     let scenario = Scenario::builder()
@@ -206,7 +212,7 @@ fn core_add_mem_emits_fd_and_payload() {
 
     let handle = testkit::spawn(server);
 
-    let mut stream = connect_with_retry(&socket_path);
+    let mut stream = deadline.connect(&socket_path).unwrap();
     send_client_method(
         &mut stream,
         protocol::CORE_ID,
@@ -240,7 +246,7 @@ fn core_add_mem_emits_fd_and_payload() {
     let done = read_packet(&mut stream).unwrap();
     assert_eq!(done.header.opcode, protocol::core_event::DONE);
 
-    let report = handle.join().unwrap().unwrap();
+    let report = handle.wait(deadline).unwrap();
     assert_eq!(report.exported_mem_ids, vec![321]);
     assert_eq!(report.last_sync.unwrap().seq, 777);
 }
@@ -266,22 +272,71 @@ fn send_client_method(
     protocol::write_packet(stream, &packet).unwrap();
 }
 
-fn connect_with_retry(socket_path: &std::path::Path) -> UnixStream {
-    let mut attempts = 0u32;
-    loop {
-        match UnixStream::connect(socket_path) {
-            Ok(stream) => return stream,
-            Err(err) if attempts < 60 => {
-                attempts += 1;
-                if err.kind() != std::io::ErrorKind::NotFound
-                    && err.kind() != std::io::ErrorKind::ConnectionRefused
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
-            Err(err) => panic!("failed to connect to {}: {err}", socket_path.display()),
-        }
-    }
+#[test]
+fn server_accept_timeout_is_bounded_and_diagnostic() {
+    let socket_path = testkit::unique_socket_path("pipewire-native-server-accept-timeout");
+    let scenario = Scenario::builder()
+        .steps(vec![])
+        .name("accept-timeout".to_string())
+        .build();
+    let server = ScriptedServer::builder()
+        .config(
+            ServerConfig::builder()
+                .socket_path(socket_path)
+                .deadline(Duration::from_millis(75))
+                .build(),
+        )
+        .scenario(scenario)
+        .build();
+
+    let started = Instant::now();
+    let err = server.run().unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    let diagnostic = err.to_string();
+    assert!(
+        diagnostic.contains("scenario=accept-timeout"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("phase=accept"), "{diagnostic}");
+    assert!(diagnostic.contains("step=not-started"), "{diagnostic}");
+    assert!(diagnostic.contains("buffered_frame_state="), "{diagnostic}");
+    assert!(diagnostic.contains("descriptor_count="), "{diagnostic}");
+}
+
+#[test]
+fn server_read_timeout_reports_last_script_step() {
+    let deadline = testkit::TestDeadline::after(Duration::from_secs(1));
+    let socket_path = testkit::unique_socket_path("pipewire-native-server-read-timeout");
+    let scenario = Scenario::builder()
+        .steps(vec![ScriptStep::builder()
+            .name("waiting-for-hello".to_string())
+            .expect(Expectation::CoreHello)
+            .actions(vec![])
+            .build()])
+        .name("read-timeout".to_string())
+        .build();
+    let server = ScriptedServer::builder()
+        .config(
+            ServerConfig::builder()
+                .socket_path(socket_path.clone())
+                .deadline(Duration::from_millis(100))
+                .build(),
+        )
+        .scenario(scenario)
+        .build();
+    let handle = testkit::spawn(server);
+    let _stream = deadline.connect(&socket_path).unwrap();
+
+    let err = handle.wait(deadline).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    let diagnostic = err.to_string();
+    assert!(diagnostic.contains("scenario=read-timeout"), "{diagnostic}");
+    assert!(diagnostic.contains("phase=read"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("step=0 name=waiting-for-hello"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("expectation=CoreHello"), "{diagnostic}");
+    assert!(diagnostic.contains("completed_steps=0"), "{diagnostic}");
 }

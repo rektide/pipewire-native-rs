@@ -9,6 +9,7 @@ use std::{
         unix::net::{UnixListener, UnixStream},
     },
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use bon::Builder;
@@ -34,6 +35,8 @@ pub struct ServerConfig {
     pub single_client: Option<bool>,
     /// Optional label used for tracing.
     pub trace_name: Option<String>,
+    /// Maximum duration for accepting and completing one scripted run.
+    pub deadline: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -45,6 +48,10 @@ impl ServerConfig {
         self.trace_name
             .as_deref()
             .unwrap_or("pipewire-native-scripted-server")
+    }
+
+    fn run_timeout(&self) -> Duration {
+        self.deadline.unwrap_or(Duration::from_secs(5))
     }
 }
 
@@ -79,6 +86,7 @@ impl ScriptedServer {
     pub fn run(self) -> io::Result<RunReport> {
         let config = self.config;
         let scenario = self.scenario;
+        let deadline = Instant::now() + config.run_timeout();
 
         if let Some(parent) = config.socket_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -99,7 +107,12 @@ impl ScriptedServer {
         );
 
         let listener = UnixListener::bind(&config.socket_path)?;
-        let (mut client, addr) = listener.accept()?;
+        listener.set_nonblocking(true)?;
+        wait_until_readable(&listener, deadline)
+            .map_err(|err| runtime_wait_error(&config, &scenario, None, 0, "accept", err))?;
+        let (mut client, addr) = listener
+            .accept()
+            .map_err(|err| runtime_wait_error(&config, &scenario, None, 0, "accept", err))?;
 
         debug!(
             trace_name = config.trace_name(),
@@ -112,16 +125,41 @@ impl ScriptedServer {
             ..Default::default()
         };
 
-        if config.single_client_enabled() {
-            listener.set_nonblocking(true)?;
-        }
-
         for (step_index, step) in scenario.steps.iter().enumerate() {
             if config.single_client_enabled() {
                 reject_pending_clients(&listener, &mut state)?;
             }
 
-            let packet = protocol::read_packet(&mut client)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(runtime_wait_error(
+                    &config,
+                    &scenario,
+                    Some(step_index),
+                    state.completed_steps,
+                    "read",
+                    io::Error::new(io::ErrorKind::TimedOut, "script deadline elapsed"),
+                ));
+            }
+            client.set_read_timeout(Some(remaining))?;
+            client.set_write_timeout(Some(remaining))?;
+            let packet = protocol::read_packet(&mut client).map_err(|err| {
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) {
+                    runtime_wait_error(
+                        &config,
+                        &scenario,
+                        Some(step_index),
+                        state.completed_steps,
+                        "read",
+                        err,
+                    )
+                } else {
+                    err
+                }
+            })?;
             let inbound = decode_inbound_message(
                 packet.header.object_id,
                 packet.header.opcode,
@@ -168,6 +206,71 @@ impl ScriptedServer {
 
         Ok(to_run_report(state))
     }
+}
+
+fn wait_until_readable(listener: &UnixListener, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "script deadline elapsed",
+            ));
+        }
+
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut poll_fd = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms.max(1)) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result == 0 {
+            continue;
+        }
+
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn runtime_wait_error(
+    config: &ServerConfig,
+    scenario: &Scenario,
+    step_index: Option<usize>,
+    completed_steps: usize,
+    phase: &str,
+    source: io::Error,
+) -> io::Error {
+    let scenario_name = scenario.name.as_deref().unwrap_or("unnamed");
+    let step = step_index
+        .and_then(|index| scenario.steps.get(index).map(|step| (index, step)))
+        .map(|(index, step)| {
+            format!(
+                "{index} name={} expectation={:?}",
+                step.name.as_deref().unwrap_or("unnamed"),
+                step.expect
+            )
+        })
+        .unwrap_or_else(|| "not-started".to_string());
+
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "scripted server timed out: trace={} scenario={} phase={} step={} completed_steps={} buffered_frame_state=packet-reader-internal descriptor_count=packet-reader-internal: {}",
+            config.trace_name(),
+            scenario_name,
+            phase,
+            step,
+            completed_steps,
+            source
+        ),
+    )
 }
 
 fn apply_action(

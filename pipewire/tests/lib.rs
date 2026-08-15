@@ -4,10 +4,15 @@
 
 use std::{
     collections::HashMap,
+    io,
+    os::unix::net::UnixStream,
+    os::unix::process::CommandExt,
+    path::Path,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, RwLock,
     },
+    time::Duration,
 };
 
 use pipewire_native::{
@@ -37,18 +42,65 @@ struct TestContext {
     pipewire: std::process::Child,
 }
 
+impl Drop for TestContext {
+    fn drop(&mut self) {
+        let _ = self.pipewire.kill();
+        let _ = self.pipewire.wait();
+    }
+}
+
 fn start_pipewire() -> TestContext {
     let runtime_dir = tempfile::tempdir().unwrap();
 
     std::env::set_var("PIPEWIRE_RUNTIME_DIR", runtime_dir.path());
 
-    let pipewire = std::process::Command::new("pipewire").spawn().unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    let mut pipewire = std::process::Command::new("pipewire").spawn().unwrap();
+    let socket_path = runtime_dir.path().join("pipewire-0");
+    wait_for_daemon_socket(
+        &mut pipewire,
+        &socket_path,
+        pipewire_native_server::testkit::TestDeadline::after(Duration::from_secs(5)),
+    )
+    .unwrap_or_else(|err| panic!("PipeWire daemon did not become ready: {err}"));
 
     TestContext {
         runtime_dir,
         pipewire,
+    }
+}
+
+fn wait_for_daemon_socket(
+    child: &mut std::process::Child,
+    socket_path: &Path,
+    deadline: pipewire_native_server::testkit::TestDeadline,
+) -> io::Result<()> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "daemon exited with {status} before creating {}",
+                socket_path.display()
+            )));
+        }
+
+        match UnixStream::connect(socket_path) {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                let remaining = deadline.remaining(&format!(
+                    "waiting for daemon socket {} (last error: {err})",
+                    socket_path.display()
+                ))?;
+                std::thread::park_timeout(remaining.min(Duration::from_millis(10)));
+            }
+            Err(err) => return Err(err),
+        }
     }
 }
 
@@ -189,6 +241,57 @@ fn destroy_nodes(registry: &Registry, objects: &Objects) {
 
 #[test]
 fn test_lib() {
+    const HELPER_ENV: &str = "PIPEWIRE_NATIVE_REAL_DAEMON_HELPER";
+
+    if std::env::var_os(HELPER_ENV).is_some() {
+        test_lib_with_real_daemon();
+        return;
+    }
+
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .arg("--exact")
+        .arg("test_lib")
+        .arg("--nocapture")
+        .env(HELPER_ENV, "1");
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut helper = command.spawn().unwrap();
+    let deadline = pipewire_native_server::testkit::TestDeadline::after(Duration::from_secs(8));
+
+    let status = loop {
+        if let Some(status) = helper.try_wait().unwrap() {
+            break status;
+        }
+        match deadline.remaining("running real-daemon integration helper") {
+            Ok(remaining) => {
+                std::thread::park_timeout(remaining.min(Duration::from_millis(10)));
+            }
+            Err(err) => {
+                unsafe {
+                    libc::kill(-(helper.id() as libc::pid_t), libc::SIGKILL);
+                }
+                let _ = helper.wait();
+                panic!(
+                    "real-daemon integration timed out; phase=helper-execution deadline=8s: {err}"
+                );
+            }
+        }
+    };
+    assert!(
+        status.success(),
+        "real-daemon integration helper exited with {status}"
+    );
+}
+
+fn test_lib_with_real_daemon() {
     let _test_context = start_pipewire();
 
     pipewire::init();

@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 use pipewire_native::{
     self as pipewire, context::Context, core::CoreEvents, main_loop::MainLoop,
@@ -21,6 +22,7 @@ use serial_test::serial;
 #[serial]
 fn client_handles_scripted_core_add_mem_fd_event() {
     pipewire::init();
+    let deadline = testkit::TestDeadline::after(Duration::from_secs(5));
 
     let socket_path = testkit::unique_socket_path("pipewire-native-scripted-add-mem");
 
@@ -61,6 +63,11 @@ fn client_handles_scripted_core_add_mem_fd_event() {
                     Action::SendCoreDoneFromLastSync,
                 ])
                 .build(),
+            ScriptStep::builder()
+                .name("expect-client-observed-done".to_string())
+                .expect(Expectation::CoreSync)
+                .actions(vec![Action::CloseConnection])
+                .build(),
         ])
         .build();
 
@@ -88,19 +95,24 @@ fn client_handles_scripted_core_add_mem_fd_event() {
     let core = context.connect(None).unwrap();
 
     let done_seen = Arc::new(AtomicBool::new(false));
+    let timed_out = Arc::new(AtomicBool::new(false));
     let done_seq = Arc::new(AtomicU32::new(0));
+    let acknowledgement_seq = Arc::new(AtomicU32::new(0));
     let expected_seq = Arc::new(AtomicU32::new(0));
 
     let done_seen_cb = done_seen.clone();
     let done_seq_cb = done_seq.clone();
     let expected_seq_cb = expected_seq.clone();
     let main_loop_cb = main_loop.clone();
+    let core_cb = core.clone();
+    let acknowledgement_seq_cb = acknowledgement_seq.clone();
     core.add_listener(CoreEvents::new(
         None,
         Some(Box::new(move |_id, seq| {
-            done_seq_cb.store(seq, Ordering::Relaxed);
             if seq == expected_seq_cb.load(Ordering::Relaxed) {
+                done_seq_cb.store(seq, Ordering::Relaxed);
                 done_seen_cb.store(true, Ordering::Relaxed);
+                acknowledgement_seq_cb.store(core_cb.sync().unwrap(), Ordering::Relaxed);
                 main_loop_cb.quit();
             }
         })),
@@ -110,8 +122,10 @@ fn client_handles_scripted_core_add_mem_fd_event() {
     ));
 
     let main_loop_timer = main_loop.clone();
+    let timed_out_cb = timed_out.clone();
     let mut timer = main_loop
         .add_timer(Box::new(move |_expirations| {
+            timed_out_cb.store(true, Ordering::Relaxed);
             main_loop_timer.quit();
         }))
         .unwrap();
@@ -139,11 +153,17 @@ fn client_handles_scripted_core_add_mem_fd_event() {
         }
     }
 
+    let report = server_thread.wait(deadline).unwrap();
+    assert!(
+        !timed_out.load(Ordering::Relaxed),
+        "main loop deadline elapsed before matching Core::Done; server_report={report:?}"
+    );
     assert!(done_seen.load(Ordering::Relaxed));
     assert_eq!(done_seq.load(Ordering::Relaxed), seq);
-
-    let report = server_thread.join().unwrap().unwrap();
     assert_eq!(report.completed_steps, 3);
     assert_eq!(report.exported_mem_ids, vec![55]);
-    assert_eq!(report.last_sync.unwrap().seq, seq);
+    assert_eq!(
+        report.last_sync.unwrap().seq,
+        acknowledgement_seq.load(Ordering::Relaxed)
+    );
 }
