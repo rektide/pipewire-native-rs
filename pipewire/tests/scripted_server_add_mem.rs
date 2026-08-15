@@ -27,9 +27,11 @@ use pipewire_native_server::{
 use serial_test::serial;
 
 type ImportedMemory = Arc<Mutex<Vec<(u32, u32, OwnedFd, u32)>>>;
+type ObservedMemory = Arc<Mutex<Vec<(u32, u32, u32)>>>;
 
 struct Importer {
     memory: ImportedMemory,
+    observed: ObservedMemory,
     added: Arc<AtomicU32>,
     removed: Arc<Mutex<Vec<u32>>>,
 }
@@ -37,6 +39,7 @@ struct Importer {
 impl CoreMemoryImporter for Importer {
     fn add_memory(&mut self, id: u32, type_: u32, fd: OwnedFd, flags: u32) -> std::io::Result<()> {
         self.added.fetch_add(1, Ordering::Relaxed);
+        self.observed.lock().unwrap().push((id, type_, flags));
         self.memory.lock().unwrap().push((id, type_, fd, flags));
         Ok(())
     }
@@ -79,6 +82,7 @@ fn add_mem_scenario(id: u32, fd_index: i32) -> Scenario {
                 .size(4096)
                 .build(),
         ),
+        Action::SendCoreRemoveMem { id },
         Action::SendCoreDoneFromLastSync,
     ];
 
@@ -137,16 +141,23 @@ fn new_client(
 
 fn install_importer(
     core: &pipewire::core::Core,
-) -> (ImportedMemory, Arc<AtomicU32>, Arc<Mutex<Vec<u32>>>) {
+) -> (
+    ImportedMemory,
+    ObservedMemory,
+    Arc<AtomicU32>,
+    Arc<Mutex<Vec<u32>>>,
+) {
     let imported = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::new(Mutex::new(Vec::new()));
     let added = Arc::new(AtomicU32::new(0));
     let removed = Arc::new(Mutex::new(Vec::new()));
     core.set_memory_importer(Some(Box::new(Importer {
         memory: imported.clone(),
+        observed: observed.clone(),
         added: added.clone(),
         removed: removed.clone(),
     })));
-    (imported, added, removed)
+    (imported, observed, added, removed)
 }
 
 fn install_timeout(
@@ -192,7 +203,7 @@ fn client_imports_indexed_add_mem_from_scripted_server() {
     let socket_path = testkit::unique_socket_path("pipewire-native-indexed-add-mem");
     let server = spawn_server(55, 0, &socket_path);
     let (_remote, main_loop, _context, core) = new_client(&socket_path);
-    let (imported, added, removed) = install_importer(&core);
+    let (imported, observed, added, removed) = install_importer(&core);
 
     let done_seen = Arc::new(AtomicBool::new(false));
     let expected_seq = Arc::new(AtomicU32::new(0));
@@ -220,12 +231,13 @@ fn client_imports_indexed_add_mem_from_scripted_server() {
     assert!(done_seen.load(Ordering::Relaxed));
     assert_eq!(report.exported_mem_ids, vec![55]);
     assert_eq!(added.load(Ordering::Relaxed), 1);
-    let imported = imported.lock().unwrap();
-    assert_eq!(imported.len(), 1);
-    assert_eq!(imported[0].0, 55);
-    assert_eq!(imported[0].1, spa_data_type::MEM_FD);
-    assert_eq!(imported[0].3, 0);
-    assert!(removed.lock().unwrap().is_empty());
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        &[(55, spa_data_type::MEM_FD, 0)]
+    );
+    assert!(imported.lock().unwrap().is_empty());
+    assert_eq!(removed.lock().unwrap().as_slice(), &[55]);
+    assert!(!process_has_memfd(55), "removed AddMem descriptor leaked");
 }
 
 #[test]
@@ -236,7 +248,7 @@ fn wrong_add_mem_fd_index_rejects_import_and_closes_descriptor() {
     let socket_path = testkit::unique_socket_path("pipewire-native-wrong-add-mem-index");
     let server = spawn_server(56, 1, &socket_path);
     let (_remote, main_loop, _context, core) = new_client(&socket_path);
-    let (imported, added, removed) = install_importer(&core);
+    let (imported, observed, added, removed) = install_importer(&core);
 
     core.sync().unwrap();
 
@@ -252,6 +264,7 @@ fn wrong_add_mem_fd_index_rejects_import_and_closes_descriptor() {
     assert!(processing_window_elapsed.load(Ordering::Relaxed));
     assert_eq!(report.exported_mem_ids, vec![56]);
     assert_eq!(added.load(Ordering::Relaxed), 0);
+    assert!(observed.lock().unwrap().is_empty());
     assert!(imported.lock().unwrap().is_empty());
     assert!(removed.lock().unwrap().is_empty());
     assert!(!process_has_memfd(56), "rejected AddMem descriptor leaked");

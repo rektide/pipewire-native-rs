@@ -23,7 +23,8 @@ use crate::{
     protocol::{
         self, core_event, decode_inbound_message, encode_core_add_mem_payload,
         encode_core_done_payload, encode_core_error_payload, encode_core_info_payload,
-        encode_registry_global_payload, encode_registry_global_remove_payload,
+        encode_core_remove_mem_payload, encode_registry_global_payload,
+        encode_registry_global_remove_payload,
     },
     script::{Action, Scenario},
     state::{ExecutionState, SyncState},
@@ -450,6 +451,18 @@ fn apply_action(
                 vec![fd],
             )?;
             state.exported_mem_ids.push(mem.id);
+            Ok(true)
+        }
+        Action::SendCoreRemoveMem { id } => {
+            let payload = encode_core_remove_mem_payload(*id)?;
+            send_event(
+                client,
+                sender,
+                deadline,
+                protocol::CORE_ID,
+                core_event::REMOVE_MEM,
+                payload,
+            )?;
             Ok(true)
         }
         Action::SendRegistryGlobalOnLastRegistry(global) => {

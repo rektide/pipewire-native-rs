@@ -150,6 +150,11 @@ pub enum Action {
     SendCoreError(CoreErrorAction),
     /// Emit `Core::AddMem` with a memfd fd attached via SCM_RIGHTS.
     SendCoreAddMem(CoreAddMemAction),
+    /// Emit `Core::RemoveMem` for a previously exported memory id.
+    SendCoreRemoveMem {
+        /// Server memory id to revoke.
+        id: u32,
+    },
     /// Emit `Registry::Global` on last known registry proxy id.
     SendRegistryGlobalOnLastRegistry(RegistryGlobalAction),
     /// Emit `Registry::GlobalRemove` on last known registry proxy id.

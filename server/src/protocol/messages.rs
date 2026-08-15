@@ -270,6 +270,11 @@ pub fn decode_core_add_mem_payload(payload: &[u8]) -> io::Result<CoreAddMemPaylo
     })
 }
 
+/// Encodes a `Core::RemoveMem` payload.
+pub fn encode_core_remove_mem_payload(id: u32) -> io::Result<Vec<u8>> {
+    encode_struct_payload(|sb| sb.push_int(id as i32))
+}
+
 /// Encodes a minimal `Core::Info` payload.
 pub fn encode_core_info_payload(
     cookie: u32,
