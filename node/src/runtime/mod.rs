@@ -8,14 +8,17 @@ use tokio::{
     task::{JoinError, JoinHandle},
 };
 
-use crate::transport::BoundTransport;
+use crate::{shm::MappedRegion, transport::BoundTransport};
 
 /// Per-cycle process context.
 pub struct ProcessCycle<'a> {
     /// Counter value drained from trigger eventfd.
     pub trigger_count: u64,
-    /// Writable bytes of activation memory.
-    pub activation: &'a mut [u8],
+    /// Raw activation mapping owned by this callback-scoped cycle.
+    ///
+    /// Byte-reference construction remains unsafe: this borrow serializes local
+    /// callbacks but does not prove synchronization with PipeWire or other mappings.
+    pub activation: &'a mut MappedRegion,
 }
 
 /// Process callback invoked for each cycle trigger.
@@ -99,8 +102,6 @@ pub fn spawn(runtime: NodeRuntime) -> NodeRuntimeHandle {
 fn join_result_to_io(join: Result<io::Result<()>, JoinError>) -> io::Result<()> {
     match join {
         Ok(result) => result,
-        Err(err) => Err(io::Error::other(format!(
-            "node runtime join error: {err}"
-        ))),
+        Err(err) => Err(io::Error::other(format!("node runtime join error: {err}"))),
     }
 }

@@ -4,5 +4,5 @@
 mod memfd;
 mod registry;
 
-pub use memfd::{MappedRegion, create_memfd};
+pub use memfd::{create_memfd, MappedRegion, SealStatus, ShrinkPolicy};
 pub use registry::MemoryRegistry;

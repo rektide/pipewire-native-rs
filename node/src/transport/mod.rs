@@ -4,7 +4,7 @@
 use std::{future::Future, io, os::fd::OwnedFd};
 
 use crate::{
-    shm::{MappedRegion, MemoryRegistry},
+    shm::{MappedRegion, MemoryRegistry, ShrinkPolicy},
     signal::EventFd,
 };
 
@@ -40,12 +40,25 @@ pub struct BoundTransport {
 
 impl BoundTransport {
     /// Binds a transport descriptor against imported shared memory.
+    ///
+    /// PipeWire imports are permitted without a shrink seal. Use
+    /// [`Self::bind_with_policy`] when the backing file must be shrink-safe.
     pub fn bind(config: TransportConfig, registry: &MemoryRegistry) -> io::Result<Self> {
-        let activation = registry.map(
+        Self::bind_with_policy(config, registry, ShrinkPolicy::Allow)
+    }
+
+    /// Binds a transport descriptor with an explicit activation shrink policy.
+    pub fn bind_with_policy(
+        config: TransportConfig,
+        registry: &MemoryRegistry,
+        shrink_policy: ShrinkPolicy,
+    ) -> io::Result<Self> {
+        let activation = registry.map_with_policy(
             config.activation.mem_id,
             config.activation.offset,
             config.activation.size,
             true,
+            shrink_policy,
         )?;
 
         Ok(Self {
@@ -65,14 +78,19 @@ impl BoundTransport {
         self.complete.signal(count)
     }
 
-    /// Returns immutable activation bytes.
-    pub fn activation(&self) -> &[u8] {
-        self.activation.as_slice()
+    /// Returns the raw activation mapping.
+    ///
+    /// Constructing references to its bytes remains unsafe because PipeWire may
+    /// access the same shared memory and imported files may not be shrink-sealed.
+    pub fn activation(&self) -> &MappedRegion {
+        &self.activation
     }
 
-    /// Returns mutable activation bytes.
-    pub fn activation_mut(&mut self) -> &mut [u8] {
-        self.activation.as_mut_slice()
+    /// Returns the raw activation mapping with exclusive access to this mapping owner.
+    ///
+    /// This borrow does not prove exclusivity from duplicate mappings or PipeWire.
+    pub fn activation_mut(&mut self) -> &mut MappedRegion {
+        &mut self.activation
     }
 }
 
@@ -82,7 +100,7 @@ mod tests {
 
     use tokio::runtime::Builder;
 
-    use crate::shm::{MemoryRegistry, create_memfd};
+    use crate::shm::{create_memfd, MemoryRegistry};
 
     use super::{Activation, BoundTransport, TransportConfig};
 
@@ -110,6 +128,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(transport.activation().len(), 256);
+            assert!(transport.activation().seal_status().prevents_shrink());
         });
     }
 

@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use super::MappedRegion;
+use super::{MappedRegion, ShrinkPolicy};
 
 /// Registry for memfd objects announced by PipeWire `Core::AddMem`.
 #[derive(Debug, Default)]
@@ -40,6 +40,18 @@ impl MemoryRegistry {
         size: usize,
         writable: bool,
     ) -> io::Result<MappedRegion> {
+        self.map_with_policy(id, offset, size, writable, ShrinkPolicy::Allow)
+    }
+
+    /// Maps a byte range using an explicit backing-file shrink policy.
+    pub fn map_with_policy(
+        &self,
+        id: u32,
+        offset: usize,
+        size: usize,
+        writable: bool,
+        shrink_policy: ShrinkPolicy,
+    ) -> io::Result<MappedRegion> {
         let fd = self.memory.get(&id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -47,6 +59,6 @@ impl MemoryRegistry {
             )
         })?;
 
-        MappedRegion::map_shared(fd.as_fd(), offset, size, writable)
+        MappedRegion::map_shared_with_policy(fd.as_fd(), offset, size, writable, shrink_policy)
     }
 }
