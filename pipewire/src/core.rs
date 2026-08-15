@@ -93,6 +93,7 @@ impl Core {
                 objects.clear();
 
                 this.inner.client.disconnect();
+                this.set_memory_importer(None);
             }),
             removed: some_closure!([this] {
                 debug!("core removed");
