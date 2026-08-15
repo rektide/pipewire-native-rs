@@ -115,7 +115,7 @@ impl<'a> RawPod<'a> {
 }
 
 impl RawPodOwned {
-    pub fn wrap(data: Vec<u8>) -> Result<RawPodOwned, Error> {
+    pub fn wrap(mut data: Vec<u8>) -> Result<RawPodOwned, Error> {
         if data.len() < 8 {
             return Err(Error::NoSpace);
         }
@@ -130,6 +130,7 @@ impl RawPodOwned {
         let type_ = Type::try_from(u32::from_ne_bytes(data[4..8].try_into().unwrap()))
             .map_err(|e| Error::Invalid(format!("Could not decode pod type: {e:?}")))?;
 
+        data.truncate(size);
         Ok(RawPodOwned { size, type_, data })
     }
 

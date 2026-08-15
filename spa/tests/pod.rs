@@ -11,7 +11,7 @@ use pipewire_native_spa::pod::parser::Parser;
 use pipewire_native_spa::pod::types::{
     Choice, Fd, Fraction, Id, ObjectType, Pointer, PropertyFlags, Rectangle, Type,
 };
-use pipewire_native_spa::pod::{Pod, RawPod};
+use pipewire_native_spa::pod::{Pod, RawPod, RawPodOwned};
 
 use libspa::pod as spa_pod;
 use libspa::sys::{self as spa_sys};
@@ -295,6 +295,18 @@ fn raw_pod_requires_declared_padding() {
     let mut data = pod_header(1, Type::Bytes);
     data.push(7);
     assert!(RawPod::wrap(&data).is_err());
+}
+
+#[test]
+fn owned_raw_pod_does_not_retain_trailing_input() {
+    let first = pod_header(0, Type::None);
+    let mut sequence = first.clone();
+    sequence.extend(pod_header(0, Type::None));
+
+    let (owned, consumed) = <RawPodOwned as Pod>::decode(&sequence).unwrap();
+
+    assert_eq!(consumed, first.len());
+    assert_eq!(owned.data(), first);
 }
 
 fn exercise_untrusted_pod_bytes(data: &[u8]) {
