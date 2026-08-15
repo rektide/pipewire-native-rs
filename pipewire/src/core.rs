@@ -3,7 +3,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
 use std::{
-    os::fd::RawFd,
+    os::fd::OwnedFd,
     sync::{Arc, Mutex, RwLock},
 };
 
@@ -51,6 +51,7 @@ refcounted! {
         objects: RwLock<IdMap<Box<dyn HasProxy>>>,
         methods: Arc<Mutex<CoreMethods<Core>>>,
         hooks: Arc<Mutex<spa::hook::HookList<CoreEvents>>>,
+        memory_importer: Mutex<Option<Box<dyn CoreMemoryImporter>>>,
     }
 }
 
@@ -155,13 +156,6 @@ impl Core {
                     object.proxy().set_bound_id(global_id);
                 }
             }),
-            add_mem: some_closure!([] id, type_, fd, flags, {
-                debug!("got add_mem: {id} {type_} {flags}");
-                let _ = unsafe { libc::close(fd) };
-            }),
-            remove_mem: some_closure!([] id, {
-                debug!("got remove_mem: {id}");
-            }),
             bound_props: some_closure!([this] id, global_id, props, {
                 debug!("got bound_props: {id} {global_id} {props:?}");
                 let proxies = this.inner.objects.read().unwrap();
@@ -263,6 +257,38 @@ impl Core {
     /// Remove a set of event listeners.
     pub fn remove_listener(&self, hook_id: HookId) {
         self.inner.hooks.lock().unwrap().remove(hook_id);
+    }
+
+    /// Installs the sole owner of memory descriptors announced by Core `AddMem` events.
+    /// Replacing an importer drops the previous importer and all resources it still owns.
+    pub fn set_memory_importer(&self, importer: Option<Box<dyn CoreMemoryImporter>>) {
+        *self.inner.memory_importer.lock().unwrap() = importer;
+    }
+
+    pub(crate) fn import_memory(
+        &self,
+        id: Id,
+        type_: u32,
+        fd: OwnedFd,
+        flags: u32,
+    ) -> std::io::Result<()> {
+        let mut importer = self.inner.memory_importer.lock().unwrap();
+        if let Some(importer) = importer.as_mut() {
+            importer.add_memory(id, type_, fd, flags)
+        } else {
+            debug!("dropping unhandled add_mem: {id} {type_} {flags}");
+            Ok(())
+        }
+    }
+
+    pub(crate) fn remove_memory(&self, id: Id) -> std::io::Result<()> {
+        let mut importer = self.inner.memory_importer.lock().unwrap();
+        if let Some(importer) = importer.as_mut() {
+            importer.remove_memory(id)
+        } else {
+            debug!("ignoring unhandled remove_mem: {id}");
+            Ok(())
+        }
     }
 
     /// Trigger a `sync` message to the server, flushing all pending messages.
@@ -371,11 +397,16 @@ pub struct CoreEvents {
     pub(crate) ping: Option<Box<dyn FnMut(Id, u32) + Send>>,
     pub(crate) remove_id: Option<Box<dyn FnMut(Id) + Send>>,
     pub(crate) bound_id: Option<Box<dyn FnMut(Id, Id) + Send>>,
-    #[allow(unused)]
-    pub(crate) add_mem: Option<Box<dyn FnMut(Id, u32, RawFd, u32) + Send>>,
-    #[allow(unused)]
-    pub(crate) remove_mem: Option<Box<dyn FnMut(Id) + Send>>,
     pub(crate) bound_props: Option<Box<dyn FnMut(Id, Id, &Properties) + Send>>,
+}
+
+/// Single-owner destination for memory announced by Core protocol events.
+pub trait CoreMemoryImporter: Send {
+    /// Takes ownership of one descriptor selected from the `AddMem` frame's FD table.
+    fn add_memory(&mut self, id: Id, type_: u32, fd: OwnedFd, flags: u32) -> std::io::Result<()>;
+
+    /// Invalidates a previously announced memory ID.
+    fn remove_memory(&mut self, id: Id) -> std::io::Result<()>;
 }
 
 #[allow(clippy::type_complexity)]
@@ -415,6 +446,7 @@ impl InnerCore {
                 connection,
             ))),
             hooks: spa::hook::HookList::new(),
+            memory_importer: Mutex::new(None),
         }
     }
 }

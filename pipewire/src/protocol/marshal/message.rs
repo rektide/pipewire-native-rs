@@ -3,57 +3,68 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
 use pipewire_native_macros as macros;
-use pipewire_native_spa as spa;
+use pipewire_native_protocol::native::frame::FrameFds;
+use pipewire_native_spa::{self as spa, pod::Pod};
 
-pub(crate) struct Header {
-    pub(crate) id: u32,
-    pub(crate) opcode: u8,
-    pub(crate) size: u32, // actually 24 bytes
-    pub(crate) seq: u32,
-    pub(crate) n_fds: u32,
+use super::Marshallable;
+
+pub(crate) struct InboundMessage<'a> {
+    opcode: u8,
+    payload: &'a [u8],
+    fds: &'a mut FrameFds,
+    footer: Option<CoreFooter>,
 }
 
-impl spa::pod::Pod for Header {
-    type DecodesTo = Self;
-
-    fn encode(&self, data: &mut [u8]) -> Result<usize, spa::pod::Error> {
-        if data.len() < 16 {
-            return Err(spa::pod::Error::NoSpace);
+impl<'a> InboundMessage<'a> {
+    pub(crate) fn new(opcode: u8, payload: &'a [u8], fds: &'a mut FrameFds) -> Self {
+        Self {
+            opcode,
+            payload,
+            fds,
+            footer: None,
         }
-
-        data[0..4].copy_from_slice(&self.id.to_ne_bytes());
-        let word = (self.opcode as u32) << 24 | (self.size & ((1 << 24) - 1));
-        data[4..8].copy_from_slice(&word.to_ne_bytes());
-        data[8..12].copy_from_slice(&self.seq.to_ne_bytes());
-        data[12..16].copy_from_slice(&self.n_fds.to_ne_bytes());
-
-        Ok(16)
     }
 
-    fn decode(data: &[u8]) -> Result<(Self::DecodesTo, usize), spa::pod::Error> {
-        if data.len() < 16 {
-            return Err(spa::pod::Error::Invalid(
-                "Insufficent data for header".to_string(),
+    pub(crate) fn decode<T: Marshallable>(&mut self) -> std::io::Result<T> {
+        let (body, body_size) = T::decode(self.opcode, self.payload).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("could not decode message body: {error:?}"),
+            )
+        })?;
+        let (footer, footer_size) = if body_size < self.payload.len() {
+            let (footer, size) =
+                CoreFooter::decode(&self.payload[body_size..]).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("could not decode message footer: {error:?}"),
+                    )
+                })?;
+            (Some(footer), size)
+        } else {
+            (None, 0)
+        };
+        if body_size + footer_size != self.payload.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "message payload length {} differs from body {body_size} plus footer {footer_size}",
+                    self.payload.len()
+                ),
             ));
         }
+        self.footer = footer;
+        Ok(body)
+    }
 
-        let id = u32::from_ne_bytes(data[0..4].try_into().unwrap());
-        let word = u32::from_ne_bytes(data[4..8].try_into().unwrap());
-        let opcode = (word >> 24) as u8;
-        let size = word & ((1 << 24) - 1);
-        let seq = u32::from_ne_bytes(data[8..12].try_into().unwrap());
-        let n_fds = u32::from_ne_bytes(data[12..16].try_into().unwrap());
+    pub(crate) fn take_fd(&mut self, index: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+        self.fds
+            .take(index)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
 
-        Ok((
-            Header {
-                id,
-                opcode,
-                size,
-                seq,
-                n_fds,
-            },
-            16,
-        ))
+    pub(crate) fn footer(&self) -> Option<&CoreFooter> {
+        self.footer.as_ref()
     }
 }
 
@@ -202,5 +213,59 @@ impl spa::pod::Pod for ClientFooter {
 
             Ok(footer)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::{fd::AsFd, unix::net::UnixStream};
+
+    use pipewire_native_protocol::native::frame::{
+        FrameLimits, FrameReceiver, FrameSender, OutboundFrame, ReceiveOutcome,
+    };
+
+    use super::InboundMessage;
+
+    fn frame_with_fd() -> pipewire_native_protocol::native::frame::ReceivedFrame {
+        let (tx, rx) = UnixStream::pair().unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let limits = FrameLimits::default();
+        let frame =
+            OutboundFrame::duplicate_fds(0, 0, 0, Vec::new(), &[file.as_fd()], limits).unwrap();
+        let mut sender = FrameSender::new(limits);
+        sender.enqueue(frame).unwrap();
+        sender.flush(tx.as_fd()).unwrap();
+        let mut receiver = FrameReceiver::new(limits);
+        match receiver.receive(rx.as_fd()).unwrap() {
+            ReceiveOutcome::Frame(frame) => frame,
+            outcome => panic!("expected frame, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn fd_index_is_bounds_checked_without_consuming_valid_entry() {
+        let frame = frame_with_fd();
+        let (_, payload, mut fds) = frame.into_parts();
+        let mut message = InboundMessage::new(0, &payload, &mut fds);
+
+        assert_eq!(
+            message.take_fd(1).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        message.take_fd(0).unwrap();
+    }
+
+    #[test]
+    fn fd_index_can_transfer_ownership_only_once() {
+        let frame = frame_with_fd();
+        let (_, payload, mut fds) = frame.into_parts();
+        let mut message = InboundMessage::new(0, &payload, &mut fds);
+
+        let fd = message.take_fd(0).unwrap();
+        assert_eq!(
+            message.take_fd(0).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        drop(fd);
     }
 }

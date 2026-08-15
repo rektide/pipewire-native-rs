@@ -3,16 +3,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
 use std::{
-    collections::VecDeque,
     os::{
-        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsFd, OwnedFd},
         unix::net::UnixStream,
     },
     sync::{Arc, Mutex, RwLock},
 };
 
 use pipewire_native_protocol::native::frame::{
-    FlushOutcome, FrameError, FrameLimits, FrameSender, OutboundFrame,
+    FlushOutcome, FrameError, FrameLimits, FrameReceiver, FrameSender, OutboundFrame,
+    ReceiveOutcome, ReceivedFrame,
 };
 use pipewire_native_spa::{self as spa, pod::Pod};
 
@@ -21,8 +21,7 @@ use crate::{
 };
 
 use super::marshal::{
-    self,
-    message::{ClientFooter, Header},
+    message::ClientFooter,
     message::{ClientFooterPayload, ClientGeneration, CoreFooter, CoreFooterPayload},
     Marshallable,
 };
@@ -30,17 +29,11 @@ use super::marshal::{
 default_topic!(log::topic::CONNECTION);
 
 const MAX_MESSAGE_SIZE: usize = 16_777_216;
-const MAX_CONTROL_FDS: usize = 16;
-
 refcounted! {
     pub(crate) struct Connection {
         stream: RwLock<Option<UnixStream>>,
         hooks: Arc<Mutex<spa::hook::HookList<ConnectionEvents>>>,
-        // Data received
-        in_buf: RwLock<Vec<u8>>,
-        in_size: RwLock<usize>,
-        in_offset: RwLock<usize>,
-        in_fds: RwLock<VecDeque<OwnedFd>>,
+        receiver: RwLock<FrameReceiver>,
         last_recv_generation: RwLock<i64>,
         // Data to send
         out_seq: RwLock<u32>,
@@ -79,10 +72,7 @@ impl Connection {
     }
 
     fn clear_buffers(&self) {
-        self.inner.in_buf.write().unwrap().fill(0);
-        *self.inner.in_size.write().unwrap() = 0;
-        *self.inner.in_offset.write().unwrap() = 0;
-        self.inner.in_fds.write().unwrap().clear();
+        *self.inner.receiver.write().unwrap() = FrameReceiver::new(FrameLimits::default());
         *self.inner.last_recv_generation.write().unwrap() = 0;
         *self.inner.out_seq.write().unwrap() = 0;
         *self.inner.sender.write().unwrap() = FrameSender::new(FrameLimits::default());
@@ -188,120 +178,23 @@ impl Connection {
         }
     }
 
-    pub(crate) fn next_message(&self) -> std::io::Result<Header> {
-        loop {
-            let (wanted_capacity, header) = self.parse_next()?;
-            trace!(
-                "we need {wanted_capacity}, got header: {}",
-                header.is_some()
-            );
-
-            let capacity = self.inner.in_buf.read().unwrap().len();
-            if capacity < wanted_capacity {
-                // Not enough space for header or message, make some space, try to fill some data,
-                // and then retry
-                trace!(
-                    "expanding capacity to {}",
-                    wanted_capacity.max(capacity * 2)
-                );
-                self.inner
-                    .in_buf
-                    .write()
-                    .unwrap()
-                    .resize(wanted_capacity.max(2 * capacity), 0);
-                self.read()?;
-            } else if let Some(header) = header {
-                // We had enough space, and got the header.
-                trace!(
-                    "got message id:{} opcode:{} seq:{} size:{}",
-                    header.id,
-                    header.opcode,
-                    header.seq,
-                    header.size
-                );
-
-                // Let's make sure we also have the body
-                let available =
-                    *self.inner.in_size.read().unwrap() - *self.inner.in_offset.read().unwrap();
-                if available >= header.size as usize {
-                    return Ok(header);
-                } else {
-                    // We read the header but not the data, so continue reading.
-                    self.read()?;
-                }
-            } else {
-                // We had enough space, but don't have the data, let's try to read data into the
-                // buffer
-                self.read()?;
-            }
-        }
-    }
-
-    pub(crate) fn decode_message<T: Marshallable, F: Pod<DecodesTo = F>>(
-        &self,
-        header: &Header,
-    ) -> std::io::Result<(T, Option<F>)> {
-        let buf = self.inner.in_buf.read().unwrap();
-        let mut size = self.inner.in_size.write().unwrap();
-        let mut offset = self.inner.in_offset.write().unwrap();
-
-        let start = *offset + marshal::HEADER_LEN;
-        let end = start + header.size as usize;
-
-        // Update the external offset and size before possibly bailing out with an error, otherwise
-        // we could be reading the same chunk again and again when that happens.
-        *offset += marshal::HEADER_LEN + header.size as usize;
-        if *offset == *size {
-            // We've consumed all the data
-            *offset = 0;
-            *size = 0;
-        }
-
-        let (body, body_size) = T::decode(header.opcode, &buf[start..end]).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Could not decode message body: {e:?}"),
-            )
+    pub(crate) fn receive_frame(&self) -> std::io::Result<ReceivedFrame> {
+        let stream = self.inner.stream.read().unwrap();
+        let stream = stream.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "connection has no stream")
         })?;
-
-        let (footer, footer_size) = if body_size < header.size as usize {
-            let (f, fs) = F::decode(&buf[start + body_size..]).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Could not decode message footer: {e:?}"),
-                )
-            })?;
-            (Some(f), fs)
-        } else {
-            (None, 0)
-        };
-
-        if body_size + footer_size != header.size as usize {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Mismatched message size({}) and body size({}) + footer_size({})",
-                    header.size, body_size, footer_size
-                ),
-            ));
+        match self
+            .inner
+            .receiver
+            .write()
+            .unwrap()
+            .receive(stream.as_fd())
+            .map_err(frame_error)?
+        {
+            ReceiveOutcome::Frame(frame) => Ok(frame),
+            ReceiveOutcome::WouldBlock => Err(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            ReceiveOutcome::Closed => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
         }
-
-        Ok((body, footer))
-    }
-
-    pub(crate) fn decode_core_message<T: Marshallable>(
-        &self,
-        header: &Header,
-    ) -> std::io::Result<T> {
-        let (object, footer) = self.decode_message(header)?;
-
-        self.update_generation(footer.as_ref());
-
-        Ok(object)
-    }
-
-    pub(crate) fn pop_fd(&self) -> Option<OwnedFd> {
-        self.inner.in_fds.write().unwrap().pop_front()
     }
 
     // TODO: support CoreGeneration as well when we implement server
@@ -317,117 +210,6 @@ impl Connection {
             }
         }
     }
-
-    fn parse_next(&self) -> std::io::Result<(usize, Option<Header>)> {
-        let size = *self.inner.in_size.read().unwrap();
-        let offset = *self.inner.in_offset.read().unwrap();
-
-        if size - offset < marshal::HEADER_LEN {
-            return Ok((offset + marshal::HEADER_LEN, None));
-        }
-
-        trace!("looking for message header from [{offset}..{size}]");
-
-        let buf = self.inner.in_buf.read().unwrap();
-        let header = match Header::decode(&buf[offset..size]) {
-            Ok((header, _)) => header,
-            Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to parse message: {e:?}"),
-                ))
-            }
-        };
-
-        Ok((
-            offset + marshal::HEADER_LEN + header.size as usize,
-            Some(header),
-        ))
-    }
-
-    fn read(&self) -> std::io::Result<()> {
-        let stream = self.inner.stream.read().unwrap();
-        let stream = stream.as_ref().unwrap();
-        let mut buf = self.inner.in_buf.write().unwrap();
-        let mut size = self.inner.in_size.write().unwrap();
-        let mut control = vec![
-            0u8;
-            unsafe {
-                libc::CMSG_SPACE((MAX_CONTROL_FDS * std::mem::size_of::<RawFd>()) as u32) as usize
-            }
-        ];
-
-        let mut iov = libc::iovec {
-            iov_base: buf[*size..].as_mut_ptr().cast::<libc::c_void>(),
-            iov_len: buf.len() - *size,
-        };
-        let mut msg = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: &mut iov,
-            msg_iovlen: 1,
-            msg_control: control.as_mut_ptr().cast::<libc::c_void>(),
-            msg_controllen: control.len(),
-            msg_flags: 0,
-        };
-
-        let read = loop {
-            let read =
-                unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-            if read < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-
-                return Err(err);
-            }
-
-            break read;
-        };
-
-        trace!("read {read} bytes at {size}");
-
-        if msg.msg_flags & libc::MSG_CTRUNC == libc::MSG_CTRUNC {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "control message was truncated",
-            ));
-        }
-
-        let msg_ptr = &msg as *const libc::msghdr;
-        let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg_ptr) };
-        while !cmsg.is_null() {
-            let level = unsafe { (*cmsg).cmsg_level };
-            let type_ = unsafe { (*cmsg).cmsg_type };
-
-            if level == libc::SOL_SOCKET && type_ == libc::SCM_RIGHTS {
-                let data_ptr = unsafe { libc::CMSG_DATA(cmsg) }.cast::<RawFd>();
-                let data_len =
-                    unsafe { (*cmsg).cmsg_len } as usize - unsafe { libc::CMSG_LEN(0) } as usize;
-                let n_fds = data_len / std::mem::size_of::<RawFd>();
-
-                let mut in_fds = self.inner.in_fds.write().unwrap();
-                for idx in 0..n_fds {
-                    let fd = unsafe { *data_ptr.add(idx) };
-                    if fd >= 0 {
-                        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                        in_fds.push_back(fd);
-                    }
-                }
-            }
-
-            cmsg = unsafe { libc::CMSG_NXTHDR(msg_ptr, cmsg) };
-        }
-
-        if read > 0 {
-            *size += read as usize;
-            Ok(())
-        } else {
-            // Nothing to process, we're done
-            Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
-        }
-    }
 }
 
 impl InnerConnection {
@@ -435,10 +217,7 @@ impl InnerConnection {
         InnerConnection {
             stream: RwLock::new(stream),
             hooks: spa::hook::HookList::new(),
-            in_buf: RwLock::new(vec![0; 16384]),
-            in_size: RwLock::new(0),
-            in_offset: RwLock::new(0),
-            in_fds: RwLock::new(VecDeque::new()),
+            receiver: RwLock::new(FrameReceiver::new(FrameLimits::default())),
             last_recv_generation: RwLock::new(0),
             out_seq: RwLock::new(0),
             sender: RwLock::new(FrameSender::new(FrameLimits::default())),
@@ -476,6 +255,9 @@ fn frame_error(error: FrameError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    use pipewire_native_protocol::native::frame::{Header, HEADER_LEN};
 
     use super::*;
 
@@ -516,17 +298,16 @@ mod tests {
         connection.push(42, TestMessage(payload.clone())).unwrap();
         connection.flush().unwrap();
 
-        let mut expected = vec![0; marshal::HEADER_LEN + payload.len()];
-        Header {
-            id: 42,
+        let mut expected = vec![0; HEADER_LEN + payload.len()];
+        let header = Header {
+            object_id: 42,
             opcode: 7,
-            size: payload.len() as u32,
+            payload_len: payload.len() as u32,
             seq: 0,
             n_fds: 0,
-        }
-        .encode(&mut expected)
-        .unwrap();
-        expected[marshal::HEADER_LEN..].copy_from_slice(&payload);
+        };
+        expected[..HEADER_LEN].copy_from_slice(&header.encode().unwrap());
+        expected[HEADER_LEN..].copy_from_slice(&payload);
 
         let mut actual = vec![0; expected.len()];
         rx.read_exact(&mut actual).unwrap();
@@ -588,5 +369,30 @@ mod tests {
             "queued frame did not drain after socket became writable"
         );
         assert!(connection.inner.sender.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn semantic_decode_error_leaves_coalesced_next_frame_aligned() {
+        let (tx, rx) = UnixStream::pair().unwrap();
+        let limits = FrameLimits::default();
+        let mut sender = FrameSender::new(limits);
+        sender
+            .enqueue(OutboundFrame::new(0, 255, 9, vec![0xff], Vec::new(), limits).unwrap())
+            .unwrap();
+        sender
+            .enqueue(OutboundFrame::new(0, 1, 10, Vec::new(), Vec::new(), limits).unwrap())
+            .unwrap();
+        sender.flush(tx.as_fd()).unwrap();
+
+        let connection = connection(rx);
+        let malformed = connection.receive_frame().unwrap();
+        let (_, payload, mut fds) = malformed.into_parts();
+        let mut message =
+            crate::protocol::marshal::message::InboundMessage::new(255, &payload, &mut fds);
+        assert!(message
+            .decode::<crate::protocol::marshal::core::Events>()
+            .is_err());
+
+        assert_eq!(connection.receive_frame().unwrap().header().seq, 10);
     }
 }

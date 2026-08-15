@@ -2,10 +2,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Asymptotic Inc.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
-use pipewire_native_macros as macros;
-use pipewire_native_spa::{self as spa, pod::Pod};
-use std::os::fd::IntoRawFd;
-
 use crate::{
     closure,
     core::{Core, CoreChangeMask, CoreInfo, CoreMethods},
@@ -15,6 +11,8 @@ use crate::{
     proxy::{self, HasProxy},
     trace, Id,
 };
+use pipewire_native_macros as macros;
+use pipewire_native_spa::{self as spa, pod::Pod};
 
 use super::PairList;
 
@@ -224,7 +222,8 @@ pub(crate) struct BoundId {
 #[derive(Debug, macros::PodStruct)]
 pub(crate) struct AddMem {
     id: i32,
-    type_: i32,
+    type_: spa::pod::types::Id<u32>,
+    fd: spa::pod::types::Fd,
     flags: i32,
 }
 
@@ -242,11 +241,10 @@ pub(crate) struct BoundProps {
 
 impl Events {
     pub(crate) fn demarshal(
-        connection: &Connection,
-        header: &super::message::Header,
+        message: &mut super::message::InboundMessage<'_>,
         core: Core,
     ) -> std::io::Result<()> {
-        let event = connection.decode_core_message::<Events>(header)?;
+        let event = message.decode::<Events>()?;
 
         trace!("got event: {event:?}");
 
@@ -290,25 +288,17 @@ impl Events {
                 object_notify!(core, bound_id, bound.id as Id, bound.global_id as Id);
             }
             Events::AddMem(add_mem) => {
-                let fd = connection.pop_fd().ok_or_else(|| {
+                let index = u32::try_from(add_mem.fd.0).map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "Core::AddMem event did not include SCM_RIGHTS fd",
+                        format!("Core::AddMem has negative fd index {}", add_mem.fd.0),
                     )
                 })?;
-                let raw_fd = fd.into_raw_fd();
-
-                object_notify!(
-                    core,
-                    add_mem,
-                    add_mem.id as Id,
-                    add_mem.type_ as u32,
-                    raw_fd,
-                    add_mem.flags as u32
-                );
+                let fd = message.take_fd(index)?;
+                core.import_memory(add_mem.id as Id, add_mem.type_.0, fd, add_mem.flags as u32)?;
             }
             Events::RemoveMem(rem_mem) => {
-                object_notify!(core, remove_mem, rem_mem.id as Id);
+                core.remove_memory(rem_mem.id as Id)?;
             }
             Events::BoundProps(bound) => {
                 let props = Properties::new_vec(bound.props.data);

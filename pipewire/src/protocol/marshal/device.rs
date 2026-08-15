@@ -165,11 +165,10 @@ pub(crate) struct Param {
 
 impl Events {
     pub(crate) fn demarshal(
-        connection: &Connection,
-        header: &super::message::Header,
+        message: &mut super::message::InboundMessage<'_>,
         device: Device,
     ) -> std::io::Result<()> {
-        let event = connection.decode_core_message::<Events>(header)?;
+        let event = message.decode::<Events>()?;
 
         trace!("got event: {event:?}");
 

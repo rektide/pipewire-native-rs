@@ -10,7 +10,6 @@ use pipewire_native_spa::{
 
 use crate::{
     default_topic, log, object_notify,
-    protocol::connection::Connection,
     proxy::profiler::{
         ClockSample, DriverClockSample, FollowerNodeSample, NodeSample, Profiler, ProfilerSample,
         SampleInfo,
@@ -128,11 +127,10 @@ pub(crate) struct Follower {
 
 impl Events {
     pub(crate) fn demarshal(
-        connection: &Connection,
-        header: &super::message::Header,
+        message: &mut super::message::InboundMessage<'_>,
         profiler: Profiler,
     ) -> std::io::Result<()> {
-        let event = connection.decode_core_message::<Events>(header)?;
+        let event = message.decode::<Events>()?;
 
         trace!("got event: {event:?}");
 

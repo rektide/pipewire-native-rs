@@ -8,7 +8,6 @@ use pipewire_native_spa::{self as spa, pod::Pod};
 use crate::{
     default_topic, log, object_notify,
     properties::Properties,
-    protocol::connection::Connection,
     proxy::factory::{Factory, FactoryChangeMask, FactoryInfo},
     trace, Id,
 };
@@ -36,11 +35,10 @@ pub(crate) struct Info {
 
 impl Events {
     pub(crate) fn demarshal(
-        connection: &Connection,
-        header: &super::message::Header,
+        message: &mut super::message::InboundMessage<'_>,
         factory: Factory,
     ) -> std::io::Result<()> {
-        let event = connection.decode_core_message::<Events>(header)?;
+        let event = message.decode::<Events>()?;
 
         trace!("got event: {event:?}");
 

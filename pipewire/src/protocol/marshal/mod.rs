@@ -17,8 +17,6 @@ pub(crate) mod registry;
 
 use pipewire_native_spa::{self as spa, pod::Pod};
 
-pub(crate) const HEADER_LEN: usize = 16;
-
 pub(crate) trait Marshallable {
     fn opcode(&self) -> u8;
 

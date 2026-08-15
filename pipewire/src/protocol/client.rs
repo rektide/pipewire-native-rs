@@ -154,15 +154,7 @@ impl Client {
     fn on_remote_data(&self, _fd: RawFd, mask: spa::flags::Io) {
         trace!("on remote data: {mask:?}");
 
-        if mask.intersects(spa::flags::Io::ERR | spa::flags::Io::HUP) {
-            self.on_connection_error(
-                std::io::Error::from(std::io::ErrorKind::BrokenPipe),
-                "I/O error",
-            );
-            return;
-        }
-
-        if mask.contains(spa::flags::Io::IN) {
+        if mask.intersects(spa::flags::Io::IN | spa::flags::Io::HUP) {
             loop {
                 if let Err(err) = self.process_messages() {
                     // We use EAGAIN to signify there are no more messages pending
@@ -174,6 +166,14 @@ impl Client {
                     }
                 }
             }
+        }
+
+        if mask.intersects(spa::flags::Io::ERR | spa::flags::Io::HUP) {
+            self.on_connection_error(
+                std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+                "I/O error",
+            );
+            return;
         }
 
         if mask.contains(spa::flags::Io::OUT) || *self.inner.need_flush.read().unwrap() {
@@ -217,96 +217,91 @@ impl Client {
 
     fn process_messages(&self) -> std::io::Result<()> {
         let core = self.core();
-        let header = self.inner.connection.next_message()?;
-        let object_type = match core.find_proxy_type(header.id as Id) {
+        let frame = self.inner.connection.receive_frame()?;
+        let header = frame.header();
+        let object_type = match core.find_proxy_type(header.object_id as Id) {
             Some(type_) => type_,
             None => {
                 warn!(
                     "Got message id:{} opcode:{} seq:{}",
-                    header.id, header.opcode, header.seq
+                    header.object_id, header.opcode, header.seq
                 );
                 return Ok(());
             }
         };
+        let (_, payload, mut fds) = frame.into_parts();
+        let mut message =
+            super::marshal::message::InboundMessage::new(header.opcode, &payload, &mut fds);
 
         match object_type {
             types::interface::CORE => {
-                let core = core.find_object::<Core>(header.id).unwrap();
-                super::marshal::core::Events::demarshal(&self.inner.connection, &header, core)?;
+                let core = core.find_object::<Core>(header.object_id).unwrap();
+                super::marshal::core::Events::demarshal(&mut message, core)?;
             }
             types::interface::CLIENT => {
                 let client = core
-                    .find_object::<proxy::client::Client>(header.id)
+                    .find_object::<proxy::client::Client>(header.object_id)
                     .unwrap();
-                super::marshal::client::Events::demarshal(&self.inner.connection, &header, client)?;
+                super::marshal::client::Events::demarshal(&mut message, client)?;
             }
             types::interface::DEVICE => {
                 let device = core
-                    .find_object::<proxy::device::Device>(header.id)
+                    .find_object::<proxy::device::Device>(header.object_id)
                     .unwrap();
-                super::marshal::device::Events::demarshal(&self.inner.connection, &header, device)?;
+                super::marshal::device::Events::demarshal(&mut message, device)?;
             }
             types::interface::FACTORY => {
                 let factory = core
-                    .find_object::<proxy::factory::Factory>(header.id)
+                    .find_object::<proxy::factory::Factory>(header.object_id)
                     .unwrap();
-                super::marshal::factory::Events::demarshal(
-                    &self.inner.connection,
-                    &header,
-                    factory,
-                )?;
+                super::marshal::factory::Events::demarshal(&mut message, factory)?;
             }
             types::interface::LINK => {
-                let link = core.find_object::<proxy::link::Link>(header.id).unwrap();
-                super::marshal::link::Events::demarshal(&self.inner.connection, &header, link)?;
+                let link = core
+                    .find_object::<proxy::link::Link>(header.object_id)
+                    .unwrap();
+                super::marshal::link::Events::demarshal(&mut message, link)?;
             }
             types::interface::METADATA => {
                 let metadata = core
-                    .find_object::<proxy::metadata::Metadata>(header.id)
+                    .find_object::<proxy::metadata::Metadata>(header.object_id)
                     .unwrap();
-                super::marshal::metadata::Events::demarshal(
-                    &self.inner.connection,
-                    &header,
-                    metadata,
-                )?;
+                super::marshal::metadata::Events::demarshal(&mut message, metadata)?;
             }
             types::interface::MODULE => {
                 let module = core
-                    .find_object::<proxy::module::Module>(header.id)
+                    .find_object::<proxy::module::Module>(header.object_id)
                     .unwrap();
-                super::marshal::module::Events::demarshal(&self.inner.connection, &header, module)?;
+                super::marshal::module::Events::demarshal(&mut message, module)?;
             }
             types::interface::NODE => {
-                let node = core.find_object::<proxy::node::Node>(header.id).unwrap();
-                super::marshal::node::Events::demarshal(&self.inner.connection, &header, node)?;
+                let node = core
+                    .find_object::<proxy::node::Node>(header.object_id)
+                    .unwrap();
+                super::marshal::node::Events::demarshal(&mut message, node)?;
             }
             types::interface::PORT => {
-                let port = core.find_object::<proxy::port::Port>(header.id).unwrap();
-                super::marshal::port::Events::demarshal(&self.inner.connection, &header, port)?;
+                let port = core
+                    .find_object::<proxy::port::Port>(header.object_id)
+                    .unwrap();
+                super::marshal::port::Events::demarshal(&mut message, port)?;
             }
             types::interface::PROFILER => {
                 let profiler = core
-                    .find_object::<proxy::profiler::Profiler>(header.id)
+                    .find_object::<proxy::profiler::Profiler>(header.object_id)
                     .unwrap();
-                super::marshal::profiler::Events::demarshal(
-                    &self.inner.connection,
-                    &header,
-                    profiler,
-                )?;
+                super::marshal::profiler::Events::demarshal(&mut message, profiler)?;
             }
             types::interface::REGISTRY => {
                 let registry = core
-                    .find_object::<proxy::registry::Registry>(header.id)
+                    .find_object::<proxy::registry::Registry>(header.object_id)
                     .unwrap();
-                super::marshal::registry::Events::demarshal(
-                    &self.inner.connection,
-                    &header,
-                    registry,
-                )?;
+                super::marshal::registry::Events::demarshal(&mut message, registry)?;
             }
             _ => unreachable!(),
         }
 
+        self.inner.connection.update_generation(message.footer());
         *self.inner.last_in_seq.write().unwrap() = header.seq;
 
         Ok(())
