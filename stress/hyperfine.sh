@@ -4,6 +4,7 @@ set -euo pipefail
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 MANIFEST="$HERE/Cargo.toml"
 BIN="$HERE/target/release/pw-stress"
+REPORT_BIN="$HERE/target/release/pw-stress-report"
 RESULTS="$HERE/results"
 WARMUP=${WARMUP:-1}
 RUNS=${RUNS:-10}
@@ -29,19 +30,25 @@ fi
 
 mkdir -p "$RESULTS"
 printf 'Preparing release runner...\n' >&2
-cargo build --release --manifest-path "$MANIFEST" --bin pw-stress
+cargo build --release --manifest-path "$MANIFEST" --bin pw-stress --bin pw-stress-report
 
 hyperfine --shell=none --warmup "$WARMUP" --runs "$RUNS" --style basic \
   -L preset "$PRESETS" -L payload "$FRAME_PAYLOADS" -L chunk "$FRAME_CHUNKS" -L density "$FRAME_FD_DENSITIES" \
   --export-json "$RESULTS/frame.json" \
   "$BIN frame --preset {preset} --payload-bytes {payload} --recv-chunk-bytes {chunk} --fd-density {density}"
+"$REPORT_BIN" --output-prefix "$RESULTS/frame-report" "$RESULTS/frame.json"
 
 hyperfine --shell=none --warmup "$WARMUP" --runs "$RUNS" --style basic \
   -L preset "$PRESETS" -L depth "$POD_DEPTHS" -L width "$POD_WIDTHS" -L values "$POD_VALUES" -L mode "$POD_MODES" \
   --export-json "$RESULTS/pod.json" \
   "$BIN pod --preset {preset} --depth {depth} --width {width} --values-per-container {values} --mode {mode}"
+"$REPORT_BIN" --output-prefix "$RESULTS/pod-report" "$RESULTS/pod.json"
 
 hyperfine --shell=none --warmup "$WARMUP" --runs "$RUNS" --style basic \
   -L preset "$PRESETS" -L region "$MEMORY_REGIONS" -L live "$MEMORY_LIVE" -L cycles "$MEMORY_CYCLES" \
   --export-json "$RESULTS/memory.json" \
   "$BIN memory --preset {preset} --region-bytes {region} --live-mappings {live} --retire-cycles {cycles}"
+"$REPORT_BIN" --output-prefix "$RESULTS/memory-report" "$RESULTS/memory.json"
+
+"$REPORT_BIN" --output-prefix "$RESULTS/report" \
+  "$RESULTS/frame.json" "$RESULTS/pod.json" "$RESULTS/memory.json"

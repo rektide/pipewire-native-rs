@@ -3,6 +3,7 @@
 pub mod frame;
 pub mod memory;
 pub mod pod;
+pub mod report;
 
 use std::hint::black_box;
 

@@ -30,18 +30,28 @@ Use subcommand help for all controls: `pw-stress frame --help`, `pw-stress pod -
 
 ## Hyperfine matrices
 
-[`hyperfine.sh`](/stress/hyperfine.sh) validates hyperfine 1.20.x syntax, performs one release build preparation, and benchmarks the binary directly with `--shell=none`. Repeated `-L` lists create cartesian matrices. JSON under `stress/results/` records each expanded command and parameter values and is intentionally ignored by Git.
+[`hyperfine.sh`](/stress/hyperfine.sh) validates hyperfine 1.20.x syntax, performs one release build preparation, and benchmarks the binary directly with `--shell=none`. Repeated `-L` lists create cartesian matrices. After each matrix, the separately built `pw-stress-report` re-executes every exact command once outside timing to obtain verified resolved metadata. It writes JSON, CSV, and Markdown per-workload reports plus combined `report.{json,csv,md}` under ignored `stress/results/`. Report generation is never part of a measured command.
 
 ```sh
 stress/hyperfine.sh
 WARMUP=0 RUNS=2 PRESETS=smoke FRAME_PAYLOADS=64,4096 FRAME_CHUNKS=1,1024 FRAME_FD_DENSITIES=0,100 POD_DEPTHS=1,4 POD_WIDTHS=2 POD_VALUES=4,64 POD_MODES=decode-only MEMORY_REGIONS=4096 MEMORY_LIVE=1,4 MEMORY_CYCLES=1,4 stress/hyperfine.sh
 ```
 
+Regenerate reports from existing Hyperfine 1.20 exports without benchmarking:
+
+```sh
+cargo build --release --manifest-path stress/Cargo.toml --bin pw-stress-report
+stress/target/release/pw-stress-report --output-prefix stress/results/report stress/results/frame.json stress/results/pod.json stress/results/memory.json
+stress/target/release/pw-stress-report --help
+```
+
+Hyperfine exports a command string rather than an argv array. The reporter applies POSIX shell-word splitting and then executes the resulting argv directly without a shell. This correctly preserves quoted spaces, but an unquoted executable path containing spaces is inherently ambiguous. In that case, pass `--argv-overrides FILE`; the file is a JSON object mapping each exact exported command string to an array containing the executable and arguments.
+
 ## Interpreting results
 
-Hyperfine measures full process execution, including deterministic generation and mandatory verification. POD `decode-only` isolates parser work more closely; `encode-decode` includes Builder allocation/encoding. Frame results include socket and descriptor creation plus nonblocking progress. Memory results include sealed memfd creation, import, mmap, touching every byte, retirement, generation checks, unmap, and an FD baseline check.
+Hyperfine measures full process execution, including deterministic generation and mandatory verification. Reports define mean operations/s as `verified operations / Hyperfine mean elapsed seconds`; the conservative range is `operations / max elapsed` through `operations / min elapsed`. Decimal MB/s uses 1,000,000 bytes and binary MiB/s uses 1,048,576 bytes. Auxiliary rates are `fds/s` for frame, `fixture-bytes/s` for POD (the encoded fixture size divided by elapsed time, not additional processed bytes), and `generations/s` for memory. POD `decode-only` isolates parser work more closely; `encode-decode` includes Builder allocation/encoding. Frame results include socket and descriptor creation plus nonblocking progress. Memory results include sealed memfd creation, import, mmap, touching every byte, retirement, generation checks, unmap, and an FD baseline check.
 
-Compare only commands with equivalent operation/byte counts in their JSON summary. Pin CPU affinity (`taskset`), use a fixed performance governor, stop noisy services, avoid thermal throttling, and increase `WARMUP`/`RUNS` for publishable numbers. Record kernel, CPU, compiler, commit, and command matrix with exported results.
+The report includes the exact command, sorted Hyperfine parameter map, sample count, checksum, resolved counts, timings, rates, and explicit units. Compare only commands with equivalent operation/byte counts. Operations mean different things for frames, POD iterations, and memory mappings, so cross-workload rates are not directly comparable. Pin CPU affinity (`taskset`), use a fixed performance governor, stop noisy services, avoid thermal throttling, and increase `WARMUP`/`RUNS` for publishable numbers. Record kernel, CPU, compiler, commit, and command matrix with exported results.
 
 ## Resource cautions
 
