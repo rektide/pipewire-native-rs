@@ -11,7 +11,7 @@ use pipewire_native_spa::pod::parser::Parser;
 use pipewire_native_spa::pod::types::{
     Choice, Fd, Fraction, Id, ObjectType, Pointer, PropertyFlags, Rectangle, Type,
 };
-use pipewire_native_spa::pod::Pod;
+use pipewire_native_spa::pod::{Pod, RawPod};
 
 use libspa::pod as spa_pod;
 use libspa::sys::{self as spa_sys};
@@ -203,6 +203,98 @@ fn test_pod_decode() {
         default: Id(2u32),
         alternatives: [Id(1), Id(2), Id(3), Id(4)].to_vec(),
     });
+}
+
+fn pod_header(size: u32, type_: Type) -> Vec<u8> {
+    let mut data = vec![0; 8];
+    data[0..4].copy_from_slice(&size.to_ne_bytes());
+    data[4..8].copy_from_slice(&(type_ as u32).to_ne_bytes());
+    data
+}
+
+#[test]
+fn malformed_pods_return_errors_instead_of_panicking() {
+    let primitive_without_body = pod_header(4, Type::Int);
+    assert!(i32::decode(&primitive_without_body).is_err());
+
+    for len in 0..8 {
+        assert!(String::decode(&vec![0; len]).is_err());
+        assert!(Vec::<u8>::decode(&vec![0; len]).is_err());
+    }
+
+    assert!(String::decode(&pod_header(0, Type::String)).is_err());
+
+    let mut short_array = pod_header(4, Type::Array);
+    short_array.resize(16, 0);
+    assert!(Vec::<i32>::decode(&short_array).is_err());
+
+    let mut zero_child_array = pod_header(8, Type::Array);
+    zero_child_array.extend_from_slice(&0u32.to_ne_bytes());
+    zero_child_array.extend_from_slice(&(Type::Int as u32).to_ne_bytes());
+    assert!(Vec::<i32>::decode(&zero_child_array).is_err());
+    assert!(Parser::new(&zero_child_array)
+        .pop_array_raw(|_, _| Ok(()))
+        .is_err());
+
+    let mut zero_child_choice = pod_header(16, Type::Choice);
+    zero_child_choice.extend_from_slice(&3u32.to_ne_bytes());
+    zero_child_choice.extend_from_slice(&0u32.to_ne_bytes());
+    zero_child_choice.extend_from_slice(&0u32.to_ne_bytes());
+    zero_child_choice.extend_from_slice(&(Type::Int as u32).to_ne_bytes());
+    assert!(Choice::<i32>::decode(&zero_child_choice).is_err());
+    assert!(Parser::new(&zero_child_choice)
+        .pop_choice_raw(|_, _| Ok(()))
+        .is_err());
+
+    let mut short_object = pod_header(4, Type::Object);
+    short_object.resize(16, 0);
+    assert!(Parser::new(&short_object)
+        .pop_object::<PropInfo, ParamType, _>(|_, _| Ok(()))
+        .is_err());
+    assert!(Parser::new(&short_object)
+        .pop_object_raw::<ParamType, _>(|_, _, _| Ok(()))
+        .is_err());
+}
+
+#[test]
+fn raw_container_parsers_advance_to_the_next_pod() {
+    let mut buf = [0u8; 128];
+    let data = Builder::new(&mut buf)
+        .push_array(&[1i32, 2])
+        .push_choice(Choice::None(3i32))
+        .push_int(4)
+        .build()
+        .unwrap();
+    let mut parser = Parser::new(data);
+
+    let mut array_values = Vec::new();
+    parser
+        .pop_array_raw(|type_, body| {
+            assert_eq!(type_, Type::Int);
+            array_values.push(i32::from_ne_bytes(body.try_into().unwrap()));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(array_values, [1, 2]);
+
+    parser
+        .pop_choice_raw(|type_, choice| {
+            assert_eq!(type_, Type::Int);
+            let Choice::None(body) = choice else {
+                panic!("expected a none choice");
+            };
+            assert_eq!(i32::from_ne_bytes(body.try_into().unwrap()), 3);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(parser.pop_int().unwrap(), 4);
+}
+
+#[test]
+fn raw_pod_requires_declared_padding() {
+    let mut data = pod_header(1, Type::Bytes);
+    data.push(7);
+    assert!(RawPod::wrap(&data).is_err());
 }
 
 #[test]

@@ -18,13 +18,20 @@ impl<'a> Parser<'a> {
     }
 
     pub fn available(&self) -> usize {
-        self.data.len() - self.pos
+        self.data.len().saturating_sub(self.pos)
     }
 
     pub fn pop_pod<U: Pod>(&mut self) -> Result<<U as Pod>::DecodesTo, Error> {
         let (res, size) = U::decode(&self.data[self.pos..])?;
-
-        self.pos += size;
+        if size > self.available() {
+            return Err(Error::Invalid(
+                "Decoded pod exceeds available data".to_string(),
+            ));
+        }
+        self.pos = self
+            .pos
+            .checked_add(size)
+            .ok_or_else(|| Error::Invalid("Parser position overflow".to_string()))?;
 
         Ok(res)
     }
@@ -101,7 +108,12 @@ impl<'a> Parser<'a> {
 
         let size =
             u32::from_ne_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap()) as usize;
-        let total_size = 8 + size + super::pad_8(size);
+        if size < 8 {
+            return Err(Error::Invalid(
+                "Array body is smaller than its header".to_string(),
+            ));
+        }
+        let total_size = super::pod_total_size(size)?;
 
         if self.available() < total_size {
             return Err(Error::Invalid("Not enough data for struct".to_string()));
@@ -114,6 +126,9 @@ impl<'a> Parser<'a> {
 
         let child_size =
             u32::from_ne_bytes(self.data[self.pos + 8..self.pos + 12].try_into().unwrap()) as usize;
+        if child_size == 0 {
+            return Err(Error::Invalid("Array child size is zero".to_string()));
+        }
         let child_type =
             match u32::from_ne_bytes(self.data[self.pos + 12..self.pos + 16].try_into().unwrap())
                 .try_into()
@@ -122,11 +137,15 @@ impl<'a> Parser<'a> {
                 Err(_) => return Err(Error::Invalid("Could noy parse child_type".to_string())),
             };
 
-        let mut pos = self.pos + 16;
+        let elements_size = size - 8;
+        if !elements_size.is_multiple_of(child_size) {
+            return Err(Error::Invalid("Array body has a partial child".to_string()));
+        }
 
-        while pos + child_size < total_size {
-            parse_item(child_type, &self.data[pos..pos + child_size])?;
-            pos += child_size;
+        let body_start = self.pos + 16;
+        let body_end = body_start + elements_size;
+        for body in self.data[body_start..body_end].chunks_exact(child_size) {
+            parse_item(child_type, body)?;
         }
 
         self.pos += total_size;
@@ -152,9 +171,14 @@ impl<'a> Parser<'a> {
         }
 
         let size = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
-        let padding = super::pad_8(size);
+        if size < 16 {
+            return Err(Error::Invalid(
+                "Choice body is smaller than its header".to_string(),
+            ));
+        }
+        let total_size = super::pod_total_size(size)?;
 
-        if data.len() < 8 + size + padding {
+        if data.len() < total_size {
             return Err(Error::Invalid("Not enough data for choice".to_string()));
         }
 
@@ -168,41 +192,56 @@ impl<'a> Parser<'a> {
         let choice_type = u32::from_ne_bytes(data[8..12].try_into().unwrap());
         // flags is unused, so we don't decode it at [12..16]
         let child_size = u32::from_ne_bytes(data[16..20].try_into().unwrap()) as usize;
+        if child_size == 0 {
+            return Err(Error::Invalid("Choice child size is zero".to_string()));
+        }
         let child_type = u32::from_ne_bytes(data[20..24].try_into().unwrap())
             .try_into()
             .map_err(|_| Error::Invalid("Invalid child type in choice".to_string()))?;
 
-        let child_1 = 24..24 + child_size;
-        let child_2 = 24 + child_size..24 + child_size * 2;
-        let child_3 = 24 + child_size * 2..24 + child_size * 3;
-        let child_4 = 24 + child_size * 3..24 + child_size * 4;
+        let children_size = size - 16;
+        if !children_size.is_multiple_of(child_size) {
+            return Err(Error::Invalid(
+                "Choice body has a partial child".to_string(),
+            ));
+        }
+        let child_count = children_size / child_size;
+        let child = |index: usize| {
+            let start = 24 + index * child_size;
+            &data[start..start + child_size]
+        };
 
         let choice = match choice_type {
-            0 => Choice::None(&data[child_1]),
+            0 => {
+                if child_count != 1 {
+                    return Err(Error::Invalid("Invalid none choice size".to_string()));
+                }
+                Choice::None(child(0))
+            }
             1 => {
-                if size != 16 + child_size * 3 {
+                if child_count != 3 {
                     return Err(Error::Invalid(
                         "Not enough data for choice range".to_string(),
                     ));
                 }
 
-                let default = &data[child_1];
-                let min = &data[child_2];
-                let max = &data[child_3];
+                let default = child(0);
+                let min = child(1);
+                let max = child(2);
 
                 Choice::Range { default, min, max }
             }
             2 => {
-                if size != 16 + child_size * 4 {
+                if child_count != 4 {
                     return Err(Error::Invalid(
                         "Not enough data for choice step".to_string(),
                     ));
                 }
 
-                let default = &data[child_1];
-                let min = &data[child_2];
-                let max = &data[child_3];
-                let step = &data[child_4];
+                let default = child(0);
+                let min = child(1);
+                let max = child(2);
+                let step = child(3);
 
                 Choice::Step {
                     default,
@@ -212,11 +251,14 @@ impl<'a> Parser<'a> {
                 }
             }
             3 => {
-                let default = &data[child_1];
+                if child_count == 0 {
+                    return Err(Error::Invalid("Enum choice has no default".to_string()));
+                }
+                let default = child(0);
                 let mut alternatives = Vec::new();
 
-                for i in 1..(size - 16) / child_size {
-                    alternatives.push(&data[24 + child_size * i..24 + child_size * (i + 1)]);
+                for i in 1..child_count {
+                    alternatives.push(child(i));
                 }
 
                 Choice::Enum {
@@ -225,14 +267,14 @@ impl<'a> Parser<'a> {
                 }
             }
             4 => {
-                if size != 16 + child_size * 2 {
+                if child_count != 2 {
                     return Err(Error::Invalid(
                         "Not enough data for choice flags".to_string(),
                     ));
                 }
 
-                let default = &data[child_1];
-                let flags = &data[child_2];
+                let default = child(0);
+                let flags = child(1);
 
                 Choice::Flags { default, flags }
             }
@@ -240,8 +282,9 @@ impl<'a> Parser<'a> {
         };
 
         parse_choice(child_type, choice)?;
+        self.pos += total_size;
 
-        Ok(8 + size + padding)
+        Ok(total_size)
     }
 
     pub fn pop_struct<F, T>(&mut self, parse_struct: F) -> Result<(T, usize), Error>
@@ -254,7 +297,8 @@ impl<'a> Parser<'a> {
 
         let size =
             u32::from_ne_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap()) as usize;
-        if self.available() < 8 + size {
+        let total_size = super::pod_total_size(size)?;
+        if self.available() < total_size {
             return Err(Error::Invalid("Not enough data for struct".to_string()));
         }
 
@@ -267,9 +311,9 @@ impl<'a> Parser<'a> {
         let ret = parse_struct(&mut struct_parser)?;
 
         // The caller may or may not iterate over all fields, don't depend on that
-        self.pos += size + 8;
+        self.pos += total_size;
 
-        Ok((ret, size + 8))
+        Ok((ret, total_size))
     }
 
     pub fn pop_object<K, I, T>(
@@ -286,7 +330,13 @@ impl<'a> Parser<'a> {
 
         let size =
             u32::from_ne_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap()) as usize;
-        if self.available() < 8 + size {
+        if size < 8 {
+            return Err(Error::Invalid(
+                "Object body is smaller than its header".to_string(),
+            ));
+        }
+        let total_size = super::pod_total_size(size)?;
+        if self.available() < total_size {
             return Err(Error::Invalid("Not enough data for object".to_string()));
         }
 
@@ -327,9 +377,9 @@ impl<'a> Parser<'a> {
         };
 
         // The caller may or may not iterate over all properties, don't depend on that
-        self.pos += size - 8;
+        self.pos += size - 8 + super::pad_8(size);
 
-        Ok((ret, size + 8))
+        Ok((ret, total_size))
     }
 
     pub fn pop_object_raw<I, T>(
@@ -345,7 +395,13 @@ impl<'a> Parser<'a> {
 
         let size =
             u32::from_ne_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap()) as usize;
-        if self.available() < 8 + size {
+        if size < 8 {
+            return Err(Error::Invalid(
+                "Object body is smaller than its header".to_string(),
+            ));
+        }
+        let total_size = super::pod_total_size(size)?;
+        if self.available() < total_size {
             return Err(Error::Invalid("Not enough data for object".to_string()));
         }
 
@@ -380,9 +436,9 @@ impl<'a> Parser<'a> {
         };
 
         // The caller may or may not iterate over all properties, don't depend on that
-        self.pos += size - 8;
+        self.pos += size - 8 + super::pad_8(size);
 
-        Ok((ret, size + 8))
+        Ok((ret, total_size))
     }
 
     pub fn pop_raw_pod(&mut self) -> Result<RawPod<'a>, Error> {
@@ -410,7 +466,7 @@ impl<'a, K> ObjectParser<'a, K> {
     }
 
     pub fn available(&self) -> usize {
-        self.data.len() - self.pos
+        self.data.len().saturating_sub(self.pos)
     }
 
     pub fn pop_property(&mut self) -> Result<Option<(K, PropertyFlags, RawPod<'a>)>, Error>
@@ -474,7 +530,7 @@ impl<'a> ObjectParserRaw<'a> {
     }
 
     pub fn available(&self) -> usize {
-        self.data.len() - self.pos
+        self.data.len().saturating_sub(self.pos)
     }
 
     pub fn pop_property(&mut self) -> Result<Option<(u32, PropertyFlags, RawPod<'a>)>, Error> {

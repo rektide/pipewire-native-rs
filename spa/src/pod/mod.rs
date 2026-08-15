@@ -50,6 +50,13 @@ fn pad_8(size: usize) -> usize {
     }
 }
 
+fn pod_total_size(body_size: usize) -> Result<usize, Error> {
+    8usize
+        .checked_add(body_size)
+        .and_then(|size| size.checked_add(pad_8(body_size)))
+        .ok_or_else(|| Error::Invalid("Pod size overflow".to_string()))
+}
+
 #[derive(Clone)]
 pub struct RawPod<'a> {
     size: usize,
@@ -71,7 +78,7 @@ impl<'a> RawPod<'a> {
         }
 
         let internal_size = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
-        let size = 8 + internal_size + pad_8(internal_size);
+        let size = pod_total_size(internal_size)?;
 
         if size > data.len() {
             return Err(Error::NoSpace);
@@ -114,7 +121,7 @@ impl RawPodOwned {
         }
 
         let internal_size = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
-        let size = 8 + internal_size + pad_8(internal_size);
+        let size = pod_total_size(internal_size)?;
 
         if size > data.len() {
             return Err(Error::NoSpace);
@@ -245,9 +252,13 @@ where
             )));
         }
 
-        let val = Self::decode_body(&data[8..])?;
-        let padding = pad_8(size);
-        Ok((val, 8 + size + padding))
+        let total_size = pod_total_size(size)?;
+        if data.len() < total_size {
+            return Err(Error::Invalid("Not enough data for primitive".to_string()));
+        }
+
+        let val = Self::decode_body(&data[8..8 + size])?;
+        Ok((val, total_size))
     }
 }
 
@@ -485,10 +496,17 @@ impl Pod for &str {
     }
 
     fn decode(data: &[u8]) -> Result<(String, usize), Error> {
-        let len = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
-        let padding = pad_8(len);
+        if data.len() < 8 {
+            return Err(Error::Invalid("Not enough data for string".to_string()));
+        }
 
-        if data.len() < 8 + len {
+        let len = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
+        if len == 0 {
+            return Err(Error::Invalid("String has no null terminator".to_string()));
+        }
+        let total_size = pod_total_size(len)?;
+
+        if data.len() < total_size {
             return Err(Error::Invalid("Not enough data for string".to_string()));
         }
 
@@ -505,7 +523,7 @@ impl Pod for &str {
             return Err(Error::Invalid("Not enough data for string".to_string()));
         }
 
-        Ok((s, 8 + len + padding))
+        Ok((s, total_size))
     }
 }
 
@@ -543,10 +561,14 @@ impl Pod for &[u8] {
     }
 
     fn decode(data: &[u8]) -> Result<(Vec<u8>, usize), Error> {
-        let len = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
-        let padding = pad_8(len);
+        if data.len() < 8 {
+            return Err(Error::Invalid("Not enough data for byte array".to_string()));
+        }
 
-        if data.len() < 8 + len {
+        let len = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
+        let total_size = pod_total_size(len)?;
+
+        if data.len() < total_size {
             return Err(Error::Invalid("Not enough data for byte array".to_string()));
         }
 
@@ -557,7 +579,7 @@ impl Pod for &[u8] {
             )));
         }
 
-        Ok((data[8..8 + len].to_vec(), 8 + len + padding))
+        Ok((data[8..8 + len].to_vec(), total_size))
     }
 }
 
@@ -617,11 +639,16 @@ impl Pod for Pointer {
     }
 
     fn decode(data: &[u8]) -> Result<(Pointer, usize), Error> {
+        if data.len() < 8 {
+            return Err(Error::Invalid("Not enough data for pointer".to_string()));
+        }
+
         let size = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
         let ptr_size = std::mem::size_of::<*const c_void>();
-        let padding = 8 - ptr_size;
+        let expected_size = 8 + ptr_size;
+        let total_size = pod_total_size(size)?;
 
-        if data.len() < 24 {
+        if size != expected_size || data.len() < total_size {
             return Err(Error::Invalid("Not enough data for pointer".to_string()));
         }
 
@@ -642,7 +669,7 @@ impl Pod for Pointer {
             u32::from_ne_bytes(data[16..20].try_into().unwrap()) as *const c_void
         };
 
-        Ok((Pointer { type_, ptr }, 8 + size + padding))
+        Ok((Pointer { type_, ptr }, total_size))
     }
 }
 
@@ -699,9 +726,14 @@ where
         }
 
         let size = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
-        let padding = pad_8(size);
+        if size < 8 {
+            return Err(Error::Invalid(
+                "Array body is smaller than its header".to_string(),
+            ));
+        }
+        let total_size = pod_total_size(size)?;
 
-        if data.len() < 8 + size + padding {
+        if data.len() < total_size {
             return Err(Error::Invalid("Not enough data for array".to_string()));
         }
 
@@ -713,17 +745,25 @@ where
         }
 
         let child_size = u32::from_ne_bytes(data[8..12].try_into().unwrap()) as usize;
+        if child_size == 0 || child_size != T::pod_size() {
+            return Err(Error::Invalid("Invalid array child size".to_string()));
+        }
         let type_ = u32::from_ne_bytes(data[12..16].try_into().unwrap()).try_into();
         if Ok(T::pod_type()) != type_ {
             return Err(Error::Invalid(format!("Invalid array type {type_:?}")));
         }
 
-        for i in 0..(size - 8) / child_size {
-            let val = T::decode_body(&data[16 + i * child_size..])?;
+        let elements_size = size - 8;
+        if !elements_size.is_multiple_of(child_size) {
+            return Err(Error::Invalid("Array body has a partial child".to_string()));
+        }
+
+        for body in data[16..16 + elements_size].chunks_exact(child_size) {
+            let val = T::decode_body(body)?;
             res.push(val);
         }
 
-        Ok((res, 8 + size + padding))
+        Ok((res, total_size))
     }
 }
 
@@ -849,9 +889,14 @@ where
         }
 
         let size = u32::from_ne_bytes(data[0..4].try_into().unwrap()) as usize;
-        let padding = pad_8(size);
+        if size < 16 {
+            return Err(Error::Invalid(
+                "Choice body is smaller than its header".to_string(),
+            ));
+        }
+        let total_size = pod_total_size(size)?;
 
-        if data.len() < 8 + size + padding {
+        if data.len() < total_size {
             return Err(Error::Invalid("Not enough data for choice".to_string()));
         }
 
@@ -865,7 +910,7 @@ where
         let choice_type = u32::from_ne_bytes(data[8..12].try_into().unwrap());
         // flags is unused, so we don't decode it at [12..16]
         let child_size = u32::from_ne_bytes(data[16..20].try_into().unwrap()) as usize;
-        if child_size != T::pod_size() {
+        if child_size == 0 || child_size != T::pod_size() {
             return Err(Error::Invalid("Not enough data for choice".to_string()));
         }
         let child_type = u32::from_ne_bytes(data[20..24].try_into().unwrap());
@@ -873,35 +918,50 @@ where
             return Err(Error::Invalid(format!("Invalid child type {child_type}")));
         }
 
+        let children_size = size - 16;
+        if !children_size.is_multiple_of(child_size) {
+            return Err(Error::Invalid(
+                "Choice body has a partial child".to_string(),
+            ));
+        }
+        let child_count = children_size / child_size;
+        let child = |index: usize| {
+            let start = 24 + index * child_size;
+            &data[start..start + child_size]
+        };
+
         let choice = match choice_type {
             0 => {
-                let value = T::decode_body(&data[24..])?;
+                if child_count != 1 {
+                    return Err(Error::Invalid("Invalid none choice size".to_string()));
+                }
+                let value = T::decode_body(child(0))?;
                 Choice::None(value)
             }
             1 => {
-                if size != 16 + child_size * 3 {
+                if child_count != 3 {
                     return Err(Error::Invalid(
                         "Not enough data for choice range".to_string(),
                     ));
                 }
 
-                let default = T::decode_body(&data[24..])?;
-                let min = T::decode_body(&data[24 + child_size..])?;
-                let max = T::decode_body(&data[24 + child_size * 2..])?;
+                let default = T::decode_body(child(0))?;
+                let min = T::decode_body(child(1))?;
+                let max = T::decode_body(child(2))?;
 
                 Choice::Range { default, min, max }
             }
             2 => {
-                if size != 16 + child_size * 4 {
+                if child_count != 4 {
                     return Err(Error::Invalid(
                         "Not enough data for choice step".to_string(),
                     ));
                 }
 
-                let default = T::decode_body(&data[24..])?;
-                let min = T::decode_body(&data[24 + child_size..])?;
-                let max = T::decode_body(&data[24 + child_size * 2..])?;
-                let step = T::decode_body(&data[24 + child_size * 3..])?;
+                let default = T::decode_body(child(0))?;
+                let min = T::decode_body(child(1))?;
+                let max = T::decode_body(child(2))?;
+                let step = T::decode_body(child(3))?;
 
                 Choice::Step {
                     default,
@@ -911,11 +971,14 @@ where
                 }
             }
             3 => {
-                let default = T::decode_body(&data[24..])?;
+                if child_count == 0 {
+                    return Err(Error::Invalid("Enum choice has no default".to_string()));
+                }
+                let default = T::decode_body(child(0))?;
                 let mut alternatives = Vec::new();
 
-                for i in 1..(size - 16) / child_size {
-                    alternatives.push(T::decode_body(&data[24 + child_size * i..])?);
+                for i in 1..child_count {
+                    alternatives.push(T::decode_body(child(i))?);
                 }
 
                 Choice::Enum {
@@ -924,21 +987,21 @@ where
                 }
             }
             4 => {
-                if size != 16 + child_size * 2 {
+                if child_count != 2 {
                     return Err(Error::Invalid(
                         "Not enough data for choice flags".to_string(),
                     ));
                 }
 
-                let default = T::decode_body(&data[24..])?;
-                let flags = T::decode_body(&data[24 + child_size..])?;
+                let default = T::decode_body(child(0))?;
+                let flags = T::decode_body(child(1))?;
 
                 Choice::Flags { default, flags }
             }
             t => return Err(Error::Invalid(format!("Invalid choice type {t}"))),
         };
 
-        Ok((choice, 8 + size + padding))
+        Ok((choice, total_size))
     }
 }
 
