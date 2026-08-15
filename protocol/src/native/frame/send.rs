@@ -99,6 +99,20 @@ impl FrameSender {
         if self.failed {
             return Err(FrameError::Poisoned);
         }
+        let payload = frame.header.payload_len as usize;
+        let payload_limit = self.limits.max_payload.min(WIRE_MAX_PAYLOAD);
+        if payload > payload_limit {
+            return Err(FrameError::PayloadTooLarge {
+                declared: payload,
+                limit: payload_limit,
+            });
+        }
+        if frame.fds.len() > self.limits.max_frame_fds {
+            return Err(FrameError::TooManyFrameFds {
+                declared: frame.fds.len(),
+                limit: self.limits.max_frame_fds,
+            });
+        }
         if self.queued_bytes.saturating_add(frame.bytes.len()) > self.limits.max_queued_bytes {
             return Err(FrameError::SendQueueFull {
                 queued: self.queued_bytes,

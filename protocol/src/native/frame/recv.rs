@@ -303,20 +303,26 @@ fn parse_control(control: &[u8], flags: libc::c_int) -> Result<Vec<OwnedFd>, Fra
             std::ptr::read_unaligned(control.as_ptr().add(offset).cast::<libc::cmsghdr>())
         };
         let length = header.cmsg_len;
-        if length < data_offset || length > visible - offset {
-            return Err(FrameError::MalformedControl);
-        }
         if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
-            let data_len = length - data_offset;
-            if data_len % size_of::<RawFd>() != 0 {
-                return Err(FrameError::MalformedControl);
-            }
+            // recvmsg installs every returned SCM_RIGHTS integer in this process. Adopt every
+            // complete slot that both cmsg_len and msg_controllen make addressable before a
+            // later metadata error can return. Bytes beyond either bound cannot safely be
+            // treated as descriptors: they may belong to another control record.
+            let data_start = offset.checked_add(data_offset);
+            let declared_end = offset.checked_add(length);
+            let data_end = declared_end.unwrap_or(visible).min(visible);
+            let data_len = data_start
+                .filter(|start| *start <= data_end)
+                .map_or(0, |start| data_end - start);
             for index in 0..data_len / size_of::<RawFd>() {
                 let fd = unsafe {
                     std::ptr::read_unaligned(
                         control
                             .as_ptr()
-                            .add(offset + data_offset + index * size_of::<RawFd>())
+                            .add(
+                                data_start.expect("positive data length")
+                                    + index * size_of::<RawFd>(),
+                            )
                             .cast::<RawFd>(),
                     )
                 };
@@ -325,6 +331,12 @@ fn parse_control(control: &[u8], flags: libc::c_int) -> Result<Vec<OwnedFd>, Fra
                 }
                 owned.push(unsafe { OwnedFd::from_raw_fd(fd) });
             }
+            if data_len % size_of::<RawFd>() != 0 {
+                return Err(FrameError::MalformedControl);
+            }
+        }
+        if length < data_offset || length > visible - offset {
+            return Err(FrameError::MalformedControl);
         }
         let Some(next) = cmsg_align(length).and_then(|length| offset.checked_add(length)) else {
             return Err(FrameError::MalformedControl);
@@ -345,6 +357,7 @@ use std::os::fd::AsRawFd;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::IntoRawFd;
 
     fn control(cmsg_len: usize, level: libc::c_int, kind: libc::c_int, data: &[u8]) -> Vec<u8> {
         let header_len = size_of::<libc::cmsghdr>();
@@ -361,6 +374,45 @@ mod tests {
         }
         bytes[header_len..].copy_from_slice(data);
         bytes
+    }
+
+    fn assert_writer_closed(read: &OwnedFd) {
+        let descriptor_flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(descriptor_flags, -1);
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    read.as_raw_fd(),
+                    libc::F_SETFL,
+                    descriptor_flags | libc::O_NONBLOCK,
+                )
+            },
+            0
+        );
+        let mut byte = [0];
+        assert_eq!(
+            unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) },
+            0,
+            "the visible received descriptor must be closed on parse failure"
+        );
+    }
+
+    fn assert_closed_after_parse_error(cmsg_len: usize, trailing: &[u8], flags: libc::c_int) {
+        let (read, write) = pipe();
+        let mut data = write.into_raw_fd().to_ne_bytes().to_vec();
+        data.extend_from_slice(trailing);
+        assert!(parse_control(
+            &control(cmsg_len, libc::SOL_SOCKET, libc::SCM_RIGHTS, &data),
+            flags,
+        )
+        .is_err());
+        assert_writer_closed(&read);
+    }
+
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
     }
 
     #[test]
@@ -402,5 +454,36 @@ mod tests {
         assert!(parse_control(&control(header_len, 123, 456, &[]), 0)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn malformed_rights_lengths_close_every_complete_declared_visible_fd() {
+        let data_offset = cmsg_align(size_of::<libc::cmsghdr>()).unwrap();
+        let fd_len = size_of::<RawFd>();
+
+        assert_closed_after_parse_error(data_offset + fd_len + 1, &[0], 0);
+        assert_closed_after_parse_error(data_offset + fd_len + 8, &[], 0);
+
+        let (read, write) = pipe();
+        let first_len = data_offset + fd_len;
+        let mut records = control(
+            first_len,
+            libc::SOL_SOCKET,
+            libc::SCM_RIGHTS,
+            &write.into_raw_fd().to_ne_bytes(),
+        );
+        records.resize(cmsg_align(first_len).unwrap(), 0);
+        records.extend(control(data_offset - 1, 0, 0, &[]));
+        assert!(matches!(
+            parse_control(&records, 0),
+            Err(FrameError::MalformedControl)
+        ));
+        assert_writer_closed(&read);
+    }
+
+    #[test]
+    fn truncated_control_closes_every_visible_fd_before_rejection() {
+        let data_offset = cmsg_align(size_of::<libc::cmsghdr>()).unwrap();
+        assert_closed_after_parse_error(data_offset + size_of::<RawFd>(), &[], libc::MSG_CTRUNC);
     }
 }

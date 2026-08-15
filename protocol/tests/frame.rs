@@ -312,7 +312,7 @@ fn extra_fds_at_eof_and_truncated_control_are_terminal_and_cleaned() {
     );
 
     let (tx, rx) = UnixStream::pair().unwrap();
-    let (_read, write) = pipe();
+    let (read, write) = pipe();
     let mut sender = FrameSender::new(limits);
     sender
         .enqueue(OutboundFrame::new(1, 1, 1, vec![], vec![write], limits).unwrap())
@@ -326,6 +326,14 @@ fn extra_fds_at_eof_and_truncated_control_are_terminal_and_cleaned() {
         receiver.receive(rx.as_fd()),
         Err(FrameError::TruncatedControl)
     ));
+    let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
+    unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    let mut byte = [0];
+    assert_eq!(
+        unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) },
+        0,
+        "Linux closes SCM_RIGHTS descriptors discarded by control truncation"
+    );
 }
 
 #[test]
@@ -391,6 +399,48 @@ fn queue_limits_reject_atomically_and_sender_remains_usable() {
     assert!(sender.is_empty());
     let accepted = OutboundFrame::new(1, 1, 1, b"a".to_vec(), vec![], limits).unwrap();
     sender.enqueue(accepted).unwrap();
+}
+
+#[test]
+fn sender_enforces_its_frame_limits_when_construction_limits_differ() {
+    let construction_limits = FrameLimits {
+        max_payload: 16,
+        max_frame_fds: 2,
+        ..FrameLimits::default()
+    };
+    let sender_limits = FrameLimits {
+        max_payload: 1,
+        max_frame_fds: 1,
+        ..FrameLimits::default()
+    };
+    let mut sender = FrameSender::new(sender_limits);
+
+    let payload = OutboundFrame::new(1, 1, 1, b"ab".to_vec(), vec![], construction_limits).unwrap();
+    assert!(matches!(
+        sender.enqueue(payload),
+        Err(FrameError::PayloadTooLarge {
+            declared: 2,
+            limit: 1
+        })
+    ));
+    assert!(sender.is_empty());
+
+    let (_read1, write1) = pipe();
+    let (_read2, write2) = pipe();
+    let fds =
+        OutboundFrame::new(1, 1, 1, vec![], vec![write1, write2], construction_limits).unwrap();
+    assert!(matches!(
+        sender.enqueue(fds),
+        Err(FrameError::TooManyFrameFds {
+            declared: 2,
+            limit: 1
+        })
+    ));
+    assert!(sender.is_empty());
+
+    sender
+        .enqueue(OutboundFrame::new(1, 1, 1, b"a".to_vec(), vec![], construction_limits).unwrap())
+        .unwrap();
 }
 
 #[test]
