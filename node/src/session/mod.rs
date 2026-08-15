@@ -7,5 +7,7 @@
 pub mod activation;
 /// Cycle-scoped output buffer selection and publication.
 pub mod cycle;
+/// Connection-scoped imported-memory ownership and generational mapping.
+pub mod memory;
 /// SPA port IO, chunk, and media-plane views.
 pub mod port;
