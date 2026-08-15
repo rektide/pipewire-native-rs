@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Asymptotic Inc.
 
 use std::{
+    io::Write,
+    os::fd::AsFd,
     os::unix::net::UnixStream,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -270,6 +273,95 @@ fn send_client_method(
     };
 
     protocol::write_packet(stream, &packet).unwrap();
+}
+
+#[test]
+fn scripted_peer_receives_every_frame_byte_split() {
+    let deadline = testkit::TestDeadline::after(Duration::from_secs(3));
+    let socket_path = testkit::unique_socket_path("pipewire-native-server-frame-splits");
+    let payload = encode_core_hello_payload(3).unwrap();
+    let frame_len = protocol::HEADER_LEN + payload.len();
+    let scenario = Scenario::builder()
+        .steps(
+            (1..frame_len)
+                .map(|split| {
+                    ScriptStep::builder()
+                        .name(format!("frame-split-{split}"))
+                        .expect(Expectation::CoreHello)
+                        .actions(vec![])
+                        .build()
+                })
+                .collect(),
+        )
+        .name("frame-byte-splits".to_string())
+        .build();
+    let server = ScriptedServer::builder()
+        .config(
+            ServerConfig::builder()
+                .socket_path(socket_path.clone())
+                .deadline(Duration::from_secs(2))
+                .build(),
+        )
+        .scenario(scenario)
+        .build();
+    let handle = testkit::spawn(server);
+    let mut stream = deadline.connect(&socket_path).unwrap();
+
+    for split in 1..frame_len {
+        let header = NativeHeader {
+            object_id: protocol::CORE_ID,
+            opcode: protocol::core_method::HELLO,
+            payload_size: payload.len() as u32,
+            seq: split as u32,
+            n_fds: 0,
+        };
+        let mut wire = header.encode().unwrap().to_vec();
+        wire.extend_from_slice(&payload);
+        stream.write_all(&wire[..split]).unwrap();
+        thread::sleep(Duration::from_millis(1));
+        stream.write_all(&wire[split..]).unwrap();
+    }
+
+    let report = handle.wait(deadline).unwrap();
+    assert_eq!(report.completed_steps, frame_len - 1);
+}
+
+#[test]
+fn scripted_peer_rejects_unexpected_inbound_fds() {
+    let deadline = testkit::TestDeadline::after(Duration::from_secs(2));
+    let socket_path = testkit::unique_socket_path("pipewire-native-server-unexpected-fd");
+    let scenario = Scenario::builder()
+        .steps(vec![ScriptStep::builder()
+            .expect(Expectation::CoreHello)
+            .actions(vec![])
+            .build()])
+        .build();
+    let server = ScriptedServer::builder()
+        .config(
+            ServerConfig::builder()
+                .socket_path(socket_path.clone())
+                .build(),
+        )
+        .scenario(scenario)
+        .build();
+    let handle = testkit::spawn(server);
+    let mut stream = deadline.connect(&socket_path).unwrap();
+    let packet = NativePacket {
+        header: NativeHeader {
+            object_id: protocol::CORE_ID,
+            opcode: protocol::core_method::HELLO,
+            payload_size: 0,
+            seq: 0,
+            n_fds: 1,
+        },
+        payload: encode_core_hello_payload(3).unwrap(),
+    };
+    let fd = tempfile::tempfile().unwrap();
+
+    protocol::write_packet_with_fds(&mut stream, &packet, &[fd.as_fd()]).unwrap();
+    let err = handle.wait(deadline).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("expected no inbound fds"), "{err}");
 }
 
 #[test]

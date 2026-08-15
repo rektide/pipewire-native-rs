@@ -9,6 +9,7 @@ edition.workspace = true
 [dependencies]
 bon = "3.9.0"
 libc.workspace = true
+pipewire-native-protocol.workspace = true
 pipewire-native-spa.workspace = true
 tracing = "0.1.41"
 

@@ -13,14 +13,17 @@ use std::{
 };
 
 use bon::Builder;
+use pipewire_native_protocol::native::frame::{
+    FlushOutcome, FrameError, FrameLimits, FrameReceiver, FrameSender, OutboundFrame,
+    ReceiveOutcome,
+};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
     protocol::{
         self, core_event, decode_inbound_message, encode_core_add_mem_payload,
         encode_core_done_payload, encode_core_error_payload, encode_core_info_payload,
-        encode_registry_global_payload, encode_registry_global_remove_payload, NativeHeader,
-        NativePacket,
+        encode_registry_global_payload, encode_registry_global_remove_payload,
     },
     script::{Action, Scenario},
     state::{ExecutionState, SyncState},
@@ -108,11 +111,32 @@ impl ScriptedServer {
 
         let listener = UnixListener::bind(&config.socket_path)?;
         listener.set_nonblocking(true)?;
-        wait_until_readable(&listener, deadline)
-            .map_err(|err| runtime_wait_error(&config, &scenario, None, 0, "accept", err))?;
-        let (mut client, addr) = listener
-            .accept()
-            .map_err(|err| runtime_wait_error(&config, &scenario, None, 0, "accept", err))?;
+        let limits = FrameLimits::default();
+        let mut receiver = FrameReceiver::new(limits);
+        let mut sender = FrameSender::new(limits);
+        let mut last_frame_route = None;
+        wait_until_readable(&listener, deadline).map_err(|err| {
+            runtime_wait_error(
+                &config,
+                &scenario,
+                None,
+                0,
+                "accept",
+                TransportDiagnostics::new(&receiver, &sender, last_frame_route),
+                err,
+            )
+        })?;
+        let (client, addr) = listener.accept().map_err(|err| {
+            runtime_wait_error(
+                &config,
+                &scenario,
+                None,
+                0,
+                "accept",
+                TransportDiagnostics::new(&receiver, &sender, last_frame_route),
+                err,
+            )
+        })?;
 
         debug!(
             trace_name = config.trace_name(),
@@ -124,7 +148,6 @@ impl ScriptedServer {
             accepted_clients: 1,
             ..Default::default()
         };
-
         for (step_index, step) in scenario.steps.iter().enumerate() {
             if config.single_client_enabled() {
                 reject_pending_clients(&listener, &mut state)?;
@@ -138,46 +161,61 @@ impl ScriptedServer {
                     Some(step_index),
                     state.completed_steps,
                     "read",
+                    TransportDiagnostics::new(&receiver, &sender, last_frame_route),
                     io::Error::new(io::ErrorKind::TimedOut, "script deadline elapsed"),
                 ));
             }
-            client.set_read_timeout(Some(remaining))?;
-            client.set_write_timeout(Some(remaining))?;
-            let packet = protocol::read_packet(&mut client).map_err(|err| {
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) {
-                    runtime_wait_error(
-                        &config,
-                        &scenario,
-                        Some(step_index),
-                        state.completed_steps,
-                        "read",
-                        err,
-                    )
-                } else {
-                    err
+            let frame = loop {
+                match receiver.receive(client.as_fd()).map_err(frame_error)? {
+                    ReceiveOutcome::Frame(frame) => break frame,
+                    ReceiveOutcome::WouldBlock => {
+                        wait_until(client.as_fd(), libc::POLLIN, deadline).map_err(|err| {
+                            runtime_wait_error(
+                                &config,
+                                &scenario,
+                                Some(step_index),
+                                state.completed_steps,
+                                "read",
+                                TransportDiagnostics::new(&receiver, &sender, last_frame_route),
+                                err,
+                            )
+                        })?;
+                    }
+                    ReceiveOutcome::Closed => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "client closed while waiting for scripted inbound frame",
+                        ));
+                    }
                 }
-            })?;
-            let inbound = decode_inbound_message(
-                packet.header.object_id,
-                packet.header.opcode,
-                packet.payload.as_slice(),
-            )?;
+            };
+            let header = frame.header();
+            last_frame_route = Some((header.object_id, header.opcode, header.seq));
+            if !frame.fds().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "scenario step {step_index} expected no inbound fds but frame object:{} opcode:{} carried {}",
+                        header.object_id,
+                        header.opcode,
+                        frame.fds().len()
+                    ),
+                ));
+            }
+            let inbound = decode_inbound_message(header.object_id, header.opcode, frame.payload())?;
 
             trace!(
                 trace_name = config.trace_name(),
                 step_index,
-                object_id = packet.header.object_id,
-                opcode = packet.header.opcode,
+                object_id = header.object_id,
+                opcode = header.opcode,
                 inbound = ?inbound,
                 "received inbound message"
             );
 
             if !step
                 .expect
-                .matches(packet.header.object_id, packet.header.opcode, &inbound)
+                .matches(header.object_id, header.opcode, &inbound)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -185,17 +223,38 @@ impl ScriptedServer {
                         "scenario step {} expectation {:?} did not match inbound object:{} opcode:{} message:{:?}",
                         step_index,
                         step.expect,
-                        packet.header.object_id,
-                        packet.header.opcode,
+                        header.object_id,
+                        header.opcode,
                         inbound,
                     ),
                 ));
             }
 
             update_state_from_inbound(&mut state, &inbound);
+            if config.single_client_enabled() {
+                reject_pending_clients(&listener, &mut state)?;
+            }
 
             for action in &step.actions {
-                let keep_running = apply_action(&mut client, &mut state, action)?;
+                let keep_running = apply_action(&client, &mut sender, deadline, &mut state, action)
+                    .map_err(|err| {
+                        if matches!(
+                            err.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) {
+                            runtime_wait_error(
+                                &config,
+                                &scenario,
+                                Some(step_index),
+                                state.completed_steps,
+                                "write",
+                                TransportDiagnostics::new(&receiver, &sender, last_frame_route),
+                                err,
+                            )
+                        } else {
+                            err
+                        }
+                    })?;
                 if !keep_running {
                     return Ok(to_run_report(state));
                 }
@@ -209,6 +268,14 @@ impl ScriptedServer {
 }
 
 fn wait_until_readable(listener: &UnixListener, deadline: Instant) -> io::Result<()> {
+    wait_until(listener.as_fd(), libc::POLLIN, deadline)
+}
+
+fn wait_until(
+    fd: std::os::fd::BorrowedFd<'_>,
+    events: libc::c_short,
+    deadline: Instant,
+) -> io::Result<()> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -220,8 +287,8 @@ fn wait_until_readable(listener: &UnixListener, deadline: Instant) -> io::Result
 
         let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
         let mut poll_fd = libc::pollfd {
-            fd: listener.as_raw_fd(),
-            events: libc::POLLIN,
+            fd: fd.as_raw_fd(),
+            events,
             revents: 0,
         };
         let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms.max(1)) };
@@ -245,6 +312,7 @@ fn runtime_wait_error(
     step_index: Option<usize>,
     completed_steps: usize,
     phase: &str,
+    transport: TransportDiagnostics<'_>,
     source: io::Error,
 ) -> io::Error {
     let scenario_name = scenario.name.as_deref().unwrap_or("unnamed");
@@ -262,19 +330,46 @@ fn runtime_wait_error(
     io::Error::new(
         io::ErrorKind::TimedOut,
         format!(
-            "scripted server timed out: trace={} scenario={} phase={} step={} completed_steps={} buffered_frame_state=packet-reader-internal descriptor_count=packet-reader-internal: {}",
+            "scripted server timed out: trace={} scenario={} phase={} step={} completed_steps={} buffered_frame_state=shared-receiver descriptor_count=shared-receiver buffered_bytes={} pending_fds={} queued_bytes={} queued_fds={} last_frame_route={:?}: {}",
             config.trace_name(),
             scenario_name,
             phase,
             step,
             completed_steps,
+            transport.receiver.buffered_bytes(),
+            transport.receiver.pending_fds(),
+            transport.sender.queued_bytes(),
+            transport.sender.queued_fds(),
+            transport.last_frame_route,
             source
         ),
     )
 }
 
+struct TransportDiagnostics<'a> {
+    receiver: &'a FrameReceiver,
+    sender: &'a FrameSender,
+    last_frame_route: Option<(u32, u8, u32)>,
+}
+
+impl<'a> TransportDiagnostics<'a> {
+    fn new(
+        receiver: &'a FrameReceiver,
+        sender: &'a FrameSender,
+        last_frame_route: Option<(u32, u8, u32)>,
+    ) -> Self {
+        Self {
+            receiver,
+            sender,
+            last_frame_route,
+        }
+    }
+}
+
 fn apply_action(
-    client: &mut UnixStream,
+    client: &UnixStream,
+    sender: &mut FrameSender,
+    deadline: Instant,
     state: &mut ExecutionState,
     action: &Action,
 ) -> io::Result<bool> {
@@ -288,7 +383,14 @@ fn apply_action(
                 &info.name,
                 info.props.as_slice(),
             )?;
-            send_event(client, protocol::CORE_ID, core_event::INFO, payload)?;
+            send_event(
+                client,
+                sender,
+                deadline,
+                protocol::CORE_ID,
+                core_event::INFO,
+                payload,
+            )?;
             Ok(true)
         }
         Action::SendCoreDoneFromLastSync => {
@@ -300,17 +402,38 @@ fn apply_action(
             };
 
             let payload = encode_core_done_payload(sync.id, sync.seq)?;
-            send_event(client, protocol::CORE_ID, core_event::DONE, payload)?;
+            send_event(
+                client,
+                sender,
+                deadline,
+                protocol::CORE_ID,
+                core_event::DONE,
+                payload,
+            )?;
             Ok(true)
         }
         Action::SendCoreDone { id, seq } => {
             let payload = encode_core_done_payload(*id, *seq)?;
-            send_event(client, protocol::CORE_ID, core_event::DONE, payload)?;
+            send_event(
+                client,
+                sender,
+                deadline,
+                protocol::CORE_ID,
+                core_event::DONE,
+                payload,
+            )?;
             Ok(true)
         }
         Action::SendCoreError(err) => {
             let payload = encode_core_error_payload(err.id, err.seq, err.res, &err.message)?;
-            send_event(client, protocol::CORE_ID, core_event::ERROR, payload)?;
+            send_event(
+                client,
+                sender,
+                deadline,
+                protocol::CORE_ID,
+                core_event::ERROR,
+                payload,
+            )?;
             Ok(true)
         }
         Action::SendCoreAddMem(mem) => {
@@ -318,10 +441,12 @@ fn apply_action(
             let fd = create_memfd_for_add_mem(mem.id, mem.size)?;
             send_event_with_fds(
                 client,
+                sender,
+                deadline,
                 protocol::CORE_ID,
                 core_event::ADD_MEM,
                 payload,
-                &[fd.as_fd()],
+                vec![fd],
             )?;
             state.exported_mem_ids.push(mem.id);
             Ok(true)
@@ -343,6 +468,8 @@ fn apply_action(
             )?;
             send_event(
                 client,
+                sender,
+                deadline,
                 registry_id,
                 protocol::registry_event::GLOBAL,
                 payload,
@@ -360,6 +487,8 @@ fn apply_action(
             let payload = encode_registry_global_remove_payload(*id)?;
             send_event(
                 client,
+                sender,
+                deadline,
                 registry_id,
                 protocol::registry_event::GLOBAL_REMOVE,
                 payload,
@@ -371,33 +500,55 @@ fn apply_action(
 }
 
 fn send_event(
-    client: &mut UnixStream,
+    client: &UnixStream,
+    sender: &mut FrameSender,
+    deadline: Instant,
     object_id: u32,
     opcode: u8,
     payload: Vec<u8>,
 ) -> io::Result<()> {
-    send_event_with_fds(client, object_id, opcode, payload, &[])
+    send_event_with_fds(
+        client,
+        sender,
+        deadline,
+        object_id,
+        opcode,
+        payload,
+        Vec::new(),
+    )
 }
 
 fn send_event_with_fds(
-    client: &mut UnixStream,
+    client: &UnixStream,
+    sender: &mut FrameSender,
+    deadline: Instant,
     object_id: u32,
     opcode: u8,
     payload: Vec<u8>,
-    fds: &[std::os::fd::BorrowedFd<'_>],
+    fds: Vec<OwnedFd>,
 ) -> io::Result<()> {
-    let packet = NativePacket {
-        header: NativeHeader {
-            object_id,
-            opcode,
-            payload_size: payload.len() as u32,
-            seq: 0,
-            n_fds: fds.len() as u32,
-        },
-        payload,
-    };
+    let frame = OutboundFrame::new(object_id, opcode, 0, payload, fds, FrameLimits::default())
+        .map_err(frame_error)?;
+    sender.enqueue(frame).map_err(frame_error)?;
+    loop {
+        match sender.flush(client.as_fd()).map_err(frame_error)? {
+            FlushOutcome::Drained => return Ok(()),
+            FlushOutcome::WouldBlock => wait_until(client.as_fd(), libc::POLLOUT, deadline)?,
+        }
+    }
+}
 
-    protocol::write_packet_with_fds(client, &packet, fds)
+fn frame_error(error: FrameError) -> io::Error {
+    let kind = match &error {
+        FrameError::Io(source) => source.kind(),
+        FrameError::PayloadTooLarge { .. }
+        | FrameError::TooManyFrameFds { .. }
+        | FrameError::SendQueueFull { .. }
+        | FrameError::SendFdQueueFull { .. } => io::ErrorKind::InvalidInput,
+        FrameError::WriteZero => io::ErrorKind::WriteZero,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error)
 }
 
 fn update_state_from_inbound(state: &mut ExecutionState, inbound: &protocol::InboundMessage) {
