@@ -61,6 +61,8 @@ pub mod keys;
 /// Provides an event loop for the library to communicate with the PipeWire server, as well as
 /// primitives to managed mutually exclusive access to shared data structures.
 pub mod main_loop;
+/// Client node integration built on the data-plane node crate.
+pub mod node;
 /// Sructures for representing permissions.
 pub mod permission;
 /// Properties represent a key-value structure for various object properties. While the internal

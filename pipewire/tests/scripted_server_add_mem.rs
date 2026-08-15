@@ -3,10 +3,9 @@
 
 use std::{
     ffi::OsString,
-    os::fd::OwnedFd,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Duration,
 };
@@ -14,8 +13,9 @@ use std::{
 use pipewire_native::{
     self as pipewire,
     context::Context,
-    core::{CoreEvents, CoreMemoryImporter},
+    core::CoreEvents,
     main_loop::MainLoop,
+    node::session::memory::{MemoryError, MemoryId, MemoryPoolHandle, RegionRef, ShrinkPolicy},
     properties::Properties,
 };
 use pipewire_native_server::{
@@ -25,31 +25,6 @@ use pipewire_native_server::{
     testkit,
 };
 use serial_test::serial;
-
-type ImportedMemory = Arc<Mutex<Vec<(u32, u32, OwnedFd, u32)>>>;
-type ObservedMemory = Arc<Mutex<Vec<(u32, u32, u32)>>>;
-
-struct Importer {
-    memory: ImportedMemory,
-    observed: ObservedMemory,
-    added: Arc<AtomicU32>,
-    removed: Arc<Mutex<Vec<u32>>>,
-}
-
-impl CoreMemoryImporter for Importer {
-    fn add_memory(&mut self, id: u32, type_: u32, fd: OwnedFd, flags: u32) -> std::io::Result<()> {
-        self.added.fetch_add(1, Ordering::Relaxed);
-        self.observed.lock().unwrap().push((id, type_, flags));
-        self.memory.lock().unwrap().push((id, type_, fd, flags));
-        Ok(())
-    }
-
-    fn remove_memory(&mut self, id: u32) -> std::io::Result<()> {
-        self.memory.lock().unwrap().retain(|entry| entry.0 != id);
-        self.removed.lock().unwrap().push(id);
-        Ok(())
-    }
-}
 
 struct RemoteGuard(Option<OsString>);
 
@@ -72,44 +47,66 @@ impl Drop for RemoteGuard {
 }
 
 fn add_mem_scenario(id: u32, fd_index: i32) -> Scenario {
-    let actions = vec![
-        Action::SendCoreAddMem(
-            CoreAddMemAction::builder()
-                .id(id)
-                .memory_type(spa_data_type::MEM_FD)
-                .fd_index(fd_index)
-                .flags(0)
-                .size(4096)
-                .build(),
-        ),
-        Action::SendCoreRemoveMem { id },
-        Action::SendCoreDoneFromLastSync,
+    let add = Action::SendCoreAddMem(
+        CoreAddMemAction::builder()
+            .id(id)
+            .memory_type(spa_data_type::MEM_FD)
+            .fd_index(fd_index)
+            .flags(0)
+            .size(4096)
+            .build(),
+    );
+    let (first_actions, remove_step) = if fd_index == 0 {
+        (
+            vec![add, Action::SendCoreDoneFromLastSync],
+            Some(
+                ScriptStep::builder()
+                    .expect(Expectation::CoreSync)
+                    .actions(vec![
+                        Action::SendCoreRemoveMem { id },
+                        Action::SendCoreDoneFromLastSync,
+                    ])
+                    .build(),
+            ),
+        )
+    } else {
+        (
+            vec![
+                add,
+                Action::SendCoreRemoveMem { id },
+                Action::SendCoreDoneFromLastSync,
+            ],
+            None,
+        )
+    };
+
+    let mut steps = vec![
+        ScriptStep::builder()
+            .expect(Expectation::CoreHello)
+            .actions(vec![Action::SendCoreInfo(
+                CoreInfoAction::builder()
+                    .cookie(1)
+                    .user_name("tester".to_string())
+                    .host_name("localhost".to_string())
+                    .version("1.0-test".to_string())
+                    .name("scripted-add-mem".to_string())
+                    .props(vec![])
+                    .build(),
+            )])
+            .build(),
+        ScriptStep::builder()
+            .expect(Expectation::ClientUpdateProperties)
+            .actions(vec![])
+            .build(),
+        ScriptStep::builder()
+            .expect(Expectation::CoreSync)
+            .actions(first_actions)
+            .build(),
     ];
+    steps.extend(remove_step);
 
     Scenario::builder()
-        .steps(vec![
-            ScriptStep::builder()
-                .expect(Expectation::CoreHello)
-                .actions(vec![Action::SendCoreInfo(
-                    CoreInfoAction::builder()
-                        .cookie(1)
-                        .user_name("tester".to_string())
-                        .host_name("localhost".to_string())
-                        .version("1.0-test".to_string())
-                        .name("scripted-add-mem".to_string())
-                        .props(vec![])
-                        .build(),
-                )])
-                .build(),
-            ScriptStep::builder()
-                .expect(Expectation::ClientUpdateProperties)
-                .actions(vec![])
-                .build(),
-            ScriptStep::builder()
-                .expect(Expectation::CoreSync)
-                .actions(actions)
-                .build(),
-        ])
+        .steps(steps)
         .name("client-add-mem".to_string())
         .build()
 }
@@ -128,6 +125,72 @@ fn spawn_server(id: u32, fd_index: i32, socket_path: &std::path::Path) -> testki
     testkit::spawn(server)
 }
 
+fn importer_failure_scenario(id: u32, memory_type: u32, duplicate: bool) -> Scenario {
+    let add_mem = |id, memory_type| {
+        Action::SendCoreAddMem(
+            CoreAddMemAction::builder()
+                .id(id)
+                .memory_type(memory_type)
+                .fd_index(0)
+                .flags(0)
+                .size(4096)
+                .build(),
+        )
+    };
+    let mut actions = Vec::new();
+    if duplicate {
+        actions.push(add_mem(id, spa_data_type::MEM_FD));
+    }
+    actions.push(add_mem(id, memory_type));
+    actions.push(add_mem(id + 1, spa_data_type::MEM_FD));
+
+    Scenario::builder()
+        .steps(vec![
+            ScriptStep::builder()
+                .expect(Expectation::CoreHello)
+                .actions(vec![Action::SendCoreInfo(
+                    CoreInfoAction::builder()
+                        .cookie(1)
+                        .user_name("tester".to_string())
+                        .host_name("localhost".to_string())
+                        .version("1.0-test".to_string())
+                        .name("scripted-import-error".to_string())
+                        .props(vec![])
+                        .build(),
+                )])
+                .build(),
+            ScriptStep::builder()
+                .expect(Expectation::ClientUpdateProperties)
+                .actions(vec![])
+                .build(),
+            ScriptStep::builder()
+                .expect(Expectation::CoreSync)
+                .actions(actions)
+                .build(),
+        ])
+        .name("client-import-error".to_string())
+        .build()
+}
+
+fn spawn_importer_failure_server(
+    id: u32,
+    memory_type: u32,
+    duplicate: bool,
+    socket_path: &std::path::Path,
+) -> testkit::ServerHandle {
+    let server = ScriptedServer::builder()
+        .config(
+            ServerConfig::builder()
+                .socket_path(socket_path.to_path_buf())
+                .single_client(true)
+                .deadline(Duration::from_secs(3))
+                .build(),
+        )
+        .scenario(importer_failure_scenario(id, memory_type, duplicate))
+        .build();
+    testkit::spawn(server)
+}
+
 fn new_client(
     socket_path: &std::path::Path,
 ) -> (RemoteGuard, MainLoop, Context, pipewire::core::Core) {
@@ -137,27 +200,6 @@ fn new_client(
     let context = Context::new(&main_loop, Properties::new()).unwrap();
     let core = context.connect(None).unwrap();
     (remote, main_loop, context, core)
-}
-
-fn install_importer(
-    core: &pipewire::core::Core,
-) -> (
-    ImportedMemory,
-    ObservedMemory,
-    Arc<AtomicU32>,
-    Arc<Mutex<Vec<u32>>>,
-) {
-    let imported = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::new(Mutex::new(Vec::new()));
-    let added = Arc::new(AtomicU32::new(0));
-    let removed = Arc::new(Mutex::new(Vec::new()));
-    core.set_memory_importer(Some(Box::new(Importer {
-        memory: imported.clone(),
-        observed: observed.clone(),
-        added: added.clone(),
-        removed: removed.clone(),
-    })));
-    (imported, observed, added, removed)
 }
 
 fn install_timeout(
@@ -203,7 +245,7 @@ fn client_imports_indexed_add_mem_from_scripted_server() {
     let socket_path = testkit::unique_socket_path("pipewire-native-indexed-add-mem");
     let server = spawn_server(55, 0, &socket_path);
     let (_remote, main_loop, _context, core) = new_client(&socket_path);
-    let (imported, observed, added, removed) = install_importer(&core);
+    let memory = MemoryPoolHandle::install(&core, ShrinkPolicy::Allow);
 
     let done_seen = Arc::new(AtomicBool::new(false));
     let expected_seq = Arc::new(AtomicU32::new(0));
@@ -223,20 +265,45 @@ fn client_imports_indexed_add_mem_from_scripted_server() {
     expected_seq.store(core.sync().unwrap(), Ordering::Relaxed);
 
     let timed_out = Arc::new(AtomicBool::new(false));
-    let _timer = install_timeout(&main_loop, timed_out.clone(), Duration::from_secs(3));
-    main_loop.run();
+    {
+        let _timer = install_timeout(&main_loop, timed_out.clone(), Duration::from_secs(3));
+        main_loop.run();
+    }
+
+    assert!(!timed_out.load(Ordering::Relaxed));
+    assert!(done_seen.load(Ordering::Relaxed));
+    assert_eq!(memory.len(), 1);
+    let key = memory.resolve(MemoryId(55)).unwrap();
+    let mapping = memory
+        .bind(
+            RegionRef {
+                memory: MemoryId(55),
+                offset: 0,
+                len: 4096,
+            },
+            true,
+        )
+        .unwrap();
+    assert_eq!(mapping.key(), key);
+    assert_eq!(mapping.flags(), 0);
+
+    done_seen.store(false, Ordering::Relaxed);
+    expected_seq.store(core.sync().unwrap(), Ordering::Relaxed);
+    {
+        let _timer = install_timeout(&main_loop, timed_out.clone(), Duration::from_secs(3));
+        main_loop.run();
+    }
 
     let report = server.wait(deadline).unwrap();
     assert!(!timed_out.load(Ordering::Relaxed));
     assert!(done_seen.load(Ordering::Relaxed));
     assert_eq!(report.exported_mem_ids, vec![55]);
-    assert_eq!(added.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        observed.lock().unwrap().as_slice(),
-        &[(55, spa_data_type::MEM_FD, 0)]
-    );
-    assert!(imported.lock().unwrap().is_empty());
-    assert_eq!(removed.lock().unwrap().as_slice(), &[55]);
+    assert!(memory.is_empty());
+    assert!(matches!(
+        memory.resolve(MemoryId(55)),
+        Err(MemoryError::UnknownMemory(MemoryId(55)))
+    ));
+    drop(mapping);
     assert!(!process_has_memfd(55), "removed AddMem descriptor leaked");
 }
 
@@ -248,7 +315,7 @@ fn wrong_add_mem_fd_index_rejects_import_and_closes_descriptor() {
     let socket_path = testkit::unique_socket_path("pipewire-native-wrong-add-mem-index");
     let server = spawn_server(56, 1, &socket_path);
     let (_remote, main_loop, _context, core) = new_client(&socket_path);
-    let (imported, observed, added, removed) = install_importer(&core);
+    let memory = MemoryPoolHandle::install(&core, ShrinkPolicy::Allow);
 
     core.sync().unwrap();
 
@@ -263,9 +330,79 @@ fn wrong_add_mem_fd_index_rejects_import_and_closes_descriptor() {
     let report = server.wait(deadline).unwrap();
     assert!(processing_window_elapsed.load(Ordering::Relaxed));
     assert_eq!(report.exported_mem_ids, vec![56]);
-    assert_eq!(added.load(Ordering::Relaxed), 0);
-    assert!(observed.lock().unwrap().is_empty());
-    assert!(imported.lock().unwrap().is_empty());
-    assert!(removed.lock().unwrap().is_empty());
+    assert!(memory.is_empty());
     assert!(!process_has_memfd(56), "rejected AddMem descriptor leaked");
+}
+
+#[test]
+#[serial]
+fn duplicate_add_mem_closes_candidate_and_later_frame_resources() {
+    pipewire::init();
+    let deadline = testkit::TestDeadline::after(Duration::from_secs(3));
+    let socket_path = testkit::unique_socket_path("pipewire-native-duplicate-add-mem");
+    let server = spawn_importer_failure_server(57, spa_data_type::MEM_FD, true, &socket_path);
+    let (_remote, main_loop, _context, core) = new_client(&socket_path);
+    let memory = MemoryPoolHandle::install(&core, ShrinkPolicy::Allow);
+
+    core.sync().unwrap();
+    let processing_window_elapsed = Arc::new(AtomicBool::new(false));
+    let _timer = install_timeout(
+        &main_loop,
+        processing_window_elapsed.clone(),
+        Duration::from_millis(100),
+    );
+    main_loop.run();
+
+    let report = server.wait(deadline).unwrap();
+    assert!(processing_window_elapsed.load(Ordering::Relaxed));
+    assert_eq!(report.exported_mem_ids, vec![57, 57, 58]);
+    assert_eq!(memory.resolve(MemoryId(57)).unwrap().id, MemoryId(57));
+    assert!(matches!(
+        memory.resolve(MemoryId(58)),
+        Err(MemoryError::UnknownMemory(MemoryId(58)))
+    ));
+
+    core.disconnect();
+    assert!(matches!(
+        memory.resolve(MemoryId(57)),
+        Err(MemoryError::Disconnected)
+    ));
+    assert!(!process_has_memfd(57), "duplicate AddMem descriptor leaked");
+    assert!(!process_has_memfd(58), "later frame descriptor leaked");
+}
+
+#[test]
+#[serial]
+fn unsupported_add_mem_closes_candidate_and_later_frame_resources() {
+    pipewire::init();
+    let deadline = testkit::TestDeadline::after(Duration::from_secs(3));
+    let socket_path = testkit::unique_socket_path("pipewire-native-unsupported-add-mem");
+    let server = spawn_importer_failure_server(59, spa_data_type::DMA_BUF, false, &socket_path);
+    let (_remote, main_loop, _context, core) = new_client(&socket_path);
+    let memory = MemoryPoolHandle::install(&core, ShrinkPolicy::Allow);
+
+    core.sync().unwrap();
+    let processing_window_elapsed = Arc::new(AtomicBool::new(false));
+    let _timer = install_timeout(
+        &main_loop,
+        processing_window_elapsed.clone(),
+        Duration::from_millis(100),
+    );
+    main_loop.run();
+
+    let report = server.wait(deadline).unwrap();
+    assert!(processing_window_elapsed.load(Ordering::Relaxed));
+    assert_eq!(report.exported_mem_ids, vec![59, 60]);
+    assert!(memory.is_empty());
+
+    core.disconnect();
+    assert!(matches!(
+        memory.resolve(MemoryId(59)),
+        Err(MemoryError::Disconnected)
+    ));
+    assert!(
+        !process_has_memfd(59),
+        "unsupported AddMem descriptor leaked"
+    );
+    assert!(!process_has_memfd(60), "later frame descriptor leaked");
 }
