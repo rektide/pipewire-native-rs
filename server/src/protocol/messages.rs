@@ -34,21 +34,7 @@ pub mod core_event {
     pub const REMOVE_MEM: u8 = 7;
 }
 
-/// Values from `enum spa_data_type`.
-pub mod spa_data_type {
-    /// `SPA_DATA_Invalid`.
-    pub const INVALID: u32 = 0;
-    /// `SPA_DATA_MemPtr`.
-    pub const MEM_PTR: u32 = 1;
-    /// `SPA_DATA_MemFd`.
-    pub const MEM_FD: u32 = 2;
-    /// `SPA_DATA_DmaBuf`.
-    pub const DMA_BUF: u32 = 3;
-    /// `SPA_DATA_MemId`.
-    pub const MEM_ID: u32 = 4;
-    /// `SPA_DATA_SyncObj`.
-    pub const SYNC_OBJ: u32 = 5;
-}
+pub use spa::buffer::data_type as spa_data_type;
 
 /// Client method opcodes.
 pub mod client_method {

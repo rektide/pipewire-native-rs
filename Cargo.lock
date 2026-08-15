@@ -843,6 +843,7 @@ name = "pipewire-native-node"
 version = "0.1.4"
 dependencies = [
  "libc",
+ "pipewire-native-spa",
  "tokio",
 ]
 

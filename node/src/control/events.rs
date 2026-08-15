@@ -3,6 +3,8 @@
 
 use std::os::fd::OwnedFd;
 
+use pipewire_native_spa::buffer::data_type;
+
 use crate::transport::{Activation, TransportConfig};
 
 /// Memory kinds announced by `Core::AddMem`.
@@ -19,8 +21,8 @@ pub enum MemoryType {
 impl From<u32> for MemoryType {
     fn from(value: u32) -> Self {
         match value {
-            0 => Self::MemFd,
-            1 => Self::DmaBuf,
+            data_type::MEM_FD => Self::MemFd,
+            data_type::DMA_BUF => Self::DmaBuf,
             other => Self::Unknown(other),
         }
     }
@@ -85,5 +87,22 @@ impl From<TransportEvent> for TransportConfig {
             write_fd: value.write_fd,
             activation: value.activation.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_type_uses_spa_data_type_values() {
+        assert_eq!(MemoryType::from(data_type::MEM_FD), MemoryType::MemFd);
+        assert_eq!(MemoryType::from(data_type::DMA_BUF), MemoryType::DmaBuf);
+    }
+
+    #[test]
+    fn memory_type_preserves_unhandled_values() {
+        assert_eq!(MemoryType::from(data_type::INVALID), MemoryType::Unknown(0));
+        assert_eq!(MemoryType::from(99), MemoryType::Unknown(99));
     }
 }
