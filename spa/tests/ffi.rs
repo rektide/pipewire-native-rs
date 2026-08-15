@@ -215,6 +215,28 @@ fn test_load_support() {
 }
 
 #[test]
+fn ffi_interface_retains_handle_factory_and_plugin() {
+    let (support, plugin) = init_support();
+    let factory = plugin
+        .find_factory(interface::plugin::CPU_FACTORY)
+        .expect("Should find CPU factory");
+
+    drop(plugin);
+    let handle = factory
+        .init(None, &support)
+        .expect("Factory should retain its plugin library");
+    let cpu = handle
+        .get_interface(interface::CPU)
+        .expect("CPU factory should produce an interface")
+        .downcast_box::<CpuImpl>()
+        .expect("CPU interface should be a CpuImpl");
+
+    drop(factory);
+    drop(handle);
+    assert!(cpu.get_count() > 0, "Interface should retain its handle");
+}
+
+#[test]
 fn test_loop_support() {
     let (mut support, plugin) = init_support();
 

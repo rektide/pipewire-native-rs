@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Sanchayan Maity
 
 use std::ffi::{c_int, c_uint, c_void, CString};
+use std::sync::Arc;
 
 use crate::interface;
 use crate::interface::cpu::{CpuFlags, CpuImpl, CpuVm};
@@ -39,9 +40,20 @@ struct CCpu {
 
 struct CCpuImpl {}
 
-pub(super) fn new_impl(interface: *mut CInterface) -> CpuImpl {
+struct CCpuInterface {
+    interface: *mut CCpu,
+    _owner: Arc<super::plugin::CHandleOwner>,
+}
+
+pub(super) fn new_impl(
+    interface: *mut CInterface,
+    owner: Arc<super::plugin::CHandleOwner>,
+) -> CpuImpl {
     CpuImpl {
-        inner: Box::pin(interface as *mut CCpu),
+        inner: Box::pin(CCpuInterface {
+            interface: interface as *mut CCpu,
+            _owner: owner,
+        }),
 
         get_flags: CCpuImpl::get_flags,
         force_flags: CCpuImpl::force_flags,
@@ -57,8 +69,9 @@ impl CCpuImpl {
         unsafe {
             this.inner
                 .as_ref()
-                .downcast_ref::<*mut CCpu>()
+                .downcast_ref::<CCpuInterface>()
                 .unwrap()
+                .interface
                 .as_ref()
                 .unwrap()
         }

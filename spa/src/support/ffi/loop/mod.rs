@@ -59,18 +59,23 @@ struct CLoopMethods {
 struct CLoopImpl {
     iface: *mut CLoop,
     sources: HashMap<RawFd, Pin<Box<CSourceImpl>>>,
+    _owner: Arc<super::plugin::CHandleOwner>,
 }
 
 // The only usage of CLoopImpl should be inside the inner below
 unsafe impl Send for CLoopImpl {}
 unsafe impl Sync for CLoopImpl {}
 
-pub fn new_impl(interface: *mut CInterface) -> LoopImpl {
+pub(super) fn new_impl(
+    interface: *mut CInterface,
+    owner: Arc<super::plugin::CHandleOwner>,
+) -> LoopImpl {
     LoopImpl {
         // Arc so we can take a reference out of the pinned box, and RwLock so we can mutate it
         inner: Box::pin(Arc::new(RwLock::new(CLoopImpl {
             iface: interface as *mut CLoop,
             sources: HashMap::new(),
+            _owner: owner,
         }))),
 
         add_source: CLoopImpl::add_source,

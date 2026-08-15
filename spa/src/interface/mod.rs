@@ -100,27 +100,47 @@ impl Support {
 
 impl Drop for Support {
     fn drop(&mut self) {
-        for s in self.c_supports.iter_mut() {
+        while let Some(s) = self.c_supports.pop() {
             unsafe {
                 let type_ = CString::from_raw(s.type_);
-                match type_.to_str().unwrap() {
-                    CPU => <CpuImpl as plugin::Interface>::free_native(s.data as *mut CInterface),
-                    LOOP => <LoopImpl as plugin::Interface>::free_native(s.data as *mut CInterface),
-                    LOOP_CONTROL => <LoopControlImpl as plugin::Interface>::free_native(
-                        s.data as *mut CInterface,
-                    ),
+                let name = match type_.to_str().unwrap() {
+                    CPU => {
+                        <CpuImpl as plugin::Interface>::free_native(s.data as *mut CInterface);
+                        CPU
+                    }
+                    LOOP => {
+                        <LoopImpl as plugin::Interface>::free_native(s.data as *mut CInterface);
+                        LOOP
+                    }
+                    LOOP_CONTROL => {
+                        <LoopControlImpl as plugin::Interface>::free_native(
+                            s.data as *mut CInterface,
+                        );
+                        LOOP_CONTROL
+                    }
                     LOOP_UTILS => {
-                        <LoopUtilsImpl as plugin::Interface>::free_native(s.data as *mut CInterface)
+                        <LoopUtilsImpl as plugin::Interface>::free_native(
+                            s.data as *mut CInterface,
+                        );
+                        LOOP_UTILS
                     }
-                    LOG => <LogImpl as plugin::Interface>::free_native(s.data as *mut CInterface),
+                    LOG => {
+                        <LogImpl as plugin::Interface>::free_native(s.data as *mut CInterface);
+                        LOG
+                    }
                     SYSTEM => {
-                        <SystemImpl as plugin::Interface>::free_native(s.data as *mut CInterface)
+                        <SystemImpl as plugin::Interface>::free_native(s.data as *mut CInterface);
+                        SYSTEM
                     }
-                    THREAD_UTILS => <ThreadUtilsImpl as plugin::Interface>::free_native(
-                        s.data as *mut CInterface,
-                    ),
+                    THREAD_UTILS => {
+                        <ThreadUtilsImpl as plugin::Interface>::free_native(
+                            s.data as *mut CInterface,
+                        );
+                        THREAD_UTILS
+                    }
                     _ => unreachable!(),
-                }
+                };
+                self.supports.remove(name);
             }
         }
     }

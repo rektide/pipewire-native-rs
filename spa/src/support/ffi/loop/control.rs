@@ -47,6 +47,7 @@ struct CLoopControlIface {
 #[repr(C)]
 struct CLoopControlImpl {
     iface: *mut CLoopControlIface,
+    _owner: Arc<super::super::plugin::CHandleOwner>,
     hooks: Arc<Mutex<HookList<LoopControlHooks>>>,
     c_hook: CHook,
     c_hook_methods: CControlHooks,
@@ -67,9 +68,13 @@ extern "C" fn loop_after_trampoline(data: *mut c_void) {
     emit_hook!(loop_control_impl_.hooks, after);
 }
 
-pub fn new_impl(interface: *mut CInterface) -> LoopControlImpl {
+pub(in crate::support::ffi) fn new_impl(
+    interface: *mut CInterface,
+    owner: Arc<super::super::plugin::CHandleOwner>,
+) -> LoopControlImpl {
     let inner = Box::pin(Arc::new(RwLock::new(CLoopControlImpl {
         iface: interface as *mut CLoopControlIface,
+        _owner: owner,
         hooks: HookList::new(),
         c_hook: CHook::new(),
         c_hook_methods: CControlHooks {

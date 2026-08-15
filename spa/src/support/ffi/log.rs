@@ -5,6 +5,7 @@
 use std::{
     any::Any,
     ffi::{c_char, c_int, c_void, CStr, CString},
+    sync::Arc,
 };
 
 use crate::interface::ffi::CInterface;
@@ -56,11 +57,22 @@ struct CLog {
 
 struct CLogImpl {}
 
-pub fn new_impl(interface: *mut CInterface) -> LogImpl {
+struct CLogInterface {
+    interface: *mut CLog,
+    _owner: Arc<super::plugin::CHandleOwner>,
+}
+
+pub(super) fn new_impl(
+    interface: *mut CInterface,
+    owner: Arc<super::plugin::CHandleOwner>,
+) -> LogImpl {
     let level = unsafe { (interface as *mut CLog).as_ref().unwrap().level };
 
     LogImpl {
-        inner: Box::pin(interface as *mut CLog),
+        inner: Box::pin(CLogInterface {
+            interface: interface as *mut CLog,
+            _owner: owner,
+        }),
         level,
 
         log: CLogImpl::log,
@@ -136,8 +148,9 @@ impl CLogImpl {
             let log = this
                 .inner
                 .as_ref()
-                .downcast_ref::<*mut CLog>()
+                .downcast_ref::<CLogInterface>()
                 .unwrap()
+                .interface
                 .as_ref()
                 .unwrap();
             let funcs = log.iface.cb.funcs as *const CLogMethods;
@@ -183,8 +196,9 @@ impl CLogImpl {
             let log = this
                 .inner
                 .as_ref()
-                .downcast_ref::<*mut CLog>()
+                .downcast_ref::<CLogInterface>()
                 .unwrap()
+                .interface
                 .as_ref()
                 .unwrap();
             let funcs = log.iface.cb.funcs as *const CLogMethods;

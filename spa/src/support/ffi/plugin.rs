@@ -4,6 +4,7 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use libloading::os::unix::{Library, Symbol, RTLD_NOW};
 
@@ -18,26 +19,35 @@ use super::system;
 use super::{c_string, r#loop};
 
 const ENTRYPOINT: &str = "spa_handle_factory_enum";
-type EntryPointFn = unsafe extern "C" fn(*const *mut CHandleFactory, *mut u32) -> c_int;
+type EntryPointFn = unsafe extern "C" fn(*mut *const CHandleFactory, index: *mut u32) -> c_int;
 
 pub struct Plugin {
+    inner: Arc<PluginInner>,
+}
+
+struct PluginInner {
     _library: Library,
-    factories: Vec<*mut CHandleFactory>,
+    factories: Vec<*const CHandleFactory>,
 }
 
 unsafe impl Send for Plugin {}
 unsafe impl Sync for Plugin {}
+unsafe impl Send for PluginInner {}
+unsafe impl Sync for PluginInner {}
 
 impl Plugin {
     pub fn find_factory(&self, name: &str) -> Option<Box<dyn HandleFactory>> {
-        for f in &self.factories {
+        for f in &self.inner.factories {
             let f_name = unsafe {
                 let factory = f.as_ref().unwrap();
                 CStr::from_ptr(factory.name).to_str()
             };
 
             if f_name == Ok(name) {
-                return Some(Box::new(CHandleFactoryImpl { factory: *f }));
+                return Some(Box::new(CHandleFactoryImpl {
+                    factory: *f,
+                    plugin: self.inner.clone(),
+                }));
             }
         }
 
@@ -72,23 +82,25 @@ pub struct CHandleFactory {
     pub name: *const c_char,
     pub info: *const Dict,
 
-    pub get_size: fn(factory: *const CHandleFactory, params: *const Dict) -> usize,
-    pub init: fn(
+    pub get_size:
+        unsafe extern "C" fn(factory: *const CHandleFactory, params: *const Dict) -> usize,
+    pub init: unsafe extern "C" fn(
         factory: *const CHandleFactory,
         handle: *mut CHandle,
         params: *const Dict,
         support: *const CSupport,
         n_support: u32,
     ) -> c_int,
-    pub enum_interface_info: fn(
+    pub enum_interface_info: unsafe extern "C" fn(
         factory: *const CHandleFactory,
-        info: *const *mut CInterfaceInfo,
+        info: *mut *const CInterfaceInfo,
         index: *mut u32,
     ) -> c_int,
 }
 
 struct CHandleFactoryImpl {
-    factory: *mut CHandleFactory,
+    factory: *const CHandleFactory,
+    plugin: Arc<PluginInner>,
 }
 
 impl HandleFactory for CHandleFactoryImpl {
@@ -120,6 +132,9 @@ impl HandleFactory for CHandleFactoryImpl {
             };
             let size = (self.factory.as_ref().unwrap().get_size)(self.factory, info_ptr);
             let handle = libc::calloc(1, size) as *mut CHandle;
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
             let (support, n_support) = {
                 let c_support = support.c_support();
                 (c_support.as_ptr(), c_support.len())
@@ -133,22 +148,30 @@ impl HandleFactory for CHandleFactoryImpl {
             );
 
             match ret {
-                0 => Ok(Box::new(CHandleImpl { handle })),
-                err => Err(std::io::Error::from_raw_os_error(err)),
+                0 => Ok(Box::new(CHandleImpl {
+                    owner: Arc::new(CHandleOwner {
+                        handle,
+                        _plugin: self.plugin.clone(),
+                    }),
+                })),
+                err => {
+                    libc::free(handle as *mut c_void);
+                    Err(std::io::Error::from_raw_os_error(-err))
+                }
             }
         }
     }
 
     fn enum_interface_info(&self) -> Vec<crate::interface::plugin::InterfaceInfo> {
         let mut interfaces = vec![];
-        let info: *mut CInterfaceInfo = std::ptr::null_mut();
+        let mut info: *const CInterfaceInfo = std::ptr::null();
         let mut i: u32 = 0;
 
         loop {
             unsafe {
                 match (self.factory.as_ref().unwrap().enum_interface_info)(
                     self.factory,
-                    &info,
+                    &mut info,
                     &mut i,
                 ) {
                     1 => interfaces.push(InterfaceInfo {
@@ -164,19 +187,29 @@ impl HandleFactory for CHandleFactoryImpl {
 #[repr(C)]
 pub struct CHandle {
     pub version: u32,
-    pub get_interface:
-        fn(handle: *const CHandle, type_: *const c_char, iface: *mut *mut CInterface) -> c_int,
-    pub clear: fn(handle: *mut CHandle) -> c_int,
+    pub get_interface: unsafe extern "C" fn(
+        handle: *mut CHandle,
+        type_: *const c_char,
+        iface: *mut *mut CInterface,
+    ) -> c_int,
+    pub clear: unsafe extern "C" fn(handle: *mut CHandle) -> c_int,
 }
 
 struct CHandleImpl {
+    owner: Arc<CHandleOwner>,
+}
+
+pub(super) struct CHandleOwner {
     handle: *mut CHandle,
+    _plugin: Arc<PluginInner>,
 }
 
 unsafe impl Send for CHandleImpl {}
 unsafe impl Sync for CHandleImpl {}
+unsafe impl Send for CHandleOwner {}
+unsafe impl Sync for CHandleOwner {}
 
-impl Drop for CHandleImpl {
+impl Drop for CHandleOwner {
     fn drop(&mut self) {
         unsafe {
             (self.handle.as_ref().unwrap().clear)(self.handle);
@@ -187,15 +220,15 @@ impl Drop for CHandleImpl {
 
 impl Handle for CHandleImpl {
     fn version(&self) -> u32 {
-        unsafe { self.handle.as_ref().unwrap().version }
+        unsafe { self.owner.handle.as_ref().unwrap().version }
     }
 
     fn get_interface(&self, type_: &str) -> Option<Box<dyn Interface>> {
         let mut iface: *mut CInterface = std::ptr::null_mut();
 
         unsafe {
-            (self.handle.as_ref().unwrap().get_interface)(
-                self.handle,
+            (self.owner.handle.as_ref().unwrap().get_interface)(
+                self.owner.handle,
                 c_string(type_).as_ptr(),
                 &mut iface,
             )
@@ -206,12 +239,17 @@ impl Handle for CHandleImpl {
         }
 
         match type_ {
-            interface::CPU => Some(Box::new(cpu::new_impl(iface))),
-            interface::LOG => Some(Box::new(log::new_impl(iface))),
-            interface::LOOP => Some(Box::new(r#loop::new_impl(iface))),
-            interface::LOOP_CONTROL => Some(Box::new(r#loop::control::new_impl(iface))),
-            interface::LOOP_UTILS => Some(Box::new(r#loop::utils::new_impl(iface))),
-            interface::SYSTEM => Some(Box::new(system::new_impl(iface))),
+            interface::CPU => Some(Box::new(cpu::new_impl(iface, self.owner.clone()))),
+            interface::LOG => Some(Box::new(log::new_impl(iface, self.owner.clone()))),
+            interface::LOOP => Some(Box::new(r#loop::new_impl(iface, self.owner.clone()))),
+            interface::LOOP_CONTROL => Some(Box::new(r#loop::control::new_impl(
+                iface,
+                self.owner.clone(),
+            ))),
+            interface::LOOP_UTILS => {
+                Some(Box::new(r#loop::utils::new_impl(iface, self.owner.clone())))
+            }
+            interface::SYSTEM => Some(Box::new(system::new_impl(iface, self.owner.clone()))),
             _ => None,
         }
     }
@@ -224,14 +262,13 @@ pub fn load(path: &PathBuf) -> Result<Plugin, String> {
             .get(ENTRYPOINT.as_bytes())
             .map_err(|e| format!("{}", e))?;
 
-        let h: *mut CHandleFactory = std::ptr::null_mut();
-        let h_ptr: *const *mut CHandleFactory = &h;
+        let mut h: *const CHandleFactory = std::ptr::null();
         let mut i: u32 = 0;
         let i_ptr: *mut u32 = &mut i;
         let mut factories = vec![];
 
         loop {
-            match entrypoint(h_ptr, i_ptr) {
+            match entrypoint(&mut h, i_ptr) {
                 1 => factories.push(h),
                 0 => break,
                 err => return Err(format!("Could not load plugin: {}", err)),
@@ -239,8 +276,10 @@ pub fn load(path: &PathBuf) -> Result<Plugin, String> {
         }
 
         Ok(Plugin {
-            _library: library,
-            factories,
+            inner: Arc::new(PluginInner {
+                _library: library,
+                factories,
+            }),
         })
     }
 }

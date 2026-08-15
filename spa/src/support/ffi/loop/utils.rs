@@ -8,6 +8,7 @@ use std::{
     ffi::{c_int, c_uint, c_ulong, c_void, CString},
     os::fd::RawFd,
     pin::Pin,
+    sync::Arc,
 };
 
 use crate::interface::r#loop::*;
@@ -75,9 +76,20 @@ struct CLoopUtils {
 
 struct CLoopUtilsImpl {}
 
-pub fn new_impl(interface: *mut CInterface) -> LoopUtilsImpl {
+struct CLoopUtilsInterface {
+    interface: *mut CLoopUtils,
+    _owner: Arc<super::super::plugin::CHandleOwner>,
+}
+
+pub(in crate::support::ffi) fn new_impl(
+    interface: *mut CInterface,
+    owner: Arc<super::super::plugin::CHandleOwner>,
+) -> LoopUtilsImpl {
     LoopUtilsImpl {
-        inner: Box::pin(interface as *mut CLoopUtils),
+        inner: Box::pin(CLoopUtilsInterface {
+            interface: interface as *mut CLoopUtils,
+            _owner: owner,
+        }),
 
         add_io: CLoopUtilsImpl::add_io,
         update_io: CLoopUtilsImpl::update_io,
@@ -97,8 +109,9 @@ impl CLoopUtilsImpl {
         unsafe {
             this.inner
                 .as_ref()
-                .downcast_ref::<*mut CLoopUtils>()
+                .downcast_ref::<CLoopUtilsInterface>()
                 .unwrap()
+                .interface
                 .as_ref()
                 .unwrap()
         }

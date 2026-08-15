@@ -5,6 +5,7 @@
 use std::{
     ffi::{c_int, c_ulong, c_void, CString},
     os::fd::RawFd,
+    sync::Arc,
 };
 
 use crate::{
@@ -90,9 +91,20 @@ struct CSystem {
 
 struct CSystemImpl {}
 
-pub fn new_impl(interface: *mut CInterface) -> SystemImpl {
+struct CSystemInterface {
+    interface: *mut CSystem,
+    _owner: Arc<super::plugin::CHandleOwner>,
+}
+
+pub(super) fn new_impl(
+    interface: *mut CInterface,
+    owner: Arc<super::plugin::CHandleOwner>,
+) -> SystemImpl {
     SystemImpl {
-        inner: Box::pin(interface as *mut CSystem),
+        inner: Box::pin(CSystemInterface {
+            interface: interface as *mut CSystem,
+            _owner: owner,
+        }),
 
         read: CSystemImpl::read,
         write: CSystemImpl::write,
@@ -128,8 +140,9 @@ impl CSystemImpl {
         unsafe {
             this.inner
                 .as_ref()
-                .downcast_ref::<*mut CSystem>()
+                .downcast_ref::<CSystemInterface>()
                 .unwrap()
+                .interface
                 .as_ref()
                 .unwrap()
         }
