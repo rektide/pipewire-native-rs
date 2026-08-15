@@ -297,6 +297,62 @@ fn raw_pod_requires_declared_padding() {
     assert!(RawPod::wrap(&data).is_err());
 }
 
+fn exercise_untrusted_pod_bytes(data: &[u8]) {
+    let _ = RawPod::wrap(data);
+    let _ = <()>::decode(data);
+    let _ = bool::decode(data);
+    let _ = i32::decode(data);
+    let _ = i64::decode(data);
+    let _ = f32::decode(data);
+    let _ = f64::decode(data);
+    let _ = String::decode(data);
+    let _ = Vec::<u8>::decode(data);
+    let _ = Vec::<i32>::decode(data);
+    let _ = Choice::<i32>::decode(data);
+    let _ = Pointer::decode(data);
+    let _ = Fd::decode(data);
+    let _ = Rectangle::decode(data);
+    let _ = Fraction::decode(data);
+
+    let _ = Parser::new(data).pop_raw_pod();
+    let _ = Parser::new(data).pop_array_raw(|_, _| Ok(()));
+    let _ = Parser::new(data).pop_choice_raw(|_, _| Ok(()));
+    let _ = Parser::new(data).pop_struct(|_| Ok(()));
+    let _ = Parser::new(data).pop_object::<PropInfo, ParamType, _>(|_, _| Ok(()));
+    let _ = Parser::new(data).pop_object_raw::<ParamType, _>(|_, _, _| Ok(()));
+}
+
+#[test]
+fn generated_untrusted_pod_bytes_are_bounded() {
+    let structured_seeds = [
+        pod_header(0, Type::String),
+        pod_header(4, Type::Array),
+        pod_header(8, Type::Array),
+        pod_header(16, Type::Choice),
+        pod_header(4, Type::Object),
+        pod_header(u32::MAX, Type::Bytes),
+    ];
+    for seed in &structured_seeds {
+        for end in 0..=seed.len() {
+            exercise_untrusted_pod_bytes(&seed[..end]);
+        }
+    }
+
+    // Fixed-state generation keeps failures reproducible while covering many header,
+    // body, padding, type, and nested-size combinations in every normal test run.
+    let mut state = 0x6a09_e667_f3bc_c909u64;
+    for len in 0..=256 {
+        let mut data = vec![0; len];
+        for byte in &mut data {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        exercise_untrusted_pod_bytes(&data);
+    }
+}
+
 #[test]
 fn test_pod_parser() {
     let mut buf = [0u8; 1024];
