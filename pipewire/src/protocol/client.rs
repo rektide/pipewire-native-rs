@@ -99,14 +99,7 @@ impl Client {
     }
 
     pub(crate) fn disconnect(&self) {
-        let _ = self.inner.source.write().unwrap().take();
-        let _ = self.inner.stream.write().unwrap().take();
-
-        self.inner.connection.disconnect();
-        *self.inner.connected.write().unwrap() = false;
-        *self.inner.need_flush.write().unwrap() = false;
-
-        *self.inner.last_in_seq.write().unwrap() = 0;
+        self.clear_connection();
     }
 
     pub(crate) fn set_stream(&self, stream: UnixStream) -> std::io::Result<()> {
@@ -131,7 +124,14 @@ impl Client {
             }),
         );
 
-        *self.inner.source.write().unwrap() = source;
+        let Some(source) = source else {
+            self.inner.stream.write().unwrap().take();
+            self.inner.connection.disconnect();
+            return Err(std::io::Error::other("failed to add connection I/O source"));
+        };
+
+        self.inner.source.write().unwrap().replace(source);
+        *self.inner.connected.write().unwrap() = true;
 
         Ok(())
     }
@@ -201,10 +201,12 @@ impl Client {
 
             match self.inner.connection.flush() {
                 Ok(_) => {
+                    *self.inner.need_flush.write().unwrap() = false;
                     let main_loop = self.core().context().main_loop();
                     let mut source_ref = self.inner.source.write().unwrap();
-                    let source = source_ref.as_mut().unwrap();
-                    let _ = main_loop.update_io(source, source.mask() & !spa::flags::Io::OUT);
+                    if let Some(source) = source_ref.as_mut() {
+                        let _ = main_loop.update_io(source, source.mask() & !spa::flags::Io::OUT);
+                    }
                 }
                 Err(err) => {
                     if err.raw_os_error() != Some(libc::EAGAIN) {
@@ -308,21 +310,36 @@ impl Client {
     }
 
     fn on_connection_error(&self, err: std::io::Error, msg: &str) {
-        warn!("Got connection error: {:?}", err);
-
-        if let Some(source) = self.inner.source.write().unwrap().take() {
-            let main_loop = self.core().context().main_loop();
-            main_loop.destroy_source(source);
+        let seq = *self.inner.last_in_seq.read().unwrap();
+        if !self.clear_connection() {
+            return;
         }
 
+        warn!("Got connection error: {:?}", err);
+
         let core = &self.core();
-        let seq = *self.inner.last_in_seq.read().unwrap();
         let res = err
             .raw_os_error()
             .unwrap_or(err.kind() as i32)
             .unsigned_abs();
 
         proxy_notify!(core, error, seq, res, msg);
+    }
+
+    fn clear_connection(&self) -> bool {
+        let was_connected = std::mem::replace(&mut *self.inner.connected.write().unwrap(), false);
+
+        if let Some(source) = self.inner.source.write().unwrap().take() {
+            let main_loop = self.core().context().main_loop();
+            main_loop.destroy_source(source);
+        }
+
+        self.inner.stream.write().unwrap().take();
+        self.inner.connection.disconnect();
+        *self.inner.need_flush.write().unwrap() = false;
+        *self.inner.last_in_seq.write().unwrap() = 0;
+
+        was_connected
     }
 
     fn connect_local_socket(
@@ -405,5 +422,150 @@ impl InnerClient {
 
     fn set_core(&self, core: WeakCore) {
         self.core.write().unwrap().replace(core);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{pipe, Read},
+        os::fd::AsRawFd,
+        os::unix::net::{UnixListener, UnixStream},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    use serial_test::serial;
+
+    use crate::{
+        context::Context,
+        properties::Properties,
+        protocol::marshal::Marshallable,
+        proxy::{HasProxy, ProxyEvents},
+    };
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestMessage;
+
+    impl Marshallable for TestMessage {
+        fn opcode(&self) -> u8 {
+            7
+        }
+
+        fn encode(&self, data: &mut [u8]) -> Result<usize, spa::pod::Error> {
+            data[0] = 0x5a;
+            Ok(1)
+        }
+
+        fn decode(_opcode: u8, _data: &[u8]) -> Result<(Self, usize), spa::pod::Error> {
+            unreachable!()
+        }
+    }
+
+    fn send_fd_byte(stream: &UnixStream, fd: &impl AsRawFd) {
+        let byte = [0_u8];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_ptr().cast_mut().cast(),
+            iov_len: byte.len(),
+        };
+        let mut control = [0_usize; 4];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) as _ };
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as _;
+            std::ptr::write(libc::CMSG_DATA(header).cast(), fd.as_raw_fd());
+            assert_eq!(
+                libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL),
+                1
+            );
+        }
+    }
+
+    fn test_core() -> (
+        tempfile::TempDir,
+        main_loop::MainLoop,
+        Context,
+        Core,
+        UnixStream,
+    ) {
+        crate::init();
+        let runtime = tempfile::tempdir().unwrap();
+        let socket_path = runtime.path().join("pipewire-test");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let previous_remote = std::env::var_os("PIPEWIRE_REMOTE");
+        unsafe { std::env::set_var("PIPEWIRE_REMOTE", &socket_path) };
+
+        let properties = Properties::new_vec(vec![(
+            "loop.name".to_string(),
+            "pw-client-terminal-test".to_string(),
+        )]);
+        let main_loop = main_loop::MainLoop::new(&properties).unwrap();
+        let context = Context::new(&main_loop, Properties::new()).unwrap();
+        let core = context.connect(None).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+
+        if let Some(remote) = previous_remote {
+            unsafe { std::env::set_var("PIPEWIRE_REMOTE", remote) };
+        } else {
+            unsafe { std::env::remove_var("PIPEWIRE_REMOTE") };
+        }
+
+        (runtime, main_loop, context, core, peer)
+    }
+
+    #[test]
+    #[serial]
+    fn hup_terminal_cleanup_closes_both_streams_and_all_descriptors_once() {
+        let (_runtime, _main_loop, _context, core, _core_peer) = test_core();
+        let client = Client::new();
+        client.set_core(core.downgrade());
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        client.set_stream(stream).unwrap();
+
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notifications_cb = notifications.clone();
+        core.proxy().add_listener(ProxyEvents {
+            error: Some(Box::new(move |_, _, _| {
+                notifications_cb.fetch_add(1, Ordering::Relaxed);
+            })),
+            ..Default::default()
+        });
+
+        let (mut inbound_reader, inbound_writer) = pipe().unwrap();
+        send_fd_byte(&peer, &inbound_writer);
+        drop(inbound_writer);
+
+        let (mut outbound_reader, outbound_writer) = pipe().unwrap();
+        client
+            .connection()
+            .push_with_owned_fds(3, TestMessage, vec![outbound_writer.into()])
+            .unwrap();
+
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        client.on_remote_data(-1, spa::flags::Io::IN | spa::flags::Io::HUP);
+
+        assert!(!*client.inner.connected.read().unwrap());
+        assert!(client.inner.source.read().unwrap().is_none());
+        assert!(client.inner.stream.read().unwrap().is_none());
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+
+        let mut byte = [0_u8];
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        assert_eq!(inbound_reader.read(&mut byte).unwrap(), 0);
+        assert_eq!(outbound_reader.read(&mut byte).unwrap(), 0);
+
+        client.on_remote_data(-1, spa::flags::Io::HUP);
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
     }
 }

@@ -167,7 +167,9 @@ impl Connection {
 
     pub(crate) fn flush(&self) -> std::io::Result<()> {
         let stream = self.inner.stream.read().unwrap();
-        let stream = stream.as_ref().unwrap();
+        let stream = stream.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "connection has no stream")
+        })?;
         let mut sender = self.inner.sender.write().unwrap();
 
         trace!("flushing {} bytes", sender.queued_bytes());
@@ -254,7 +256,7 @@ fn frame_error(error: FrameError) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::io::{pipe, Read};
     use std::os::fd::AsRawFd;
 
     use pipewire_native_protocol::native::frame::{Header, HEADER_LEN};
@@ -268,6 +270,31 @@ mod tests {
         crate::init();
         Connection {
             inner: new_refcounted(InnerConnection::new(Some(stream))),
+        }
+    }
+
+    fn send_fd_byte(stream: &UnixStream, fd: &impl AsRawFd) {
+        let byte = [0_u8];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_ptr().cast_mut().cast(),
+            iov_len: byte.len(),
+        };
+        let mut control = [0_usize; 4];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as _) as _ };
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as _) as _;
+            std::ptr::write(libc::CMSG_DATA(header).cast(), fd.as_raw_fd());
+            assert_eq!(
+                libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL),
+                1
+            );
         }
     }
 
@@ -394,5 +421,48 @@ mod tests {
             .is_err());
 
         assert_eq!(connection.receive_frame().unwrap().header().seq, 10);
+    }
+
+    #[test]
+    fn disconnect_closes_stream_and_buffered_and_queued_descriptors() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let connection = connection(stream);
+
+        let (mut inbound_reader, inbound_writer) = pipe().unwrap();
+        send_fd_byte(&peer, &inbound_writer);
+        drop(inbound_writer);
+        assert_eq!(
+            connection.receive_frame().unwrap_err().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        assert_eq!(
+            connection.inner.receiver.read().unwrap().buffered_bytes(),
+            1
+        );
+        assert_eq!(connection.inner.receiver.read().unwrap().pending_fds(), 1);
+
+        let (mut outbound_reader, outbound_writer) = pipe().unwrap();
+        connection
+            .push_with_owned_fds(3, TestMessage(vec![0x5a]), vec![outbound_writer.into()])
+            .unwrap();
+        assert_eq!(connection.inner.sender.read().unwrap().queued_fds(), 1);
+
+        connection.disconnect();
+        connection.disconnect();
+
+        assert!(connection.inner.stream.read().unwrap().is_none());
+        assert_eq!(
+            connection.inner.receiver.read().unwrap().buffered_bytes(),
+            0
+        );
+        assert_eq!(connection.inner.receiver.read().unwrap().pending_fds(), 0);
+        assert!(connection.inner.sender.read().unwrap().is_empty());
+        assert_eq!(connection.inner.sender.read().unwrap().queued_fds(), 0);
+
+        let mut byte = [0_u8];
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        assert_eq!(inbound_reader.read(&mut byte).unwrap(), 0);
+        assert_eq!(outbound_reader.read(&mut byte).unwrap(), 0);
     }
 }
