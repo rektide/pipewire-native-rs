@@ -1,0 +1,5 @@
+/artifacts/
+/target/
+/corpus/*/*
+!/corpus/pod_decode/
+!/corpus/pod_decode/seed-*

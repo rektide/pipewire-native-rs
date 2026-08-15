@@ -1,0 +1,22 @@
+[package]
+name = "pipewire-native-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pipewire-native-spa = { path = "../spa" }
+
+[[bin]]
+name = "pod_decode"
+path = "fuzz_targets/pod_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
