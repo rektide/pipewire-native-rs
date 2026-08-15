@@ -22,6 +22,10 @@ struct TestStruct {
     hooks: Arc<Mutex<HookList<TestEvents>>>,
 }
 
+struct ReentrantEvents {
+    event: Option<Box<dyn FnMut()>>,
+}
+
 #[test]
 fn test_hooks() {
     let accum = Rc::new(Mutex::new(0i32));
@@ -66,4 +70,112 @@ fn test_hooks() {
 
     emit_hook!(this.hooks, constie, 1);
     assert_eq!(*accum.lock().unwrap(), 3);
+}
+
+#[test]
+fn hook_can_remove_itself_during_dispatch() {
+    let hooks = HookList::<ReentrantEvents>::new();
+    let id = Arc::new(Mutex::new(None));
+    let calls = Arc::new(Mutex::new(0));
+
+    let callback_hooks = hooks.clone();
+    let callback_id = id.clone();
+    let callback_calls = calls.clone();
+    let hook_id = hooks.lock().unwrap().append(ReentrantEvents {
+        event: Some(Box::new(move || {
+            *callback_calls.lock().unwrap() += 1;
+            callback_hooks
+                .lock()
+                .unwrap()
+                .remove(callback_id.lock().unwrap().unwrap());
+        })),
+    });
+    *id.lock().unwrap() = Some(hook_id);
+
+    emit_hook!(hooks, event);
+    emit_hook!(hooks, event);
+
+    assert_eq!(*calls.lock().unwrap(), 1);
+}
+
+#[test]
+fn hook_added_during_dispatch_runs_on_the_next_emission() {
+    let hooks = HookList::<ReentrantEvents>::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let added = Arc::new(Mutex::new(false));
+
+    let callback_hooks = hooks.clone();
+    let callback_calls = calls.clone();
+    let callback_added = added.clone();
+    hooks.lock().unwrap().append(ReentrantEvents {
+        event: Some(Box::new(move || {
+            callback_calls.lock().unwrap().push("first");
+            let mut added = callback_added.lock().unwrap();
+            if !*added {
+                *added = true;
+                let added_calls = callback_calls.clone();
+                callback_hooks.lock().unwrap().append(ReentrantEvents {
+                    event: Some(Box::new(move || {
+                        added_calls.lock().unwrap().push("added");
+                    })),
+                });
+            }
+        })),
+    });
+
+    let second_calls = calls.clone();
+    hooks.lock().unwrap().append(ReentrantEvents {
+        event: Some(Box::new(move || {
+            second_calls.lock().unwrap().push("second");
+        })),
+    });
+
+    emit_hook!(hooks, event);
+    assert_eq!(*calls.lock().unwrap(), ["first", "second"]);
+
+    emit_hook!(hooks, event);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["first", "second", "first", "second", "added"]
+    );
+}
+
+#[test]
+fn nested_emission_skips_the_active_hook() {
+    let hooks = HookList::<ReentrantEvents>::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let nested = Arc::new(Mutex::new(false));
+
+    let callback_hooks = hooks.clone();
+    let callback_calls = calls.clone();
+    let callback_nested = nested.clone();
+    hooks.lock().unwrap().append(ReentrantEvents {
+        event: Some(Box::new(move || {
+            callback_calls.lock().unwrap().push("first-start");
+            let should_emit = {
+                let mut nested = callback_nested.lock().unwrap();
+                let should_emit = !*nested;
+                *nested = true;
+                should_emit
+            };
+            if should_emit {
+                emit_hook!(callback_hooks, event);
+            }
+            callback_calls.lock().unwrap().push("first-end");
+        })),
+    });
+
+    let second_calls = calls.clone();
+    hooks.lock().unwrap().append(ReentrantEvents {
+        event: Some(Box::new(move || {
+            second_calls.lock().unwrap().push("second");
+        })),
+    });
+
+    emit_hook!(hooks, event);
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["first-start", "second", "first-end", "second"]
+    );
 }

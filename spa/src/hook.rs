@@ -11,12 +11,38 @@ pub type HookId = u32;
 
 pub struct Hook<T> {
     id: HookId,
-    callbacks: T,
+    callbacks: Option<T>,
 }
 
 impl<T> Hook<T> {
     pub fn callbacks(&mut self) -> &mut T {
-        &mut self.callbacks
+        self.callbacks
+            .as_mut()
+            .expect("callbacks are unavailable while a hook is being dispatched")
+    }
+}
+
+#[doc(hidden)]
+pub struct HookDispatch<T> {
+    hook_list: Arc<Mutex<HookList<T>>>,
+    id: HookId,
+    callbacks: Option<T>,
+}
+
+impl<T> HookDispatch<T> {
+    pub fn callbacks(&mut self) -> &mut T {
+        self.callbacks.as_mut().unwrap()
+    }
+}
+
+impl<T> Drop for HookDispatch<T> {
+    fn drop(&mut self) {
+        let callbacks = self.callbacks.take().unwrap();
+        let mut hook_list = self.hook_list.lock().unwrap();
+
+        if let Some(hook) = hook_list.hooks.iter_mut().find(|hook| hook.id == self.id) {
+            hook.callbacks = Some(callbacks);
+        }
     }
 }
 
@@ -56,7 +82,10 @@ impl<T> HookList<T> {
 
     pub fn prepend(&mut self, callbacks: T) -> HookId {
         let id = self.next_id;
-        let hook = Hook { id, callbacks };
+        let hook = Hook {
+            id,
+            callbacks: Some(callbacks),
+        };
 
         self.hooks.push_front(hook);
         self.next_id += 1;
@@ -66,7 +95,10 @@ impl<T> HookList<T> {
 
     pub fn append(&mut self, callbacks: T) -> HookId {
         let id = self.next_id;
-        let hook = Hook { id, callbacks };
+        let hook = Hook {
+            id,
+            callbacks: Some(callbacks),
+        };
 
         self.hooks.push_back(hook);
         self.next_id += 1;
@@ -85,7 +117,38 @@ impl<T> HookList<T> {
         self.hooks
             .extract_if(|h| h.id == id)
             .next()
-            .map(|h| h.callbacks)
+            .and_then(|h| h.callbacks)
+    }
+
+    #[doc(hidden)]
+    pub fn dispatch_ids(hook_list: &Arc<Mutex<Self>>) -> Vec<HookId> {
+        // Dispatch uses a stable ID snapshot. Removals take effect immediately, while additions
+        // wait for the next emission. A nested emission skips callbacks already in flight.
+        hook_list
+            .lock()
+            .unwrap()
+            .hooks
+            .iter()
+            .map(|hook| hook.id)
+            .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn dispatch(hook_list: &Arc<Mutex<Self>>, id: HookId) -> Option<HookDispatch<T>> {
+        let callbacks = hook_list
+            .lock()
+            .unwrap()
+            .hooks
+            .iter_mut()
+            .find(|hook| hook.id == id)?
+            .callbacks
+            .take()?;
+
+        Some(HookDispatch {
+            hook_list: hook_list.clone(),
+            id,
+            callbacks: Some(callbacks),
+        })
     }
 }
 
@@ -94,11 +157,13 @@ macro_rules! emit_hook {
     ($hook_list:expr, $method:ident) => {
         {
             let _h = $hook_list.clone();
-            let mut _h = _h.lock();
-            let _hooks = _h.as_deref_mut().unwrap();
+            let _ids = $crate::hook::HookList::dispatch_ids(&_h);
 
-            for h in _hooks.iter_mut() {
-                if let Some(_method) = h.callbacks().$method.as_deref_mut() {
+            for _id in _ids {
+                let Some(mut _hook) = $crate::hook::HookList::dispatch(&_h, _id) else {
+                    continue;
+                };
+                if let Some(_method) = _hook.callbacks().$method.as_deref_mut() {
                     (_method)();
                 }
             }
@@ -107,11 +172,13 @@ macro_rules! emit_hook {
     ($hook_list:expr, $method:ident, $($args:tt)*) => {
         {
             let _h = $hook_list.clone();
-            let mut _h = _h.lock();
-            let _hooks = _h.as_deref_mut().unwrap();
+            let _ids = $crate::hook::HookList::dispatch_ids(&_h);
 
-            for h in _hooks.iter_mut() {
-                if let Some(_method) = h.callbacks().$method.as_deref_mut() {
+            for _id in _ids {
+                let Some(mut _hook) = $crate::hook::HookList::dispatch(&_h, _id) else {
+                    continue;
+                };
+                if let Some(_method) = _hook.callbacks().$method.as_deref_mut() {
                     (_method)($($args)*);
                 }
             }
