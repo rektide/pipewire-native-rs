@@ -848,6 +848,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pipewire-native-protocol"
+version = "0.1.4"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "pipewire-native-server"
 version = "0.1.4"
 dependencies = [
