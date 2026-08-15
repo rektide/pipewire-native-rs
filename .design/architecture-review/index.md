@@ -4,11 +4,14 @@
 
 - [`review-rekick0.oc.md`](/.design/architecture-review/review-rekick0.oc.md): operational re-kickoff centered on one ownership-safe, typed ClientNode cycle.
 - [`review0.oc.md`](/.design/architecture-review/review0.oc.md): full codebase review covering architecture, unsafe code, protocol framing, tests, documentation, and alternative module seams.
+- [`advance0.oc.md`](/.design/architecture-review/advance0.oc.md): implementation, verification, independent-review feedback, and handoff record for the first multi-stream advancement wave.
 
 ## Focused Designs
 
 - [`frame0.gpt56.md`](/.design/native-frame/frame0.gpt56.md): canonical native frame and SCM_RIGHTS ownership interface, state machines, migration sequence, and adversarial test matrix.
-- [`threading0.gpt56.md`](/.design/threading-contract/threading0.gpt56.md): threading and auto-trait contract. This entry is reserved for the active design wave and should be updated if its final model suffix differs.
+- [`threading0.gpt56.md`](/.design/threading-contract/threading0.gpt56.md): threading and auto-trait contract, including the loop-local ownership model, bounded cross-thread handles, unsafe-trait inventory, and migration sequence.
+- [`inventory0.gpt56.md`](/.design/client-node-protocol/inventory0.gpt56.md): upstream ClientNode v6 opcode, POD, activation, buffer, processing, and peer-signaling inventory for the minimum playback path.
+- [`session0.gpt56s.md`](/.design/client-node-session/session0.gpt56s.md): typed per-node session, generation retirement, activation atomics, port IO/buffer cycle, peer signaling, teardown, and runtime-adapter design.
 
 ## Historical Discovery
 
