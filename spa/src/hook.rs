@@ -4,7 +4,8 @@
 
 use std::{
     collections::LinkedList,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
+    thread::{self, ThreadId},
 };
 
 pub type HookId = u32;
@@ -38,7 +39,10 @@ impl<T> HookDispatch<T> {
 impl<T> Drop for HookDispatch<T> {
     fn drop(&mut self) {
         let callbacks = self.callbacks.take().unwrap();
-        let mut hook_list = self.hook_list.lock().unwrap();
+        let mut hook_list = self
+            .hook_list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(hook) = hook_list.hooks.iter_mut().find(|hook| hook.id == self.id) {
             hook.callbacks = Some(callbacks);
@@ -46,9 +50,32 @@ impl<T> Drop for HookDispatch<T> {
     }
 }
 
+#[doc(hidden)]
+pub struct HookEmission<T> {
+    hook_list: Arc<Mutex<HookList<T>>>,
+}
+
+impl<T> Drop for HookEmission<T> {
+    fn drop(&mut self) {
+        let mut hook_list = self
+            .hook_list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        hook_list.emission_depth -= 1;
+        if hook_list.emission_depth == 0 {
+            hook_list.emission_owner = None;
+            hook_list.emission_ready.notify_one();
+        }
+    }
+}
+
 pub struct HookList<T> {
     hooks: LinkedList<Hook<T>>,
     next_id: HookId,
+    emission_owner: Option<ThreadId>,
+    emission_depth: usize,
+    emission_ready: Arc<Condvar>,
 }
 
 impl<T> HookList<T> {
@@ -77,6 +104,9 @@ impl<T> HookList<T> {
         Arc::new(Mutex::new(HookList {
             hooks: LinkedList::new(),
             next_id: 0,
+            emission_owner: None,
+            emission_depth: 0,
+            emission_ready: Arc::new(Condvar::new()),
         }))
     }
 
@@ -121,12 +151,47 @@ impl<T> HookList<T> {
     }
 
     #[doc(hidden)]
+    pub fn begin_dispatch(hook_list: &Arc<Mutex<Self>>) -> HookEmission<T> {
+        // External emissions serialize for their full snapshot, but same-thread recursion is
+        // allowed so nested emissions can run inactive hooks without holding the list mutex.
+        let thread_id = thread::current().id();
+        let mut list = hook_list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        loop {
+            match list.emission_owner {
+                None => {
+                    list.emission_owner = Some(thread_id);
+                    list.emission_depth = 1;
+                    break;
+                }
+                Some(owner) if owner == thread_id => {
+                    list.emission_depth += 1;
+                    break;
+                }
+                Some(_) => {
+                    let emission_ready = list.emission_ready.clone();
+                    list = emission_ready
+                        .wait(list)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
+        }
+
+        drop(list);
+        HookEmission {
+            hook_list: hook_list.clone(),
+        }
+    }
+
+    #[doc(hidden)]
     pub fn dispatch_ids(hook_list: &Arc<Mutex<Self>>) -> Vec<HookId> {
         // Dispatch uses a stable ID snapshot. Removals take effect immediately, while additions
-        // wait for the next emission. A nested emission skips callbacks already in flight.
+        // wait for the next emission.
         hook_list
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hooks
             .iter()
             .map(|hook| hook.id)
@@ -137,7 +202,7 @@ impl<T> HookList<T> {
     pub fn dispatch(hook_list: &Arc<Mutex<Self>>, id: HookId) -> Option<HookDispatch<T>> {
         let callbacks = hook_list
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hooks
             .iter_mut()
             .find(|hook| hook.id == id)?
@@ -157,6 +222,7 @@ macro_rules! emit_hook {
     ($hook_list:expr, $method:ident) => {
         {
             let _h = $hook_list.clone();
+            let _emission = $crate::hook::HookList::begin_dispatch(&_h);
             let _ids = $crate::hook::HookList::dispatch_ids(&_h);
 
             for _id in _ids {
@@ -172,6 +238,7 @@ macro_rules! emit_hook {
     ($hook_list:expr, $method:ident, $($args:tt)*) => {
         {
             let _h = $hook_list.clone();
+            let _emission = $crate::hook::HookList::begin_dispatch(&_h);
             let _ids = $crate::hook::HookList::dispatch_ids(&_h);
 
             for _id in _ids {
