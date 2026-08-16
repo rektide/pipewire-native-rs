@@ -128,16 +128,16 @@ impl std::error::Error for PortError {}
 
 /// ABI-checked view over one synchronous `spa_io_buffers` record.
 #[derive(Debug)]
-pub struct BuffersIoView<'a> {
+pub struct BuffersIoView {
     base: NonNull<u8>,
-    _region: PhantomData<&'a UnsafeCell<[u8]>>,
+    _not_sync: PhantomData<UnsafeCell<()>>,
 }
 
 // SAFETY: moving the raw field view does not access memory. Unsafe construction
 // requires the caller to transfer protocol ownership with the view.
-unsafe impl Send for BuffersIoView<'_> {}
+unsafe impl Send for BuffersIoView {}
 
-impl<'a> BuffersIoView<'a> {
+impl BuffersIoView {
     /// Constructs a synchronous buffer IO view.
     ///
     /// # Safety
@@ -163,7 +163,7 @@ impl<'a> BuffersIoView<'a> {
         )?;
         Ok(Self {
             base,
-            _region: PhantomData,
+            _not_sync: PhantomData,
         })
     }
 
@@ -214,14 +214,14 @@ impl<'a> BuffersIoView<'a> {
 
 /// ABI-checked view over one `spa_chunk` record.
 #[derive(Debug)]
-pub struct ChunkView<'a> {
+pub struct ChunkView {
     base: NonNull<u8>,
-    _region: PhantomData<&'a UnsafeCell<[u8]>>,
+    _not_sync: PhantomData<UnsafeCell<()>>,
 }
 
-unsafe impl Send for ChunkView<'_> {}
+unsafe impl Send for ChunkView {}
 
-impl<'a> ChunkView<'a> {
+impl ChunkView {
     /// Constructs a chunk field view over externally shared memory.
     ///
     /// # Safety
@@ -234,7 +234,7 @@ impl<'a> ChunkView<'a> {
         let base = checked_record(base, len, abi::CHUNK_SIZE, abi::CHUNK_ALIGN, "spa_chunk")?;
         Ok(Self {
             base,
-            _region: PhantomData,
+            _not_sync: PhantomData,
         })
     }
 
@@ -288,17 +288,17 @@ impl<'a> ChunkView<'a> {
 
 /// One checked writable output data plane and its separately shared chunk.
 #[derive(Debug)]
-pub struct OutputBuffer<'a> {
-    chunk: ChunkView<'a>,
+pub struct OutputBuffer {
+    chunk: ChunkView,
     media: NonNull<u8>,
     max_size: usize,
     data_offset: usize,
-    _media: PhantomData<&'a mut [u8]>,
+    _not_sync: PhantomData<UnsafeCell<()>>,
 }
 
-unsafe impl Send for OutputBuffer<'_> {}
+unsafe impl Send for OutputBuffer {}
 
-impl<'a> OutputBuffer<'a> {
+impl OutputBuffer {
     /// Binds a chunk to one writable media plane.
     ///
     /// # Safety
@@ -362,7 +362,7 @@ impl<'a> OutputBuffer<'a> {
             media,
             max_size,
             data_offset,
-            _media: PhantomData,
+            _not_sync: PhantomData,
         })
     }
 
@@ -439,10 +439,10 @@ mod tests {
 
     use super::{BufferStatus, BuffersIoView, ChunkState, OutputBuffer, PortError, PortIoType};
 
-    assert_impl_all!(BuffersIoView<'static>: Send);
-    assert_not_impl_any!(BuffersIoView<'static>: Sync);
-    assert_impl_all!(OutputBuffer<'static>: Send);
-    assert_not_impl_any!(OutputBuffer<'static>: Sync);
+    assert_impl_all!(BuffersIoView: Send);
+    assert_not_impl_any!(BuffersIoView: Sync);
+    assert_impl_all!(OutputBuffer: Send);
+    assert_not_impl_any!(OutputBuffer: Sync);
 
     #[repr(C, align(4))]
     struct Aligned<const N: usize>([u8; N]);
