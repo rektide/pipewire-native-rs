@@ -630,6 +630,84 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_replacement_deregisters_old_trigger_before_new_wakes() {
+        let (session, memory, _old_key, old_trigger, _completion, _, _) = configure_running();
+        let replacement_key = memory.add(5, ActivationView::required_size());
+        {
+            let mut activation = memory
+                .map(replacement_key, 0, ActivationView::required_size(), true)
+                .unwrap();
+            let mut guard = activation.borrow();
+            let bytes = unsafe { guard.bytes_mut() };
+            bytes[0..4].copy_from_slice(&(ActivationStatus::Inactive as u32).to_ne_bytes());
+            bytes[544..548].copy_from_slice(&1_u32.to_ne_bytes());
+        }
+        let (new_trigger_fd, new_trigger) = event_pair();
+        let (new_completion_fd, new_completion) = event_pair();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handle = spawn_tokio_with_clock(
+            session,
+            Box::new(CountingProcess(Arc::clone(&calls))),
+            8,
+            FixedClock(VecDeque::from([31, 32])),
+        )
+        .unwrap();
+        handle
+            .command_sender()
+            .try_send(SessionCommand::ReplaceTransport(TransportDescriptor {
+                trigger_fd: new_trigger_fd,
+                completion_fd: new_completion_fd,
+                activation: RegionRef {
+                    memory: MemoryId(5),
+                    offset: 0,
+                    len: ActivationView::required_size(),
+                },
+            }))
+            .unwrap();
+
+        for _ in 0..100 {
+            let mut activation = memory
+                .map(replacement_key, 0, ActivationView::required_size(), true)
+                .unwrap();
+            let view = unsafe {
+                ActivationView::from_raw_parts(activation.as_mut_ptr(), activation.len()).unwrap()
+            };
+            if view.status().unwrap() == ActivationStatus::Finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        old_trigger.signal(1).unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        {
+            let mut activation = memory
+                .map(replacement_key, 0, ActivationView::required_size(), true)
+                .unwrap();
+            let mut guard = activation.borrow();
+            (unsafe { guard.bytes_mut() })[0..4]
+                .copy_from_slice(&(ActivationStatus::Triggered as u32).to_ne_bytes());
+        }
+        new_trigger.signal(1).unwrap();
+        for _ in 0..100 {
+            if calls.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            new_completion.drain().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        handle.shutdown().await.unwrap();
+    }
+
     #[test]
     fn full_and_closed_queues_drop_owned_fds_once_and_terminate() {
         for closed in [false, true] {
@@ -645,6 +723,8 @@ mod tests {
             let (completion, completion_observer) = event_pair();
             let trigger_raw = trigger.as_raw_fd();
             let completion_raw = completion.as_raw_fd();
+            let trigger_identity = fdinfo(trigger_raw).unwrap();
+            let completion_identity = fdinfo(completion_raw).unwrap();
             let error = sender
                 .try_send(SessionCommand::ReplaceTransport(TransportDescriptor {
                     trigger_fd: trigger,
@@ -672,8 +752,14 @@ mod tests {
                 completion_observer.drain().unwrap_err().kind(),
                 io::ErrorKind::WouldBlock
             );
-            assert!(unsafe { libc::fcntl(trigger_raw, libc::F_GETFD) } < 0);
-            assert!(unsafe { libc::fcntl(completion_raw, libc::F_GETFD) } < 0);
+            assert_ne!(
+                fdinfo(trigger_raw).as_deref(),
+                Some(trigger_identity.as_str())
+            );
+            assert_ne!(
+                fdinfo(completion_raw).as_deref(),
+                Some(completion_identity.as_str())
+            );
         }
     }
 }
