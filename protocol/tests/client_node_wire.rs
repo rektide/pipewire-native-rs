@@ -91,7 +91,20 @@ fn selected_methods_round_trip_and_set_active_matches_pinned_bytes() {
                 params: vec![ParamInfo { id: 4, flags: 2 }],
             }),
         }),
+        Method::Update(Update {
+            change_mask: 0,
+            params: vec![],
+            info: None,
+        }),
+        Method::PortUpdate(PortUpdate {
+            direction: Direction::Output,
+            port_id: 0,
+            change_mask: 0,
+            params: vec![],
+            info: None,
+        }),
         Method::SetActive(SetActive { active: true }),
+        Method::SetActive(SetActive { active: false }),
     ];
 
     for method in methods {
@@ -204,6 +217,10 @@ fn selected_non_fd_events_round_trip_with_clear_forms() {
         (
             wire::event::COMMAND,
             wire::encode_command(Command::Pause).unwrap(),
+        ),
+        (
+            wire::event::COMMAND,
+            wire::encode_command(Command::Suspend).unwrap(),
         ),
     ];
 
