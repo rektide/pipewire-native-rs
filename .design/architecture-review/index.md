@@ -2,6 +2,7 @@
 
 ## Start Here
 
+- [`Forward roadmap`](/.design/fwd/README.md): product and architecture sequence from the implemented foundations to ClientNode playback, runtime parity, upstream compatibility, and later media capabilities.
 - [`review-rekick0.oc.md`](/.design/architecture-review/review-rekick0.oc.md): operational re-kickoff centered on one ownership-safe, typed ClientNode cycle.
 - [`review0.oc.md`](/.design/architecture-review/review0.oc.md): full codebase review covering architecture, unsafe code, protocol framing, tests, documentation, and alternative module seams.
 - [`advance0.oc.md`](/.design/architecture-review/advance0.oc.md): implementation, verification, independent-review feedback, and handoff record for the first multi-stream advancement wave.
