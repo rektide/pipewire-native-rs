@@ -12,7 +12,10 @@ mod events;
 
 pub use events::{ActivationRegion, AddMemEvent, MemoryType, RemoveMemEvent, TransportEvent};
 
-/// Mutable bridge state that accumulates control-plane data-plane events.
+/// Legacy configuration accumulator retained until the WAV example migrates.
+///
+/// It cannot process cycles; production ClientNode processing uses
+/// [`crate::session::owner::ClientNodeSession`] and [`crate::runtime`].
 #[derive(Debug, Default)]
 pub struct ControlPlaneState {
     memory: MemoryRegistry,

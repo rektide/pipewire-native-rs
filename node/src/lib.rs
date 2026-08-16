@@ -9,7 +9,7 @@
 
 /// Control-plane event descriptors and bridge state.
 pub mod control;
-/// Runtime worker that drives process callbacks from transport signals.
+/// Runtime adapters that serialize semantic commands and process wake hints.
 pub mod runtime;
 /// ClientNode session-domain primitives.
 pub mod session;

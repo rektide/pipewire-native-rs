@@ -216,7 +216,7 @@ pub struct ProcessError {
 }
 
 /// Runtime-independent output callback invoked only after an activation claim.
-pub trait OutputProcess {
+pub trait OutputProcess: Send + 'static {
     /// Fill and commit the server-selected output cycle.
     fn process(&mut self, cycle: OutputCycle<'_>) -> Result<CommittedOutput, ProcessError>;
 }

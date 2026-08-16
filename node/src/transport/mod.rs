@@ -31,11 +31,14 @@ pub struct TransportConfig {
 }
 
 /// Bound transport with mapped activation memory and signal handles.
+///
+/// This legacy configuration probe cannot process ClientNode cycles. Use
+/// [`crate::session::owner::ClientNodeSession`] through [`crate::runtime`] instead.
 #[derive(Debug)]
 pub struct BoundTransport {
     trigger: EventFd,
-    complete: EventFd,
-    activation: MappedRegion,
+    _complete: EventFd,
+    _activation: MappedRegion,
 }
 
 impl BoundTransport {
@@ -63,8 +66,8 @@ impl BoundTransport {
 
         Ok(Self {
             trigger: EventFd::from_owned_fd(config.read_fd)?,
-            complete: EventFd::from_owned_fd(config.write_fd)?,
-            activation,
+            _complete: EventFd::from_owned_fd(config.write_fd)?,
+            _activation: activation,
         })
     }
 
@@ -76,26 +79,6 @@ impl BoundTransport {
     /// Drains one process-wake counter without waiting.
     pub fn drain_cycle(&self) -> io::Result<u64> {
         self.trigger.drain()
-    }
-
-    /// Signals processing completion.
-    pub fn signal_complete(&self, count: u64) -> io::Result<()> {
-        self.complete.signal(count)
-    }
-
-    /// Returns the raw activation mapping.
-    ///
-    /// Constructing references to its bytes remains unsafe because PipeWire may
-    /// access the same shared memory and imported files may not be shrink-sealed.
-    pub fn activation(&self) -> &MappedRegion {
-        &self.activation
-    }
-
-    /// Returns the raw activation mapping with exclusive access to this mapping owner.
-    ///
-    /// This borrow does not prove exclusivity from duplicate mappings or PipeWire.
-    pub fn activation_mut(&mut self) -> &mut MappedRegion {
-        &mut self.activation
     }
 }
 
@@ -132,8 +115,8 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(transport.activation().len(), 256);
-            assert!(transport.activation().seal_status().prevents_shrink());
+            assert_eq!(transport._activation.len(), 256);
+            assert!(transport._activation.seal_status().prevents_shrink());
         });
     }
 
