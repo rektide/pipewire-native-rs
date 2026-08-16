@@ -60,8 +60,8 @@ struct MemoryEntry {
 /// Stable Linux identity of a shared-memory backing object.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BackingIdentity {
-    device: u64,
-    inode: u64,
+    device: libc::dev_t,
+    inode: libc::ino_t,
 }
 
 /// An absolute byte interval in one backing object.
@@ -501,8 +501,8 @@ fn file_identity(fd: std::os::fd::RawFd) -> std::io::Result<(usize, BackingIdent
     Ok((
         len,
         BackingIdentity {
-            device: stat.st_dev as u64,
-            inode: stat.st_ino as u64,
+            device: stat.st_dev,
+            inode: stat.st_ino,
         },
     ))
 }

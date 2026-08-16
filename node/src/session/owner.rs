@@ -772,13 +772,8 @@ mod tests {
             let fd = create_memfd("session-alias", len).unwrap();
             let mut pool = self.0.borrow_mut();
             ids.iter()
-                .enumerate()
-                .map(|(index, id)| {
-                    let imported = if index + 1 == ids.len() {
-                        fd.try_clone().unwrap()
-                    } else {
-                        fd.try_clone().unwrap()
-                    };
+                .map(|id| {
+                    let imported = fd.try_clone().unwrap();
                     pool.add(MemoryId(*id), data_type::MEM_FD, 0, imported)
                         .unwrap()
                 })
