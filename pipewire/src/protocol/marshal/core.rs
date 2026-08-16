@@ -288,12 +288,7 @@ impl Events {
                 object_notify!(core, bound_id, bound.id as Id, bound.global_id as Id);
             }
             Events::AddMem(add_mem) => {
-                let index = u32::try_from(add_mem.fd.0).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Core::AddMem has negative fd index {}", add_mem.fd.0),
-                    )
-                })?;
+                let index = add_mem_fd_index(add_mem.fd.0)?;
                 let fd = message.take_fd(index)?;
                 core.import_memory(add_mem.id as Id, add_mem.type_.0, fd, add_mem.flags as u32)?;
             }
@@ -314,5 +309,28 @@ impl Events {
         }
 
         Ok(())
+    }
+}
+
+fn add_mem_fd_index(value: i64) -> std::io::Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Core::AddMem has invalid fd index {value}"),
+        )
+    })
+}
+
+#[cfg(test)]
+mod fd_index_tests {
+    use super::add_mem_fd_index;
+
+    #[test]
+    fn add_mem_narrows_only_at_frame_lookup() {
+        assert_eq!(add_mem_fd_index(0).unwrap(), 0);
+        assert_eq!(add_mem_fd_index(u32::MAX as i64).unwrap(), u32::MAX);
+        assert!(add_mem_fd_index(-1).is_err());
+        assert!(add_mem_fd_index(-2).is_err());
+        assert!(add_mem_fd_index(0x1_0000_0000).is_err());
     }
 }

@@ -706,6 +706,118 @@ fn hostile_shapes_counts_types_ranges_and_descriptor_tables_fail() {
 }
 
 #[test]
+fn configured_limits_and_partial_sentinels_are_enforced() {
+    let one_param = Method::Update(Update {
+        change_mask: 1,
+        params: vec![raw_object(0x40003, 4)],
+        info: None,
+    });
+    let limits = Limits {
+        max_params: 0,
+        ..Limits::default()
+    };
+    assert!(wire::decode_method(
+        one_param.opcode(),
+        &wire::encode_method(&one_param).unwrap(),
+        limits,
+    )
+    .is_err());
+
+    let info = Method::Update(Update {
+        change_mask: 1,
+        params: vec![],
+        info: Some(NodeInfo {
+            max_input_ports: 0,
+            max_output_ports: 1,
+            change_mask: 6,
+            flags: 0,
+            properties: vec![("key".into(), "value".into())],
+            params: vec![ParamInfo { id: 4, flags: 2 }],
+        }),
+    });
+    for limits in [
+        Limits {
+            max_properties: 0,
+            ..Limits::default()
+        },
+        Limits {
+            max_param_info: 0,
+            ..Limits::default()
+        },
+    ] {
+        assert!(
+            wire::decode_method(info.opcode(), &wire::encode_method(&info).unwrap(), limits,)
+                .is_err()
+        );
+    }
+
+    let buffers = wire::encode_port_use_buffers(&PortUseBuffers {
+        direction: Direction::Output,
+        port_id: 0,
+        mix_id: None,
+        flags: 0,
+        buffers: vec![BufferDescriptor {
+            metadata: RegionRef {
+                memory_id: 1,
+                offset: 0,
+                size: 64,
+            },
+            metas: vec![MetaDescriptor {
+                type_id: 1,
+                size: 16,
+            }],
+            datas: vec![DataDescriptor {
+                type_id: 3,
+                data_id: 2,
+                flags: 0,
+                map_offset: 0,
+                max_size: 32,
+            }],
+        }],
+    })
+    .unwrap();
+    for limits in [
+        Limits {
+            max_metas: 0,
+            ..Limits::default()
+        },
+        Limits {
+            max_datas: 0,
+            ..Limits::default()
+        },
+    ] {
+        assert!(wire::decode_event(
+            wire::event::PORT_USE_BUFFERS,
+            &buffers,
+            &mut frame_fds(vec![]),
+            limits,
+        )
+        .is_err());
+    }
+
+    let mut partial_io = wire::encode_port_set_io(PortSetIo::Set {
+        direction: Direction::Output,
+        port_id: 0,
+        mix_id: None,
+        io_id: wire::SPA_IO_BUFFERS,
+        region: RegionRef {
+            memory_id: 13,
+            offset: 8,
+            size: 8,
+        },
+    })
+    .unwrap();
+    partial_io[80..84].copy_from_slice(&u32::MAX.to_ne_bytes());
+    assert!(wire::decode_event(
+        wire::event::PORT_SET_IO,
+        &partial_io,
+        &mut frame_fds(vec![]),
+        Limits::default(),
+    )
+    .is_err());
+}
+
+#[test]
 fn unknown_event_is_frame_local_and_drops_its_descriptors() {
     let (mut reader, writer) = pipe_fd();
     let mut fds = frame_fds(vec![writer]);
