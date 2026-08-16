@@ -64,9 +64,7 @@ impl NodeRuntime {
     }
 }
 
-async fn wait_eventfd(
-    trigger: &AsyncFd<crate::signal::EventFd>,
-) -> io::Result<u64> {
+async fn wait_eventfd(trigger: &AsyncFd<crate::signal::EventFd>) -> io::Result<u64> {
     loop {
         let mut ready = trigger.readable().await?;
         match trigger.get_ref().drain() {

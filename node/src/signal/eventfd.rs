@@ -141,7 +141,10 @@ mod tests {
     #[test]
     fn signals_and_drains_counter() {
         let event = EventFd::new().unwrap();
-        assert_eq!(event.drain().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            event.drain().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         event.signal(7).unwrap();
         assert_eq!(event.drain().unwrap(), 7);
     }
