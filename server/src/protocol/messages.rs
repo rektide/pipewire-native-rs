@@ -458,9 +458,14 @@ fn pod_error(err: spa::pod::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use pipewire_native_protocol::wire::client_node::{Method, SetActive};
+
     use super::{
-        decode_core_add_mem_payload, decode_inbound_message, encode_core_add_mem_payload,
-        encode_core_sync_payload, spa_data_type, InboundMessage, CORE_ID,
+        decode_core_add_mem_payload, decode_inbound_message, decode_inbound_message_with_routes,
+        encode_core_add_mem_payload, encode_core_sync_payload, encode_struct_payload,
+        spa_data_type, InboundMessage, ObjectRoute, CORE_ID,
     };
 
     #[test]
@@ -493,5 +498,55 @@ mod tests {
 
         payload[48..56].copy_from_slice(&(-2_i64).to_ne_bytes());
         assert_eq!(decode_core_add_mem_payload(&payload).unwrap().fd_index, -2);
+    }
+
+    #[test]
+    fn routed_decode_is_interface_specific_and_preserves_method() {
+        let set_active = pipewire_native_protocol::wire::client_node::encode_method(
+            &Method::SetActive(SetActive { active: false }),
+        )
+        .unwrap();
+        let mut routes = BTreeMap::from([(
+            42,
+            ObjectRoute {
+                interface: pipewire_native_protocol::wire::client_node::INTERFACE.into(),
+                version: 6,
+            },
+        )]);
+        assert!(matches!(
+            decode_inbound_message_with_routes(42, 4, &set_active, &routes).unwrap(),
+            InboundMessage::ClientNodeMethod {
+                method: Method::SetActive(SetActive { active: false }),
+                ..
+            }
+        ));
+
+        routes.insert(
+            77,
+            ObjectRoute {
+                interface: "PipeWire:Interface:Other".into(),
+                version: 1,
+            },
+        );
+        let colliding = encode_struct_payload(|sb| {
+            sb.push_int(1)
+                .push_string("PipeWire:Interface:Node")
+                .push_int(3)
+                .push_int(88)
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_inbound_message_with_routes(
+                77,
+                super::registry_method::BIND,
+                &colliding,
+                &routes
+            )
+            .unwrap(),
+            InboundMessage::Unknown {
+                object_id: 77,
+                opcode: 1
+            }
+        ));
     }
 }

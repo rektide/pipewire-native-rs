@@ -710,12 +710,12 @@ fn update_state_from_inbound(
             insert_route(state, *new_id, type_, *version)?;
         }
         protocol::InboundMessage::CoreDestroy { object_id } => {
-            if state.object_routes.remove(object_id).is_none() {
-                return Err(io::Error::new(
+            state.object_routes.remove(object_id).ok_or_else(|| {
+                io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("Core::Destroy references unknown object id {object_id}"),
-                ));
-            }
+                )
+            })?;
         }
         _ => {}
     }
@@ -825,5 +825,28 @@ struct SocketPathGuard {
 impl Drop for SocketPathGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use crate::{protocol::InboundMessage, state::ExecutionState};
+
+    use super::update_state_from_inbound;
+
+    #[test]
+    fn route_collisions_fail_and_destroy_retires_route() {
+        let create = InboundMessage::CoreCreateObject {
+            factory_name: "client-node".into(),
+            type_: pipewire_native_protocol::wire::client_node::INTERFACE.into(),
+            version: 6,
+            new_id: 7,
+        };
+        let mut state = ExecutionState::default();
+        update_state_from_inbound(&mut state, &create).unwrap();
+        assert!(update_state_from_inbound(&mut state, &create).is_err());
+        update_state_from_inbound(&mut state, &InboundMessage::CoreDestroy { object_id: 7 })
+            .unwrap();
+        assert!(state.object_routes.is_empty());
     }
 }
