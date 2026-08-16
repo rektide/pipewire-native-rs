@@ -45,6 +45,20 @@ fn overwrite_fd_body(payload: &mut [u8], offset: usize, value: i64) {
     payload[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
 }
 
+fn upstream_fixture(name: &str) -> Vec<u8> {
+    let line = include_str!("fixtures/client-node-v6/upstream.hex")
+        .lines()
+        .find(|line| line.starts_with(&format!("{name} ")))
+        .unwrap();
+    line.split_once(' ')
+        .unwrap()
+        .1
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
+}
+
 fn frame_fds(fds: Vec<OwnedFd>) -> FrameFds {
     let (tx, rx) = UnixStream::pair().unwrap();
     let limits = FrameLimits::default();
@@ -121,6 +135,137 @@ fn selected_methods_round_trip_and_set_active_matches_pinned_bytes() {
     assert_eq!(
         wire::encode_method(&Method::SetActive(SetActive { active: true })).unwrap(),
         [0x10, 0, 0, 0, 0x0e, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,]
+    );
+}
+
+#[test]
+fn selected_shapes_match_independent_upstream_c_builder_fixtures() {
+    let format = RawPodOwned::wrap(upstream_fixture("format-s16le-48k-stereo")).unwrap();
+    let update = Method::Update(Update {
+        change_mask: 1,
+        params: vec![],
+        info: Some(NodeInfo {
+            max_input_ports: 0,
+            max_output_ports: 1,
+            change_mask: 7,
+            flags: 0,
+            properties: vec![],
+            params: vec![],
+        }),
+    });
+    assert_eq!(
+        wire::encode_method(&update).unwrap(),
+        upstream_fixture("update")
+    );
+    let port_update = Method::PortUpdate(PortUpdate {
+        direction: Direction::Output,
+        port_id: 0,
+        change_mask: 1,
+        params: vec![format.clone()],
+        info: Some(PortInfo {
+            change_mask: 15,
+            flags: 0,
+            rate_num: 1,
+            rate_denom: 48_000,
+            properties: vec![],
+            params: vec![],
+        }),
+    });
+    assert_eq!(
+        wire::encode_method(&port_update).unwrap(),
+        upstream_fixture("port-update-canonical")
+    );
+    for (active, name) in [(true, "set-active-true"), (false, "set-active-false")] {
+        assert_eq!(
+            wire::encode_method(&Method::SetActive(SetActive { active })).unwrap(),
+            upstream_fixture(name)
+        );
+    }
+    assert_eq!(
+        wire::encode_transport(
+            0,
+            1,
+            RegionRef {
+                memory_id: 4,
+                offset: 0,
+                size: 2312
+            }
+        )
+        .unwrap(),
+        upstream_fixture("transport")
+    );
+    assert_eq!(
+        wire::encode_port_set_param(&PortSetParam {
+            direction: Direction::Output,
+            port_id: 0,
+            param_id: wire::SPA_PARAM_FORMAT,
+            flags: 0,
+            param: Some(format),
+        })
+        .unwrap(),
+        upstream_fixture("port-set-param")
+    );
+    assert_eq!(
+        wire::encode_port_use_buffers(&PortUseBuffers {
+            direction: Direction::Output,
+            port_id: 0,
+            mix_id: None,
+            flags: 0,
+            buffers: vec![BufferDescriptor {
+                metadata: RegionRef {
+                    memory_id: 11,
+                    offset: 64,
+                    size: 128
+                },
+                metas: vec![MetaDescriptor {
+                    type_id: 1,
+                    size: 16
+                }],
+                datas: vec![DataDescriptor {
+                    type_id: 3,
+                    data_id: 12,
+                    flags: 1,
+                    map_offset: 32,
+                    max_size: 4096,
+                }],
+            }],
+        })
+        .unwrap(),
+        upstream_fixture("port-use-buffers")
+    );
+    assert_eq!(
+        wire::encode_port_set_io(PortSetIo::Set {
+            direction: Direction::Output,
+            port_id: 0,
+            mix_id: None,
+            io_id: wire::SPA_IO_BUFFERS,
+            region: RegionRef {
+                memory_id: 13,
+                offset: 8,
+                size: 8
+            },
+        })
+        .unwrap(),
+        upstream_fixture("port-set-io")
+    );
+    assert_eq!(
+        wire::encode_set_activation(
+            55,
+            Some((
+                0,
+                RegionRef {
+                    memory_id: 8,
+                    offset: 16,
+                    size: 2312
+                }
+            ))
+        )
+        .unwrap(),
+        upstream_fixture("set-activation")
+    );
+    assert_eq!(
+        wire::encode_command(Command::Start).unwrap(),
+        upstream_fixture("command-start")
     );
 }
 
