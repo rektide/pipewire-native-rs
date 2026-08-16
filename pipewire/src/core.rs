@@ -326,6 +326,26 @@ impl Core {
             .ok_or_else(|| std::io::Error::other("created ClientNode has the wrong proxy type"))
     }
 
+    /// Creates a ClientNode v6 proxy and associates it with one Tokio process session.
+    ///
+    /// The callback receives only semantic, cycle-scoped output access. Core memory must already
+    /// be routed through `memory`, normally created by
+    /// [`crate::node::session::memory::MemoryPoolHandle::install`].
+    pub fn create_tokio_client_node_session(
+        &self,
+        props: &Properties,
+        memory: crate::node::session::memory::MemoryPoolHandle,
+        process: Box<dyn pipewire_native_node::session::output::OutputProcess>,
+    ) -> std::io::Result<crate::node::session::client_node::ClientNodeSessionBridge> {
+        let proxy = self.create_client_node(props)?;
+        crate::node::session::client_node::ClientNodeSessionBridge::spawn_tokio(
+            proxy,
+            memory,
+            process,
+            pipewire_native_node::runtime::DEFAULT_COMMAND_CAPACITY,
+        )
+    }
+
     /// Destroy a proxy.
     pub fn destroy(&self, object: &dyn HasProxy) -> std::io::Result<()> {
         object_invoke!(self, destroy, object)
