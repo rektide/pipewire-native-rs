@@ -33,6 +33,8 @@ pub enum CycleError {
     FrameCountOverflow(usize),
     /// Port/chunk validation failed.
     Port(PortError),
+    /// Publication was attempted without a selected committed cycle.
+    NoCommittedCycle,
 }
 
 impl fmt::Display for CycleError {
@@ -55,6 +57,7 @@ pub struct OutputBufferPublisher<'buffers, 'format> {
     io: BuffersIoView,
     buffers: &'buffers mut [OutputBuffer],
     format: &'format NegotiatedAudioFormat,
+    selected: Option<usize>,
 }
 
 impl<'buffers, 'format> OutputBufferPublisher<'buffers, 'format> {
@@ -68,6 +71,7 @@ impl<'buffers, 'format> OutputBufferPublisher<'buffers, 'format> {
             io,
             buffers,
             format,
+            selected: None,
         }
     }
 
@@ -93,8 +97,8 @@ impl<'buffers, 'format> OutputBufferPublisher<'buffers, 'format> {
                 buffer_id: state.buffer_id,
                 buffer_count,
             })?;
+        self.selected = Some(index);
         Ok(Some(OutputCycle {
-            io: &self.io,
             buffer,
             buffer_id: state.buffer_id,
             format: self.format,
@@ -122,7 +126,6 @@ impl<'buffers, 'format> OutputBufferPublisher<'buffers, 'format> {
 /// ```
 #[derive(Debug)]
 pub struct OutputCycle<'cycle> {
-    io: &'cycle BuffersIoView,
     buffer: &'cycle mut OutputBuffer,
     buffer_id: u32,
     format: &'cycle NegotiatedAudioFormat,
@@ -171,16 +174,16 @@ impl OutputCycle<'_> {
     }
 
     /// Commits a complete number of interleaved frames.
-    pub fn commit(self, frames: usize) -> Result<PublishedOutput, CycleError> {
+    pub fn commit(self, frames: usize) -> Result<CommittedOutput, CycleError> {
         let stride = self.format.frame_stride.get();
         let bytes = frames
             .checked_mul(stride)
             .ok_or(CycleError::FrameCountOverflow(frames))?;
-        self.publish(bytes, stride, ChunkFlags::NONE)
+        self.commit_bytes(bytes, stride, ChunkFlags::NONE)
     }
 
     /// Fills and commits a complete number of neutral S16LE frames.
-    pub fn silence(mut self, frames: usize) -> Result<PublishedOutput, CycleError> {
+    pub fn silence(mut self, frames: usize) -> Result<CommittedOutput, CycleError> {
         let stride = self.format.frame_stride.get();
         let bytes = frames
             .checked_mul(stride)
@@ -192,20 +195,15 @@ impl OutputCycle<'_> {
             });
         }
         self.interleaved_pcm()[..bytes].fill(0);
-        self.publish(bytes, stride, ChunkFlags::NONE)
+        self.commit_bytes(bytes, stride, ChunkFlags::NONE)
     }
 
-    /// Publishes the chunk first, then buffer ID, then `HAVE_DATA` status.
-    ///
-    /// The caller must complete the owning activation only after this returns. That
-    /// activation transition is the synchronization edge that lets PipeWire consume
-    /// the volatile chunk and IO writes.
-    pub fn publish(
+    fn commit_bytes(
         self,
         bytes_used: usize,
         stride: usize,
         flags: ChunkFlags,
-    ) -> Result<PublishedOutput, CycleError> {
+    ) -> Result<CommittedOutput, CycleError> {
         let capacity = self.buffer.capacity();
         if bytes_used > capacity {
             return Err(CycleError::CapacityExceeded {
@@ -214,13 +212,59 @@ impl OutputCycle<'_> {
             });
         }
         u32::try_from(bytes_used).map_err(|_| CycleError::ChunkSizeOverflow(bytes_used))?;
-        self.buffer.publish(bytes_used, stride, flags)?;
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        self.io.publish_have_data(self.buffer_id);
-        Ok(PublishedOutput {
+        Ok(CommittedOutput {
             buffer_id: self.buffer_id,
             bytes_used,
+            stride,
+            flags,
         })
+    }
+}
+
+/// Validated publication intent returned by a successful callback.
+///
+/// The chunk and IO remain unpublished until the callback itself returns this value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommittedOutput {
+    buffer_id: u32,
+    bytes_used: usize,
+    stride: usize,
+    flags: ChunkFlags,
+}
+
+impl OutputBufferPublisher<'_, '_> {
+    pub(crate) fn publish_committed(
+        &mut self,
+        committed: CommittedOutput,
+    ) -> Result<PublishedOutput, CycleError> {
+        let selected = self.selected.ok_or(CycleError::NoCommittedCycle)?;
+        if committed.buffer_id as usize != selected {
+            return Err(CycleError::InvalidBufferId {
+                buffer_id: committed.buffer_id,
+                buffer_count: self.buffers.len(),
+            });
+        }
+        self.buffers[selected].publish(
+            committed.bytes_used,
+            committed.stride,
+            committed.flags,
+        )?;
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        self.io.publish_have_data(committed.buffer_id);
+        self.selected = None;
+        Ok(PublishedOutput {
+            buffer_id: committed.buffer_id,
+            bytes_used: committed.bytes_used,
+        })
+    }
+}
+
+impl Drop for OutputBufferPublisher<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(selected) = self.selected.take() {
+            self.buffers[selected].abort();
+            self.io.publish_need_data(selected as u32);
+        }
     }
 }
 
@@ -248,7 +292,7 @@ mod tests {
     use super::{CycleError, OutputBufferPublisher};
     use crate::session::config::NegotiatedAudioFormat;
     use crate::session::port::{
-        BufferStatus, BuffersIoView, ChunkFlags, ChunkState, OutputBuffer, PortIoType,
+        BufferStatus, BuffersIoView, ChunkState, OutputBuffer, PortIoType,
     };
 
     #[repr(C, align(4))]
@@ -309,7 +353,9 @@ mod tests {
             assert_eq!(cycle.buffer_id(), 1);
             assert_eq!(cycle.capacity(), 12);
             cycle.media()[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-            let published = cycle.commit(2).unwrap();
+            let committed = cycle.commit(2).unwrap();
+            assert_eq!(publisher.io_state().status, BufferStatus::NeedData as i32);
+            let published = publisher.publish_committed(committed).unwrap();
             assert_eq!(published.buffer_id(), 1);
             assert_eq!(published.bytes_used(), 8);
             assert_eq!(publisher.io_state().status, BufferStatus::HaveData as i32);
@@ -382,9 +428,9 @@ mod tests {
         let mut publisher = OutputBufferPublisher::new(io_view, &mut buffers, &format);
         let cycle = publisher.select().unwrap().unwrap();
         assert_eq!(
-            cycle.publish(3, 1, ChunkFlags::NONE).unwrap_err(),
+            cycle.commit(1).unwrap_err(),
             CycleError::CapacityExceeded {
-                requested: 3,
+                requested: 4,
                 capacity: 2,
             }
         );

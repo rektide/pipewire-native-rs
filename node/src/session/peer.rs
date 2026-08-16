@@ -9,7 +9,7 @@ use super::{
     activation::{ActivationView, TriggerOutcome},
     config::{NodeId, PeerActivationDescriptor},
     error::SessionError,
-    memory::{MemoryKey, MemoryMapping, MemoryResolver},
+    memory::{MemoryInterval, MemoryKey, MemoryMapping, MemoryResolver},
 };
 use crate::signal::EventFd;
 
@@ -20,7 +20,6 @@ pub struct PeerActivation {
     generation: u64,
     signal: EventFd,
     key: MemoryKey,
-    offset: usize,
     mapping: MemoryMapping,
 }
 
@@ -44,7 +43,6 @@ impl PeerActivation {
             generation,
             signal: EventFd::from_owned_fd(descriptor.signal_fd)?,
             key,
-            offset: descriptor.activation.offset,
             mapping,
         })
     }
@@ -64,8 +62,8 @@ impl PeerActivation {
         self.key
     }
 
-    pub(crate) fn interval(&self) -> (MemoryKey, usize, usize) {
-        (self.key, self.offset, self.offset + self.mapping.len())
+    pub(crate) fn interval(&self) -> MemoryInterval {
+        self.mapping.interval()
     }
 
     pub(crate) fn trigger(&mut self, now_ns: u64) -> Result<TriggerOutcome, SessionError> {
@@ -108,8 +106,9 @@ impl PeerSet {
     }
 
     pub(crate) fn trigger_all(&mut self, now_ns: u64) -> Result<(), SessionError> {
+        let mut first_error = None;
         for (node, peer) in &mut self.by_node {
-            peer.trigger(now_ns).map_err(|error| match error {
+            let result = peer.trigger(now_ns).map_err(|error| match error {
                 SessionError::Activation(source) => SessionError::PeerTrigger {
                     peer: *node,
                     source,
@@ -119,23 +118,26 @@ impl PeerSet {
                     source,
                 },
                 other => other,
-            })?;
+            });
+            if first_error.is_none() {
+                first_error = result.err();
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
-    pub(crate) fn remove_memory(&mut self, key_id: super::memory::MemoryId) {
-        self.by_node.retain(|_, peer| peer.key.id != key_id);
+    pub(crate) fn remove_memory(&mut self, key: MemoryKey) {
+        self.by_node.retain(|_, peer| peer.key != key);
     }
 
-    pub(crate) fn intervals(&self) -> impl Iterator<Item = (MemoryKey, usize, usize)> + '_ {
+    pub(crate) fn intervals(&self) -> impl Iterator<Item = MemoryInterval> + '_ {
         self.by_node.values().map(PeerActivation::interval)
     }
 
     pub(crate) fn intervals_except(
         &self,
         node: NodeId,
-    ) -> impl Iterator<Item = (MemoryKey, usize, usize)> + '_ {
+    ) -> impl Iterator<Item = MemoryInterval> + '_ {
         self.by_node
             .iter()
             .filter(move |(candidate, _)| **candidate != node)

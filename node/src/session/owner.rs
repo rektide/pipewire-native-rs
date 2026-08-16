@@ -13,11 +13,12 @@ use super::{
         PeerActivationUpdate, PortIoDescriptor, PortIoUpdate, TransportDescriptor,
     },
     error::SessionError,
-    memory::{MemoryError, MemoryId, MemoryResolver},
+    memory::{MemoryError, MemoryId, MemoryInterval, MemoryResolver},
     output::{OutputGeneration, OutputProcess},
     peer::{PeerActivation, PeerSet},
     transport::{ClaimCompletion, TransportGeneration},
 };
+use crate::signal::EventFd;
 
 const MAX_SESSION_PEERS: usize = 64;
 
@@ -74,8 +75,8 @@ pub enum SessionCommand {
     RemovePeerActivation(NodeId),
     /// Notify that an unresolved memory ID may now resolve.
     MemoryAvailable(MemoryId),
-    /// Invalidate every generation and pending descriptor using this numeric ID.
-    RemoveMemory(MemoryId),
+    /// Invalidate mappings retaining this exact retired memory generation.
+    RemoveMemory(super::memory::MemoryKey),
     /// Join or leave graph scheduling.
     SetActive(bool),
     /// Apply Start, Pause, or Suspend intent.
@@ -173,6 +174,16 @@ pub enum WakeOutcome {
     },
 }
 
+/// Runtime readiness registration for one exact transport generation.
+#[derive(Debug)]
+pub struct RuntimeRegistration {
+    /// Generation that must be supplied with wakes from this handle.
+    pub generation: u64,
+    /// Safely duplicated trigger eventfd. Replacement snapshots remain valid handles
+    /// but their generation is rejected by the session as stale.
+    pub trigger: EventFd,
+}
+
 /// Coherent owner of one node's mappings, descriptors, state, and cycle authority.
 #[derive(Debug)]
 pub struct ClientNodeSession<R> {
@@ -219,6 +230,19 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
     /// Current transport generation for readiness tagging.
     pub fn transport_generation(&self) -> Option<u64> {
         self.transport.as_ref().map(TransportGeneration::id)
+    }
+
+    /// Clones the current trigger registration without exposing the completion fd.
+    pub fn runtime_registration(&self) -> Result<Option<RuntimeRegistration>, SessionError> {
+        self.transport
+            .as_ref()
+            .map(|transport| {
+                Ok(RuntimeRegistration {
+                    generation: transport.id(),
+                    trigger: transport.try_clone_trigger()?,
+                })
+            })
+            .transpose()
     }
 
     /// Number of installed downstream peers.
@@ -268,8 +292,31 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
                 ApplyOutcome::Applied
             }
             SessionCommand::UseBuffers(value) => {
-                self.buffer_descriptor = Some(value);
-                self.bind_output()?
+                let replacement = self
+                    .buffer_descriptor
+                    .as_ref()
+                    .is_some_and(|current| current != &value);
+                if replacement {
+                    let format = self.format.clone();
+                    let io = self.io_descriptor;
+                    let pending = if let (Some(format), Some(io)) = (format, io) {
+                        self.output_candidate(format, &value, io)?.is_none()
+                    } else {
+                        false
+                    };
+                    self.stop()?;
+                    self.output = None;
+                    self.io_descriptor = None;
+                    self.buffer_descriptor = Some(value);
+                    if pending {
+                        ApplyOutcome::PendingMemory
+                    } else {
+                        ApplyOutcome::Applied
+                    }
+                } else {
+                    self.buffer_descriptor = Some(value);
+                    self.bind_output()?
+                }
             }
             SessionCommand::ClearBuffers => {
                 self.stop()?;
@@ -279,8 +326,27 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
                 ApplyOutcome::Applied
             }
             SessionCommand::SetPortIo(value) => {
-                self.io_descriptor = Some(value);
-                self.bind_output()?
+                let format = self.format.clone();
+                let buffers = self.buffer_descriptor.clone();
+                if let (Some(format), Some(buffers)) = (format, buffers) {
+                    match self.output_candidate(format, &buffers, value)? {
+                        Some(candidate) => {
+                            self.stop()?;
+                            self.io_descriptor = Some(value);
+                            self.output = Some(candidate);
+                            ApplyOutcome::Applied
+                        }
+                        None => {
+                            self.stop()?;
+                            self.io_descriptor = Some(value);
+                            self.output = None;
+                            ApplyOutcome::PendingMemory
+                        }
+                    }
+                } else {
+                    self.io_descriptor = Some(value);
+                    ApplyOutcome::Applied
+                }
             }
             SessionCommand::ClearPortIo => {
                 self.stop()?;
@@ -306,8 +372,8 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
                 ApplyOutcome::Applied
             }
             SessionCommand::MemoryAvailable(_) => self.retry_pending()?,
-            SessionCommand::RemoveMemory(id) => {
-                self.remove_memory(id)?;
+            SessionCommand::RemoveMemory(key) => {
+                self.remove_memory(key)?;
                 ApplyOutcome::Applied
             }
             SessionCommand::SetActive(active) => {
@@ -362,6 +428,17 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
         now_ns: u64,
         callback: &mut dyn OutputProcess,
     ) -> Result<WakeOutcome, SessionError> {
+        self.on_wake_with_finish(generation, now_ns, || now_ns, callback)
+    }
+
+    /// Processes a wake with a finish clock sampled after callback completion.
+    pub fn on_wake_with_finish(
+        &mut self,
+        generation: u64,
+        awake_ns: u64,
+        finish_time: impl FnOnce() -> u64,
+        callback: &mut dyn OutputProcess,
+    ) -> Result<WakeOutcome, SessionError> {
         let expected = self
             .transport_generation()
             .ok_or(SessionError::NotReady("transport"))?;
@@ -386,12 +463,12 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
         let completion = {
             let transport = self.transport.as_mut().unwrap();
             let output = self.output.as_mut().unwrap();
-            transport.claim_and_finish(now_ns, now_ns, || output.process(callback))
+            transport.claim_and_finish(awake_ns, finish_time, || output.process(callback))
         };
         let completion = match completion {
             Ok(value) => value,
             Err(error) => {
-                self.state = SessionState::Failed;
+                self.fail();
                 return Err(error);
             }
         };
@@ -401,18 +478,23 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
                 Ok(WakeOutcome::NotClaimed { drained, missed })
             }
             ClaimCompletion::Finished(result) => {
-                let peer_result = self.peers.trigger_all(now_ns);
-                match (result, peer_result) {
-                    (Ok(published), Ok(())) => {
+                match result {
+                    Ok(published) => match self.peers.trigger_all(awake_ns) {
+                        Ok(()) => {
                         self.state = SessionState::Running;
                         Ok(WakeOutcome::Processed {
                             drained,
                             missed,
                             produced: published.is_some(),
                         })
-                    }
-                    (Err(error), _) | (_, Err(error)) => {
-                        self.state = SessionState::Failed;
+                        }
+                        Err(error) => {
+                            self.fail();
+                            Err(error)
+                        }
+                    },
+                    Err(error) => {
+                        self.fail();
                         Err(error)
                     }
                 }
@@ -450,13 +532,27 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
         ) else {
             return Ok(ApplyOutcome::Applied);
         };
-        for id in buffer_memory_ids(&buffers).chain(std::iter::once(io.region.memory)) {
+        let Some(candidate) = self.output_candidate(format, &buffers, io)? else {
+            return Ok(ApplyOutcome::PendingMemory);
+        };
+        self.stop()?;
+        self.output = Some(candidate);
+        Ok(ApplyOutcome::Applied)
+    }
+
+    fn output_candidate(
+        &mut self,
+        format: NegotiatedAudioFormat,
+        buffers: &BufferSetDescriptor,
+        io: PortIoDescriptor,
+    ) -> Result<Option<OutputGeneration>, SessionError> {
+        for id in buffer_memory_ids(buffers).chain(std::iter::once(io.region.memory)) {
             if unresolved(self.memory.resolve(id))? {
-                return Ok(ApplyOutcome::PendingMemory);
+                return Ok(None);
             }
         }
         let generation = self.allocate_generation()?;
-        let candidate = OutputGeneration::bind(generation, format, &buffers, io, &self.memory)?;
+        let candidate = OutputGeneration::bind(generation, format, buffers, io, &self.memory)?;
         let existing: Vec<_> = self
             .transport
             .iter()
@@ -464,9 +560,7 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
             .chain(self.peers.intervals())
             .collect();
         ensure_disjoint(candidate.intervals(), existing)?;
-        self.stop()?;
-        self.output = Some(candidate);
-        Ok(ApplyOutcome::Applied)
+        Ok(Some(candidate))
     }
 
     fn bind_peer(&mut self, node: NodeId) -> Result<ApplyOutcome, SessionError> {
@@ -508,11 +602,11 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
         })
     }
 
-    fn remove_memory(&mut self, id: MemoryId) -> Result<(), SessionError> {
+    fn remove_memory(&mut self, key: super::memory::MemoryKey) -> Result<(), SessionError> {
         if self
             .transport
             .as_ref()
-            .is_some_and(|transport| transport.activation_key().id == id)
+            .is_some_and(|transport| transport.activation_key() == key)
         {
             self.stop()?;
             self.transport = None;
@@ -520,34 +614,12 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
         if self
             .output
             .as_ref()
-            .is_some_and(|output| output.depends_on(id))
+            .is_some_and(|output| output.depends_on(key))
         {
             self.stop()?;
             self.output = None;
         }
-        self.peers.remove_memory(id);
-        if self
-            .pending_transport
-            .as_ref()
-            .is_some_and(|value| value.activation.memory == id)
-        {
-            self.pending_transport = None;
-        }
-        if self
-            .buffer_descriptor
-            .as_ref()
-            .is_some_and(|value| buffer_memory_ids(value).any(|memory| memory == id))
-        {
-            self.buffer_descriptor = None;
-        }
-        if self
-            .io_descriptor
-            .is_some_and(|value| value.region.memory == id)
-        {
-            self.io_descriptor = None;
-        }
-        self.pending_peers
-            .retain(|_, value| value.activation.memory != id);
+        self.peers.remove_memory(key);
         Ok(())
     }
 
@@ -570,10 +642,8 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
     }
 
     fn stop(&mut self) -> Result<(), SessionError> {
-        if self.state == SessionState::Running {
-            if let Some(transport) = &mut self.transport {
-                transport.deactivate()?;
-            }
+        if let Some(transport) = &mut self.transport {
+            transport.deactivate()?;
         }
         if self.state != SessionState::Disconnected && self.state != SessionState::Failed {
             self.state = if self.is_ready() {
@@ -583,6 +653,13 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
             };
         }
         Ok(())
+    }
+
+    fn fail(&mut self) {
+        if let Some(transport) = &mut self.transport {
+            let _ = transport.deactivate();
+        }
+        self.state = SessionState::Failed;
     }
 
     fn is_ready(&self) -> bool {
@@ -631,13 +708,13 @@ fn buffer_memory_ids(value: &BufferSetDescriptor) -> impl Iterator<Item = Memory
 }
 
 fn ensure_disjoint(
-    candidate: impl IntoIterator<Item = (super::memory::MemoryKey, usize, usize)>,
-    existing: impl IntoIterator<Item = (super::memory::MemoryKey, usize, usize)>,
+    candidate: impl IntoIterator<Item = MemoryInterval>,
+    existing: impl IntoIterator<Item = MemoryInterval>,
 ) -> Result<(), SessionError> {
     let existing: Vec<_> = existing.into_iter().collect();
     for left in candidate {
         for right in &existing {
-            if left.0 == right.0 && left.1 < right.2 && right.1 < left.2 {
+            if left.overlaps(*right) {
                 return Err(SessionError::InvalidTransition(
                     "overlapping generation mappings",
                 ));
@@ -662,7 +739,7 @@ mod tests {
         session::{
             activation::{ActivationStatus, ActivationView},
             config::{BufferDescriptor, MetaDescriptor, PortId},
-            cycle::{OutputCycle, PublishedOutput},
+            cycle::{CommittedOutput, OutputCycle},
             memory::{MemoryKey, MemoryMapping, MemoryPool, RegionRef},
             output::ProcessError,
             port::{BufferStatus, BuffersIoView, ChunkState, ChunkView, PortIoType},
@@ -691,6 +768,23 @@ mod tests {
                     create_memfd(&format!("session-{id}"), len).unwrap(),
                 )
                 .unwrap()
+        }
+
+        fn add_aliases(&self, ids: &[u32], len: usize) -> Vec<MemoryKey> {
+            let fd = create_memfd("session-alias", len).unwrap();
+            let mut pool = self.0.borrow_mut();
+            ids.iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    let imported = if index + 1 == ids.len() {
+                        fd.try_clone().unwrap()
+                    } else {
+                        fd.try_clone().unwrap()
+                    };
+                    pool.add(MemoryId(*id), data_type::MEM_FD, 0, imported)
+                        .unwrap()
+                })
+                .collect()
         }
 
         fn bytes(&self, key: MemoryKey, len: usize) -> MemoryMapping {
@@ -801,8 +895,25 @@ mod tests {
         calls: usize,
     }
 
+    struct CommitThenFail {
+        panic: bool,
+    }
+
+    impl OutputProcess for CommitThenFail {
+        fn process(&mut self, cycle: OutputCycle<'_>) -> Result<CommittedOutput, ProcessError> {
+            let committed = cycle.commit(1).unwrap();
+            if self.panic {
+                panic!("callback panic after commit");
+            }
+            let _ = committed;
+            Err(ProcessError {
+                message: "callback error after commit".into(),
+            })
+        }
+    }
+
     impl OutputProcess for PatternProcess {
-        fn process(&mut self, mut cycle: OutputCycle<'_>) -> Result<PublishedOutput, ProcessError> {
+        fn process(&mut self, mut cycle: OutputCycle<'_>) -> Result<CommittedOutput, ProcessError> {
             self.calls += 1;
             assert_eq!(cycle.frame_capacity(), 16);
             cycle.interleaved_pcm()[..16]
@@ -839,6 +950,9 @@ mod tests {
             .apply(SessionCommand::ReplaceTransport(transport))
             .unwrap();
         let generation = session.transport_generation().unwrap();
+        let registration = session.runtime_registration().unwrap().unwrap();
+        assert_eq!(registration.generation, generation);
+        assert_ne!(registration.trigger.as_raw_fd(), trigger_raw);
         let (buffers, io) = output_descriptors();
 
         // IO and buffers may precede format and still converge.
@@ -1000,5 +1114,243 @@ mod tests {
             .apply(SessionCommand::ReplaceTransport(bad))
             .is_err());
         assert_eq!(session.transport_generation(), Some(old));
+    }
+
+    #[test]
+    fn duplicated_memfd_ids_cannot_alias_output_or_transport_regions() {
+        let resolver = FakeResolver::new();
+        let keys = resolver.add_aliases(&[1, 2, 3, 4], 4096);
+        {
+            let mut activation = resolver.bytes(keys[0], ActivationView::required_size());
+            let mut guard = activation.borrow();
+            let bytes = unsafe { guard.bytes_mut() };
+            bytes[0..4].copy_from_slice(&(ActivationStatus::Inactive as u32).to_ne_bytes());
+            bytes[544..548].copy_from_slice(&1_u32.to_ne_bytes());
+        }
+        let (transport, _, _, _, _) = transport(MemoryId(1));
+        let mut session = ClientNodeSession::new(resolver.clone());
+        session
+            .apply(SessionCommand::ReplaceTransport(transport))
+            .unwrap();
+        session
+            .apply(SessionCommand::SetFormat(
+                NegotiatedAudioFormat::pcm_s16le(48_000, 2).unwrap(),
+            ))
+            .unwrap();
+        let buffers = BufferSetDescriptor {
+            port: PortId(0),
+            buffers: vec![BufferDescriptor {
+                metadata: RegionRef {
+                    memory: MemoryId(2),
+                    offset: 3000,
+                    len: 16,
+                },
+                metas: Vec::new().into_boxed_slice(),
+                media_memory: MemoryId(3),
+                map_offset: 0,
+                max_size: 64,
+            }]
+            .into_boxed_slice(),
+        };
+        session.apply(SessionCommand::UseBuffers(buffers)).unwrap();
+        let io = PortIoDescriptor {
+            port: PortId(0),
+            region: RegionRef {
+                memory: MemoryId(4),
+                offset: 3500,
+                len: 8,
+            },
+        };
+        assert!(matches!(
+            session.apply(SessionCommand::SetPortIo(io)),
+            Err(SessionError::InvalidTransition("overlapping generation mappings"))
+        ));
+
+        let format = NegotiatedAudioFormat::pcm_s16le(48_000, 2).unwrap();
+        let (mut buffers, io) = output_descriptors();
+        buffers.buffers[0].metadata.memory = MemoryId(2);
+        buffers.buffers[0].media_memory = MemoryId(3);
+        let io = PortIoDescriptor {
+            region: RegionRef {
+                memory: MemoryId(4),
+                offset: 8,
+                len: 8,
+            },
+            ..io
+        };
+        assert!(matches!(
+            OutputGeneration::bind(99, format, &buffers, io, &resolver),
+            Err(SessionError::InvalidTransition(
+                "overlapping writable memory regions"
+            ))
+        ));
+    }
+
+    #[test]
+    fn commit_then_error_or_panic_aborts_output_and_deactivates() {
+        for panic in [false, true] {
+            let resolver = FakeResolver::new();
+            let own_key = initialize_activation(&resolver, 1, ActivationStatus::Inactive, 0);
+            let metadata_key = resolver.add(2, 16);
+            resolver.add(3, 64);
+            let io_key = resolver.add(4, 8);
+            {
+                let mut io = resolver.bytes(io_key, 8);
+                let mut guard = io.borrow();
+                let bytes = unsafe { guard.bytes_mut() };
+                bytes[0..4].copy_from_slice(&(BufferStatus::NeedData as i32).to_ne_bytes());
+            }
+            let (descriptor, trigger, _, _, _) = transport(MemoryId(1));
+            let mut session = ClientNodeSession::new(resolver.clone());
+            session
+                .apply(SessionCommand::ReplaceTransport(descriptor))
+                .unwrap();
+            let generation = session.transport_generation().unwrap();
+            let (buffers, io) = output_descriptors();
+            session.apply(SessionCommand::UseBuffers(buffers)).unwrap();
+            session.apply(SessionCommand::SetPortIo(io)).unwrap();
+            session
+                .apply(SessionCommand::SetFormat(
+                    NegotiatedAudioFormat::pcm_s16le(48_000, 2).unwrap(),
+                ))
+                .unwrap();
+            session.apply(SessionCommand::SetActive(true)).unwrap();
+            session
+                .apply(SessionCommand::SetNodeCommand(NodeCommandState::Start))
+                .unwrap();
+            {
+                let mut own = resolver.bytes(own_key, ActivationView::required_size());
+                let mut guard = own.borrow();
+                let bytes = unsafe { guard.bytes_mut() };
+                bytes[0..4]
+                    .copy_from_slice(&(ActivationStatus::Triggered as u32).to_ne_bytes());
+            }
+            trigger.signal(1).unwrap();
+            let error = session
+                .on_wake_with_finish(
+                    generation,
+                    100,
+                    || 140,
+                    &mut CommitThenFail { panic },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                (panic, error),
+                (false, SessionError::Callback(_)) | (true, SessionError::CallbackPanicked)
+            ));
+            assert_eq!(session.state(), SessionState::Failed);
+
+            let mut own = resolver.bytes(own_key, ActivationView::required_size());
+            let activation =
+                unsafe { ActivationView::from_raw_parts(own.as_mut_ptr(), own.len()).unwrap() };
+            assert_eq!(activation.status().unwrap(), ActivationStatus::Inactive);
+            assert_eq!(activation.process_result(), -libc::EIO);
+            assert_eq!(unsafe { activation.awake_time() }, 100);
+            assert_eq!(unsafe { activation.finish_time() }, 140);
+
+            let mut io = resolver.bytes(io_key, 8);
+            let io = unsafe {
+                BuffersIoView::from_raw_parts(PortIoType::Buffers, io.as_mut_ptr(), 8).unwrap()
+            };
+            assert_eq!(io.state().status, BufferStatus::NeedData as i32);
+            let mut metadata = resolver.bytes(metadata_key, 16);
+            let chunk = unsafe { ChunkView::from_raw_parts(metadata.as_mut_ptr(), 16).unwrap() };
+            assert_eq!(chunk.state().size, 0);
+        }
+    }
+
+    #[test]
+    fn peer_propagation_attempts_every_node_in_node_id_order_after_failure() {
+        let resolver = FakeResolver::new();
+        let failed = initialize_activation(&resolver, 30, ActivationStatus::NotTriggered, 0);
+        let waiting = initialize_activation(&resolver, 31, ActivationStatus::NotTriggered, 2);
+        let triggered = initialize_activation(&resolver, 32, ActivationStatus::NotTriggered, 1);
+        let mut peers = PeerSet::default();
+        let mut observers = Vec::new();
+        for (generation, node, memory) in [(3, 3, 32), (2, 2, 31), (1, 1, 30)] {
+            let (signal_fd, observer) = event_pair();
+            observers.push((node, observer));
+            peers.insert(
+                PeerActivation::bind(
+                    generation,
+                    PeerActivationDescriptor {
+                        node: NodeId(node),
+                        signal_fd,
+                        activation: RegionRef {
+                            memory: MemoryId(memory),
+                            offset: 0,
+                            len: ActivationView::required_size(),
+                        },
+                    },
+                    &resolver,
+                )
+                .unwrap(),
+            );
+        }
+        assert!(matches!(
+            peers.trigger_all(77),
+            Err(SessionError::PeerTrigger {
+                peer: NodeId(1),
+                ..
+            })
+        ));
+
+        let pending = |key| {
+            let mut mapping = resolver.bytes(key, ActivationView::required_size());
+            let activation = unsafe {
+                ActivationView::from_raw_parts(mapping.as_mut_ptr(), mapping.len()).unwrap()
+            };
+            (activation.pending(), activation.status().unwrap())
+        };
+        assert_eq!(pending(failed), (0, ActivationStatus::NotTriggered));
+        assert_eq!(pending(waiting), (1, ActivationStatus::NotTriggered));
+        assert_eq!(pending(triggered), (0, ActivationStatus::Triggered));
+        for (node, observer) in observers {
+            let result = observer.drain();
+            if node == 3 {
+                assert_eq!(result.unwrap(), 1);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            }
+        }
+    }
+
+    #[test]
+    fn output_replacement_rolls_back_rejection_and_quiesces_accepted_unresolved_state() {
+        let resolver = FakeResolver::new();
+        resolver.add(2, 16);
+        resolver.add(3, 64);
+        resolver.add(4, 8);
+        let mut session = ClientNodeSession::new(resolver);
+        let format = NegotiatedAudioFormat::pcm_s16le(48_000, 2).unwrap();
+        let (buffers, io) = output_descriptors();
+        session.apply(SessionCommand::SetFormat(format)).unwrap();
+        session
+            .apply(SessionCommand::UseBuffers(buffers.clone()))
+            .unwrap();
+        session.apply(SessionCommand::SetPortIo(io)).unwrap();
+        let old_generation = session.output.as_ref().unwrap().id();
+
+        let mut invalid = buffers.clone();
+        invalid.buffers[0].metadata.len = 8;
+        assert!(session
+            .apply(SessionCommand::UseBuffers(invalid))
+            .is_err());
+        assert_eq!(session.output.as_ref().unwrap().id(), old_generation);
+        assert_eq!(session.buffer_descriptor.as_ref(), Some(&buffers));
+        assert_eq!(session.io_descriptor, Some(io));
+
+        let mut unresolved = buffers;
+        unresolved.buffers[0].media_memory = MemoryId(99);
+        assert_eq!(
+            session
+                .apply(SessionCommand::UseBuffers(unresolved.clone()))
+                .unwrap(),
+            ApplyOutcome::PendingMemory
+        );
+        assert!(session.output.is_none());
+        assert!(session.io_descriptor.is_none());
+        assert_eq!(session.buffer_descriptor.as_ref(), Some(&unresolved));
+        assert_eq!(session.state(), SessionState::Configuring);
     }
 }

@@ -5,9 +5,9 @@
 
 use super::{
     config::{BufferSetDescriptor, NegotiatedAudioFormat, PortIoDescriptor},
-    cycle::{OutputBufferPublisher, OutputCycle, PublishedOutput},
+    cycle::{CommittedOutput, OutputBufferPublisher, OutputCycle, PublishedOutput},
     error::SessionError,
-    memory::{MemoryId, MemoryKey, MemoryMapping, MemoryResolver},
+    memory::{MemoryInterval, MemoryKey, MemoryMapping, MemoryResolver},
     port::{BufferStatus, BuffersIoView, OutputBuffer, PortIoType},
 };
 
@@ -17,11 +17,9 @@ const IO_SIZE: usize = 8;
 #[derive(Debug)]
 struct BoundBuffer {
     metadata_key: MemoryKey,
-    metadata_offset: usize,
     metadata: MemoryMapping,
     chunk_offset: usize,
     media_key: MemoryKey,
-    media_offset: usize,
     media: MemoryMapping,
 }
 
@@ -31,7 +29,6 @@ pub struct OutputGeneration {
     id: u64,
     format: NegotiatedAudioFormat,
     io_key: MemoryKey,
-    io_offset: usize,
     io: MemoryMapping,
     buffers: Box<[BoundBuffer]>,
 }
@@ -61,7 +58,7 @@ impl OutputGeneration {
             return Err(SessionError::NotReady("invalid Buffers IO size"));
         }
 
-        let mut intervals = vec![(io_key, io.region.offset, io.region.offset + io.region.len)];
+        let mut intervals = vec![io_mapping.interval()];
         let mut bound = Vec::with_capacity(buffers.buffers.len());
         for descriptor in &buffers.buffers {
             let chunk_offset = descriptor.metas.iter().try_fold(0usize, |offset, meta| {
@@ -82,20 +79,8 @@ impl OutputGeneration {
             if descriptor.max_size == 0 {
                 return Err(SessionError::NotReady("zero media capacity"));
             }
-            let media_end = descriptor
-                .map_offset
-                .checked_add(descriptor.max_size)
-                .ok_or(SessionError::Overflow("media plane"))?;
             let metadata_key = memory.resolve(descriptor.metadata.memory)?;
             let media_key = memory.resolve(descriptor.media_memory)?;
-            intervals.push((
-                metadata_key,
-                descriptor.metadata.offset,
-                descriptor.metadata.offset + descriptor.metadata.len,
-            ));
-            intervals.push((media_key, descriptor.map_offset, media_end));
-            reject_overlaps(&intervals)?;
-
             let mut metadata = memory.map(
                 metadata_key,
                 descriptor.metadata.offset,
@@ -104,6 +89,9 @@ impl OutputGeneration {
             )?;
             let mut media =
                 memory.map(media_key, descriptor.map_offset, descriptor.max_size, true)?;
+            intervals.push(metadata.interval());
+            intervals.push(media.interval());
+            reject_overlaps(&intervals)?;
             unsafe {
                 OutputBuffer::from_raw_parts(
                     metadata.as_mut_ptr().add(chunk_offset),
@@ -116,11 +104,9 @@ impl OutputGeneration {
             }
             bound.push(BoundBuffer {
                 metadata_key,
-                metadata_offset: descriptor.metadata.offset,
                 metadata,
                 chunk_offset,
                 media_key,
-                media_offset: descriptor.map_offset,
                 media,
             });
         }
@@ -128,7 +114,6 @@ impl OutputGeneration {
             id,
             format,
             io_key,
-            io_offset: io.region.offset,
             io: io_mapping,
             buffers: bound.into_boxed_slice(),
         })
@@ -145,12 +130,12 @@ impl OutputGeneration {
     }
 
     /// Returns whether this generation pins a numeric memory ID.
-    pub fn depends_on(&self, id: MemoryId) -> bool {
-        self.io_key.id == id
+    pub fn depends_on(&self, key: MemoryKey) -> bool {
+        self.io_key == key
             || self
                 .buffers
                 .iter()
-                .any(|buffer| buffer.metadata_key.id == id || buffer.media_key.id == id)
+                .any(|buffer| buffer.metadata_key == key || buffer.media_key == key)
     }
 
     pub(crate) fn process(
@@ -177,34 +162,17 @@ impl OutputGeneration {
         let Some(cycle) = publisher.select()? else {
             return Ok((None, BufferStatus::Ok as i32));
         };
-        let published = callback
+        let committed = callback
             .process(cycle)
             .map_err(|error| SessionError::Callback(error.message))?;
-        let state = publisher.io_state();
-        if state.status != BufferStatus::HaveData as i32 || state.buffer_id != published.buffer_id()
-        {
-            return Err(SessionError::InvalidTransition(
-                "callback returned without committing its selected cycle",
-            ));
-        }
+        let published = publisher.publish_committed(committed)?;
         Ok((Some(published), BufferStatus::HaveData as i32))
     }
 
-    pub(crate) fn intervals(&self) -> impl Iterator<Item = (MemoryKey, usize, usize)> + '_ {
-        std::iter::once((self.io_key, self.io_offset, self.io_offset + self.io.len())).chain(
+    pub(crate) fn intervals(&self) -> impl Iterator<Item = MemoryInterval> + '_ {
+        std::iter::once(self.io.interval()).chain(
             self.buffers.iter().flat_map(|buffer| {
-                [
-                    (
-                        buffer.metadata_key,
-                        buffer.metadata_offset,
-                        buffer.metadata_offset + buffer.metadata.len(),
-                    ),
-                    (
-                        buffer.media_key,
-                        buffer.media_offset,
-                        buffer.media_offset + buffer.media.len(),
-                    ),
-                ]
+                [buffer.metadata.interval(), buffer.media.interval()]
             }),
         )
     }
@@ -220,13 +188,13 @@ pub struct ProcessError {
 /// Runtime-independent output callback invoked only after an activation claim.
 pub trait OutputProcess {
     /// Fill and commit the server-selected output cycle.
-    fn process(&mut self, cycle: OutputCycle<'_>) -> Result<PublishedOutput, ProcessError>;
+    fn process(&mut self, cycle: OutputCycle<'_>) -> Result<CommittedOutput, ProcessError>;
 }
 
-fn reject_overlaps(intervals: &[(MemoryKey, usize, usize)]) -> Result<(), SessionError> {
+fn reject_overlaps(intervals: &[MemoryInterval]) -> Result<(), SessionError> {
     for (index, left) in intervals.iter().enumerate() {
         for right in &intervals[index + 1..] {
-            if left.0 == right.0 && left.1 < right.2 && right.1 < left.2 {
+            if left.overlaps(*right) {
                 return Err(SessionError::InvalidTransition(
                     "overlapping writable memory regions",
                 ));

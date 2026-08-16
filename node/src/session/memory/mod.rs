@@ -50,10 +50,32 @@ pub enum MemoryKind {
 #[derive(Debug)]
 struct MemoryEntry {
     key: MemoryKey,
+    backing: BackingIdentity,
     kind: MemoryKind,
     flags: u32,
     file_len: usize,
     fd: OwnedFd,
+}
+
+/// Stable Linux identity of a shared-memory backing object.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BackingIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// An absolute byte interval in one backing object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MemoryInterval {
+    pub(crate) backing: BackingIdentity,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+impl MemoryInterval {
+    pub(crate) fn overlaps(self, other: Self) -> bool {
+        self.backing == other.backing && self.start < other.end && other.start < self.end
+    }
 }
 
 /// Failure to import, resolve, or map connection memory.
@@ -197,7 +219,7 @@ impl MemoryPool {
             DataType::MemFd => MemoryKind::MemFd,
             other => return Err(MemoryError::UnsupportedMemoryType(other)),
         };
-        let file_len = file_len(fd.as_raw_fd()).map_err(MemoryError::Inspect)?;
+        let (file_len, backing) = file_identity(fd.as_raw_fd()).map_err(MemoryError::Inspect)?;
         if self.shrink_policy == ShrinkPolicy::RequireSealed
             && !seal_status(fd.as_raw_fd()).prevents_shrink()
         {
@@ -212,6 +234,7 @@ impl MemoryPool {
             id,
             Arc::new(MemoryEntry {
                 key,
+                backing,
                 kind,
                 flags,
                 file_len,
@@ -284,6 +307,7 @@ impl MemoryPool {
         Ok(MemoryMapping {
             mapped,
             entry: Arc::clone(entry),
+            offset,
         })
     }
 
@@ -327,6 +351,7 @@ impl MemoryPool {
 pub struct MemoryMapping {
     mapped: MappedRegion,
     entry: Arc<MemoryEntry>,
+    offset: usize,
 }
 
 impl fmt::Debug for MemoryMapping {
@@ -344,6 +369,20 @@ impl MemoryMapping {
     /// Returns the exact imported generation retained by this mapping.
     pub fn key(&self) -> MemoryKey {
         self.entry.key
+    }
+
+    /// Returns the stable identity of the mapped backing object.
+    pub fn backing_identity(&self) -> BackingIdentity {
+        self.entry.backing
+    }
+
+    /// Returns this mapping's checked absolute backing-file interval.
+    pub(crate) fn interval(&self) -> MemoryInterval {
+        MemoryInterval {
+            backing: self.entry.backing,
+            start: self.offset,
+            end: self.offset + self.mapped.len(),
+        }
     }
 
     /// Returns the canonical imported memory kind.
@@ -447,18 +486,25 @@ impl MemoryRegionGuard<'_> {
     }
 }
 
-fn file_len(fd: std::os::fd::RawFd) -> std::io::Result<usize> {
+fn file_identity(fd: std::os::fd::RawFd) -> std::io::Result<(usize, BackingIdentity)> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let stat = unsafe { stat.assume_init() };
-    usize::try_from(stat.st_size).map_err(|_| {
+    let len = usize::try_from(stat.st_size).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "imported memory has a negative or unsupported size",
         )
-    })
+    })?;
+    Ok((
+        len,
+        BackingIdentity {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino as u64,
+        },
+    ))
 }
 
 fn seal_status(fd: std::os::fd::RawFd) -> SealStatus {
@@ -602,6 +648,36 @@ mod tests {
             }) if active == second
         ));
         assert_eq!(pool.map(second, 0, 1, false).unwrap().key(), second);
+    }
+
+    #[test]
+    fn duplicated_handles_share_backing_identity_across_ids_and_generations() {
+        let mut pool = MemoryPool::new(ShrinkPolicy::RequireSealed);
+        let fd = sealed("aliased", 64);
+        let duplicate = fd.try_clone().unwrap();
+        let first = pool.add(MemoryId(20), data_type::MEM_FD, 0, fd).unwrap();
+        let second = pool
+            .add(MemoryId(21), data_type::MEM_FD, 0, duplicate)
+            .unwrap();
+        let first_mapping = pool.map(first, 4, 16, true).unwrap();
+        let second_mapping = pool.map(second, 8, 16, true).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            first_mapping.backing_identity(),
+            second_mapping.backing_identity()
+        );
+        assert!(first_mapping.interval().overlaps(second_mapping.interval()));
+
+        pool.remove(MemoryId(20)).unwrap();
+        let reused_fd = pool.live.get(&MemoryId(21)).unwrap().fd.try_clone().unwrap();
+        let reused = pool
+            .add(MemoryId(20), data_type::MEM_FD, 0, reused_fd)
+            .unwrap();
+        assert_ne!(first, reused);
+        assert_eq!(
+            first_mapping.backing_identity(),
+            pool.map(reused, 0, 1, true).unwrap().backing_identity()
+        );
     }
 
     #[test]

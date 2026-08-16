@@ -9,7 +9,7 @@ use super::{
     activation::{ActivationError, ActivationStatus, ActivationView},
     config::TransportDescriptor,
     error::SessionError,
-    memory::{MemoryKey, MemoryMapping, MemoryResolver},
+    memory::{MemoryInterval, MemoryKey, MemoryMapping, MemoryResolver},
 };
 use crate::signal::EventFd;
 
@@ -29,7 +29,6 @@ pub struct TransportGeneration {
     trigger: EventFd,
     _completion: EventFd,
     activation_key: MemoryKey,
-    activation_offset: usize,
     activation: MemoryMapping,
 }
 
@@ -57,7 +56,6 @@ impl TransportGeneration {
             trigger,
             _completion: completion,
             activation_key: key,
-            activation_offset: descriptor.activation.offset,
             activation: mapping,
         })
     }
@@ -72,12 +70,8 @@ impl TransportGeneration {
         self.activation_key
     }
 
-    pub(crate) fn interval(&self) -> (MemoryKey, usize, usize) {
-        (
-            self.activation_key,
-            self.activation_offset,
-            self.activation_offset + self.activation.len(),
-        )
+    pub(crate) fn interval(&self) -> MemoryInterval {
+        self.activation.interval()
     }
 
     /// Non-blockingly drains the coalesced wake counter.
@@ -108,7 +102,7 @@ impl TransportGeneration {
     pub(crate) fn claim_and_finish<T>(
         &mut self,
         awake_ns: u64,
-        finish_ns: u64,
+        finish_time: impl FnOnce() -> u64,
         process: impl FnOnce() -> Result<(T, i32), SessionError>,
     ) -> Result<ClaimCompletion<T>, SessionError> {
         let activation = self.activation_view()?;
@@ -129,7 +123,7 @@ impl TransportGeneration {
             Ok(Err(error)) => (Err(error), -libc::EIO),
             Err(_) => (Err(SessionError::CallbackPanicked), -libc::EIO),
         };
-        claim.publish_result_and_finish(status, finish_ns)?;
+        claim.publish_result_and_finish(status, finish_time())?;
         Ok(ClaimCompletion::Finished(result))
     }
 

@@ -183,6 +183,12 @@ impl BuffersIoView {
         unsafe { self.write_i32(abi::IO_STATUS, BufferStatus::HaveData as i32) };
     }
 
+    pub(crate) fn publish_need_data(&self, buffer_id: u32) {
+        unsafe { self.write_u32(abi::IO_BUFFER_ID, buffer_id) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        unsafe { self.write_i32(abi::IO_STATUS, BufferStatus::NeedData as i32) };
+    }
+
     unsafe fn read_i32(&self, offset: usize) -> i32 {
         unsafe { self.base.as_ptr().add(offset).cast::<i32>().read_volatile() }
     }
@@ -400,6 +406,12 @@ impl OutputBuffer {
             flags: flags.bits(),
         });
         Ok(())
+    }
+
+    pub(crate) fn abort(&self) {
+        let mut state = self.chunk.state();
+        state.size = 0;
+        self.chunk.publish(state);
     }
 
     /// Returns a volatile snapshot of this buffer's shared chunk.
