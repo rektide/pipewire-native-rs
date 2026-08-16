@@ -82,6 +82,8 @@ pub struct RunReport {
     pub last_registry_proxy_id: Option<u32>,
     /// Memory ids exported through scripted `Core::AddMem` actions.
     pub exported_mem_ids: Vec<u32>,
+    /// Number of live routed client objects at scenario completion.
+    pub live_object_routes: usize,
 }
 
 impl ScriptedServer {
@@ -779,6 +781,7 @@ fn to_run_report(state: ExecutionState) -> RunReport {
         last_sync: state.last_sync,
         last_registry_proxy_id: state.last_registry_proxy_id,
         exported_mem_ids: state.exported_mem_ids,
+        live_object_routes: state.object_routes.len(),
     }
 }
 
