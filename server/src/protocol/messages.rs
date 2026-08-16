@@ -185,7 +185,7 @@ pub fn decode_inbound_message_with_client_nodes(
                 let version = sp.pop_int()? as u32;
                 sp.pop_struct(|props| {
                     let count = props.pop_int()?;
-                    if count < 0 || count > 256 {
+                    if !(0..=256).contains(&count) {
                         return Err(spa::pod::Error::Invalid(
                             "invalid CreateObject property count".into(),
                         ));

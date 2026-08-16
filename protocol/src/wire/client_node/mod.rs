@@ -13,6 +13,8 @@ use pipewire_native_spa::{
 
 use crate::native::frame::FrameFds;
 
+type PropertyPairs = Vec<(String, String)>;
+
 /// Factory used to create a ClientNode object.
 pub const FACTORY_NAME: &str = "client-node";
 /// PipeWire ClientNode interface name.
@@ -1022,7 +1024,7 @@ fn pop_optional_port_info(
 fn pop_info_tail(
     sp: &mut spa::pod::parser::Parser<'_>,
     limits: Limits,
-) -> Result<(Vec<(String, String)>, Vec<ParamInfo>), spa::pod::Error> {
+) -> Result<(PropertyPairs, Vec<ParamInfo>), spa::pod::Error> {
     let n_properties = count(sp.pop_int()?, limits.max_properties, "properties")?;
     let mut properties = Vec::with_capacity(n_properties);
     for _ in 0..n_properties {

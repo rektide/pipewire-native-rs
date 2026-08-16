@@ -11,17 +11,21 @@ use crate::{
 };
 use pipewire_native_protocol::wire::client_node::{self as wire, Method};
 
+/// Sole owner callback for decoded ClientNode events and their transferred descriptors.
+pub type ClientNodeEventHandler = Box<dyn FnMut(wire::Event) + Send>;
+type SendMethod = Box<dyn FnMut(&ClientNode, Method) -> std::io::Result<()>>;
+
 refcounted! {
     /// Typed proxy for a client-created ClientNode v6 object.
     pub struct ClientNode {
         proxy: Proxy,
         methods: Arc<Mutex<ClientNodeMethods>>,
-        event_handler: Mutex<Option<Box<dyn FnMut(wire::Event) + Send>>>,
+        event_handler: Mutex<Option<ClientNodeEventHandler>>,
     }
 }
 
 pub(crate) struct ClientNodeMethods {
-    pub(crate) send: Box<dyn FnMut(&ClientNode, Method) -> std::io::Result<()>>,
+    pub(crate) send: SendMethod,
 }
 
 impl HasProxy for ClientNode {
@@ -75,7 +79,7 @@ impl ClientNode {
 
     /// Install the sole typed event owner. Replacing or clearing the handler drops
     /// any resources retained by the previous owner.
-    pub fn set_event_handler(&self, handler: Option<Box<dyn FnMut(wire::Event) + Send>>) {
+    pub fn set_event_handler(&self, handler: Option<ClientNodeEventHandler>) {
         *self.inner.event_handler.lock().unwrap() = handler;
     }
 
