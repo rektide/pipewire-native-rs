@@ -28,6 +28,8 @@ pub const MAX_SESSION_BUFFERS: usize = 64;
 pub const MAX_SESSION_METAS: usize = 64;
 /// Maximum retained data descriptors per buffer.
 pub const MAX_SESSION_DATAS: usize = 1;
+/// Maximum raw-audio channels accepted by the first PCM format.
+pub const MAX_AUDIO_CHANNELS: u32 = 64;
 const SPA_AUDIO_FORMAT_S16_LE: u32 = 0x103;
 
 /// PipeWire node identifier.
@@ -74,6 +76,9 @@ impl NegotiatedAudioFormat {
         let rate = NonZeroU32::new(rate).ok_or(SessionError::InvalidFormat("zero sample rate"))?;
         let channel_count =
             NonZeroU32::new(channels).ok_or(SessionError::InvalidFormat("zero channel count"))?;
+        if channel_count.get() > MAX_AUDIO_CHANNELS {
+            return Err(SessionError::TooManyDescriptors("audio channels"));
+        }
         let frame_stride = usize::try_from(channel_count.get())
             .ok()
             .and_then(|count| count.checked_mul(2))
@@ -246,6 +251,8 @@ pub enum UnsupportedFeature {
     AsyncIo,
     /// Client-allocated buffer reversal.
     ClientAllocatedBuffers,
+    /// Unknown buffer-set flags.
+    BufferFlags(u32),
     /// Multiple planes or a non-MemId plane.
     DataPlane,
     /// Data-plane flags outside the first writable mapping policy.
@@ -303,6 +310,11 @@ impl TryFrom<wire::PortUseBuffers> for BufferSetDescriptor {
             return Err(SessionError::Unsupported(
                 UnsupportedFeature::ClientAllocatedBuffers,
             ));
+        }
+        if value.flags != 0 {
+            return Err(SessionError::Unsupported(UnsupportedFeature::BufferFlags(
+                value.flags,
+            )));
         }
         if value.buffers.len() > MAX_SESSION_BUFFERS {
             return Err(SessionError::TooManyDescriptors("buffers"));

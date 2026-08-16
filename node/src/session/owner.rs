@@ -91,15 +91,25 @@ impl SessionCommand {
             wire::Event::Transport(value) => Ok(Self::ReplaceTransport(value.try_into()?)),
             wire::Event::PortSetParam(value) => {
                 if value.param.is_none() {
+                    super::config::validate_port(value.direction, value.port_id, None)?;
+                    if value.param_id != wire::SPA_PARAM_FORMAT {
+                        return Err(SessionError::Unsupported(
+                            super::config::UnsupportedFeature::Parameter(value.param_id),
+                        ));
+                    }
                     Ok(Self::ClearFormat)
                 } else {
                     Ok(Self::SetFormat(NegotiatedAudioFormat::from_wire(&value)?))
                 }
             }
-            wire::Event::PortUseBuffers(value) if value.buffers.is_empty() => {
-                Ok(Self::ClearBuffers)
+            wire::Event::PortUseBuffers(value) => {
+                let descriptor = BufferSetDescriptor::try_from(value)?;
+                if descriptor.buffers.is_empty() {
+                    Ok(Self::ClearBuffers)
+                } else {
+                    Ok(Self::UseBuffers(descriptor))
+                }
             }
-            wire::Event::PortUseBuffers(value) => Ok(Self::UseBuffers(value.try_into()?)),
             wire::Event::PortSetIo(value) => match PortIoUpdate::try_from(value)? {
                 PortIoUpdate::Set(value) => Ok(Self::SetPortIo(value)),
                 PortIoUpdate::Clear => Ok(Self::ClearPortIo),
@@ -686,6 +696,10 @@ mod tests {
         fn bytes(&self, key: MemoryKey, len: usize) -> MemoryMapping {
             self.0.borrow().map(key, 0, len, true).unwrap()
         }
+
+        fn remove(&self, id: MemoryId) {
+            self.0.borrow_mut().remove(id).unwrap();
+        }
     }
 
     impl MemoryResolver for FakeResolver {
@@ -926,6 +940,13 @@ mod tests {
                 received: generation + 1
             }
         );
+
+        resolver.remove(MemoryId(3));
+        session
+            .apply(SessionCommand::RemoveMemory(MemoryId(3)))
+            .unwrap();
+        assert_eq!(session.state(), SessionState::Configuring);
+        assert_eq!(unsafe { media_guard.bytes()[0] }, 0);
 
         session.apply(SessionCommand::Disconnect).unwrap();
         assert_eq!(
