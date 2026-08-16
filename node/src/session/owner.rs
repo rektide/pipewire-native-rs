@@ -1192,6 +1192,28 @@ mod tests {
     }
 
     #[test]
+    fn duplicated_handles_reject_every_writable_plane_pair() {
+        let resolver = FakeResolver::new();
+        let keys = resolver.add_aliases(&[40, 41, 42, 43, 44], 4096);
+        let mappings: Vec<_> = keys
+            .into_iter()
+            .map(|key| resolver.0.borrow().map(key, 0, 64, true).unwrap())
+            .collect();
+        let planes = ["transport", "metadata/chunk", "media", "IO", "peer"];
+        for left in 0..planes.len() {
+            for right in left + 1..planes.len() {
+                assert!(
+                    ensure_disjoint([mappings[left].interval()], [mappings[right].interval()])
+                        .is_err(),
+                    "{} unexpectedly aliased {}",
+                    planes[left],
+                    planes[right]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn commit_then_error_or_panic_aborts_output_and_deactivates() {
         for panic in [false, true] {
             let resolver = FakeResolver::new();
