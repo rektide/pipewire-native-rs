@@ -669,7 +669,13 @@ mod tests {
         assert!(first_mapping.interval().overlaps(second_mapping.interval()));
 
         pool.remove(MemoryId(20)).unwrap();
-        let reused_fd = pool.live.get(&MemoryId(21)).unwrap().fd.try_clone().unwrap();
+        let reused_fd = pool
+            .live
+            .get(&MemoryId(21))
+            .unwrap()
+            .fd
+            .try_clone()
+            .unwrap();
         let reused = pool
             .add(MemoryId(20), data_type::MEM_FD, 0, reused_fd)
             .unwrap();

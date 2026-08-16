@@ -171,9 +171,9 @@ impl OutputGeneration {
 
     pub(crate) fn intervals(&self) -> impl Iterator<Item = MemoryInterval> + '_ {
         std::iter::once(self.io.interval()).chain(
-            self.buffers.iter().flat_map(|buffer| {
-                [buffer.metadata.interval(), buffer.media.interval()]
-            }),
+            self.buffers
+                .iter()
+                .flat_map(|buffer| [buffer.metadata.interval(), buffer.media.interval()]),
         )
     }
 }

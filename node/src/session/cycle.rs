@@ -244,11 +244,7 @@ impl OutputBufferPublisher<'_, '_> {
                 buffer_count: self.buffers.len(),
             });
         }
-        self.buffers[selected].publish(
-            committed.bytes_used,
-            committed.stride,
-            committed.flags,
-        )?;
+        self.buffers[selected].publish(committed.bytes_used, committed.stride, committed.flags)?;
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         self.io.publish_have_data(committed.buffer_id);
         self.selected = None;
@@ -291,9 +287,7 @@ impl PublishedOutput {
 mod tests {
     use super::{CycleError, OutputBufferPublisher};
     use crate::session::config::NegotiatedAudioFormat;
-    use crate::session::port::{
-        BufferStatus, BuffersIoView, ChunkState, OutputBuffer, PortIoType,
-    };
+    use crate::session::port::{BufferStatus, BuffersIoView, ChunkState, OutputBuffer, PortIoType};
 
     #[repr(C, align(4))]
     struct Aligned<const N: usize>([u8; N]);

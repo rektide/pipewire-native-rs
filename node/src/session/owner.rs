@@ -477,28 +477,26 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
                 self.state = SessionState::Running;
                 Ok(WakeOutcome::NotClaimed { drained, missed })
             }
-            ClaimCompletion::Finished(result) => {
-                match result {
-                    Ok(published) => match self.peers.trigger_all(awake_ns) {
-                        Ok(()) => {
+            ClaimCompletion::Finished(result) => match result {
+                Ok(published) => match self.peers.trigger_all(awake_ns) {
+                    Ok(()) => {
                         self.state = SessionState::Running;
                         Ok(WakeOutcome::Processed {
                             drained,
                             missed,
                             produced: published.is_some(),
                         })
-                        }
-                        Err(error) => {
-                            self.fail();
-                            Err(error)
-                        }
-                    },
+                    }
                     Err(error) => {
                         self.fail();
                         Err(error)
                     }
+                },
+                Err(error) => {
+                    self.fail();
+                    Err(error)
                 }
-            }
+            },
         }
     }
 
@@ -791,8 +789,8 @@ mod tests {
             self.0.borrow().map(key, 0, len, true).unwrap()
         }
 
-        fn remove(&self, id: MemoryId) {
-            self.0.borrow_mut().remove(id).unwrap();
+        fn remove(&self, id: MemoryId) -> MemoryKey {
+            self.0.borrow_mut().remove(id).unwrap()
         }
     }
 
@@ -982,6 +980,16 @@ mod tests {
             .unwrap();
         assert_eq!(session.state(), SessionState::Running);
 
+        session.apply(SessionCommand::SetActive(false)).unwrap();
+        {
+            let mut own = resolver.bytes(own_key, ActivationView::required_size());
+            let activation =
+                unsafe { ActivationView::from_raw_parts(own.as_mut_ptr(), own.len()).unwrap() };
+            assert_eq!(activation.status().unwrap(), ActivationStatus::Inactive);
+        }
+        session.apply(SessionCommand::SetActive(true)).unwrap();
+        assert_eq!(session.state(), SessionState::Running);
+
         {
             let mut own = resolver.bytes(own_key, ActivationView::required_size());
             let activation =
@@ -1055,9 +1063,9 @@ mod tests {
             }
         );
 
-        resolver.remove(MemoryId(3));
+        let retired_media = resolver.remove(MemoryId(3));
         session
-            .apply(SessionCommand::RemoveMemory(MemoryId(3)))
+            .apply(SessionCommand::RemoveMemory(retired_media))
             .unwrap();
         assert_eq!(session.state(), SessionState::Configuring);
         assert_eq!(unsafe { media_guard.bytes()[0] }, 0);
@@ -1163,7 +1171,9 @@ mod tests {
         };
         assert!(matches!(
             session.apply(SessionCommand::SetPortIo(io)),
-            Err(SessionError::InvalidTransition("overlapping generation mappings"))
+            Err(SessionError::InvalidTransition(
+                "overlapping generation mappings"
+            ))
         ));
 
         let format = NegotiatedAudioFormat::pcm_s16le(48_000, 2).unwrap();
@@ -1222,17 +1232,11 @@ mod tests {
                 let mut own = resolver.bytes(own_key, ActivationView::required_size());
                 let mut guard = own.borrow();
                 let bytes = unsafe { guard.bytes_mut() };
-                bytes[0..4]
-                    .copy_from_slice(&(ActivationStatus::Triggered as u32).to_ne_bytes());
+                bytes[0..4].copy_from_slice(&(ActivationStatus::Triggered as u32).to_ne_bytes());
             }
             trigger.signal(1).unwrap();
             let error = session
-                .on_wake_with_finish(
-                    generation,
-                    100,
-                    || 140,
-                    &mut CommitThenFail { panic },
-                )
+                .on_wake_with_finish(generation, 100, || 140, &mut CommitThenFail { panic })
                 .unwrap_err();
             assert!(matches!(
                 (panic, error),
@@ -1256,6 +1260,19 @@ mod tests {
             let mut metadata = resolver.bytes(metadata_key, 16);
             let chunk = unsafe { ChunkView::from_raw_parts(metadata.as_mut_ptr(), 16).unwrap() };
             assert_eq!(chunk.state().size, 0);
+
+            session.apply(SessionCommand::SetActive(false)).unwrap();
+            session
+                .apply(SessionCommand::SetNodeCommand(NodeCommandState::Pause))
+                .unwrap();
+            session
+                .apply(SessionCommand::SetNodeCommand(NodeCommandState::Suspend))
+                .unwrap();
+            session.apply(SessionCommand::Disconnect).unwrap();
+            assert_eq!(
+                session.apply(SessionCommand::Disconnect).unwrap(),
+                ApplyOutcome::AlreadyDisconnected
+            );
         }
     }
 
@@ -1333,9 +1350,7 @@ mod tests {
 
         let mut invalid = buffers.clone();
         invalid.buffers[0].metadata.len = 8;
-        assert!(session
-            .apply(SessionCommand::UseBuffers(invalid))
-            .is_err());
+        assert!(session.apply(SessionCommand::UseBuffers(invalid)).is_err());
         assert_eq!(session.output.as_ref().unwrap().id(), old_generation);
         assert_eq!(session.buffer_descriptor.as_ref(), Some(&buffers));
         assert_eq!(session.io_descriptor, Some(io));
@@ -1351,6 +1366,117 @@ mod tests {
         assert!(session.output.is_none());
         assert!(session.io_descriptor.is_none());
         assert_eq!(session.buffer_descriptor.as_ref(), Some(&unresolved));
+        assert_eq!(session.state(), SessionState::Configuring);
+    }
+
+    #[test]
+    fn unresolved_permutation_converges_and_exact_revocation_survives_id_reuse() {
+        let resolver = FakeResolver::new();
+        let (transport_descriptor, old_trigger, _, _, _) = transport(MemoryId(1));
+        let (peer_fd, _) = event_pair();
+        let (buffers, io) = output_descriptors();
+        let mut session = ClientNodeSession::new(resolver.clone());
+
+        assert_eq!(
+            session
+                .apply(SessionCommand::ReplaceTransport(transport_descriptor))
+                .unwrap(),
+            ApplyOutcome::PendingMemory
+        );
+        session.apply(SessionCommand::UseBuffers(buffers)).unwrap();
+        session.apply(SessionCommand::SetPortIo(io)).unwrap();
+        assert_eq!(
+            session
+                .apply(SessionCommand::SetPeerActivation(
+                    PeerActivationDescriptor {
+                        node: NodeId(8),
+                        signal_fd: peer_fd,
+                        activation: RegionRef {
+                            memory: MemoryId(5),
+                            offset: 0,
+                            len: ActivationView::required_size(),
+                        },
+                    }
+                ))
+                .unwrap(),
+            ApplyOutcome::PendingMemory
+        );
+        assert_eq!(
+            session
+                .apply(SessionCommand::SetFormat(
+                    NegotiatedAudioFormat::pcm_s16le(48_000, 2).unwrap(),
+                ))
+                .unwrap(),
+            ApplyOutcome::PendingMemory
+        );
+        session.apply(SessionCommand::SetActive(true)).unwrap();
+        assert!(session
+            .apply(SessionCommand::SetNodeCommand(NodeCommandState::Start))
+            .is_err());
+
+        initialize_activation(&resolver, 1, ActivationStatus::Inactive, 0);
+        assert_eq!(
+            session
+                .apply(SessionCommand::MemoryAvailable(MemoryId(1)))
+                .unwrap(),
+            ApplyOutcome::PendingMemory
+        );
+        resolver.add(2, 16);
+        resolver.add(4, 8);
+        assert_eq!(
+            session
+                .apply(SessionCommand::MemoryAvailable(MemoryId(4)))
+                .unwrap(),
+            ApplyOutcome::PendingMemory
+        );
+        let old_media = resolver.add(3, 64);
+        initialize_activation(&resolver, 5, ActivationStatus::NotTriggered, 1);
+        session
+            .apply(SessionCommand::MemoryAvailable(MemoryId(5)))
+            .unwrap();
+        assert_eq!(session.state(), SessionState::Running);
+
+        resolver.remove(MemoryId(3));
+        let replacement_media = resolver.add(3, 64);
+        assert_ne!(old_media, replacement_media);
+        session
+            .apply(SessionCommand::RemoveMemory(old_media))
+            .unwrap();
+        assert!(session.output.is_none());
+        session
+            .apply(SessionCommand::MemoryAvailable(MemoryId(3)))
+            .unwrap();
+        let rebound = session.output.as_ref().unwrap().id();
+        session
+            .apply(SessionCommand::RemoveMemory(old_media))
+            .unwrap();
+        assert_eq!(session.output.as_ref().unwrap().id(), rebound);
+
+        let old_generation = session.transport_generation().unwrap();
+        initialize_activation(&resolver, 6, ActivationStatus::Inactive, 0);
+        let (replacement, _, _, _, _) = transport(MemoryId(6));
+        session
+            .apply(SessionCommand::ReplaceTransport(replacement))
+            .unwrap();
+        let registration = session.runtime_registration().unwrap().unwrap();
+        assert_ne!(registration.generation, old_generation);
+        old_trigger.signal(1).unwrap();
+        assert_eq!(
+            session
+                .on_wake(old_generation, 9, &mut PatternProcess { calls: 0 })
+                .unwrap(),
+            WakeOutcome::Stale {
+                expected: registration.generation,
+                received: old_generation,
+            }
+        );
+
+        session
+            .apply(SessionCommand::SetNodeCommand(NodeCommandState::Pause))
+            .unwrap();
+        session
+            .apply(SessionCommand::SetNodeCommand(NodeCommandState::Suspend))
+            .unwrap();
         assert_eq!(session.state(), SessionState::Configuring);
     }
 }
