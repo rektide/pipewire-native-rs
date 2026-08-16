@@ -76,7 +76,7 @@ impl<'a> Builder<'a> {
     }
 
     pub fn push_fd(self, value: RawFd) -> Self {
-        self.push_pod(&Fd(value))
+        self.push_pod(&Fd(i64::from(value)))
     }
 
     pub fn push_rectangle(self, width: u32, height: u32) -> Self {

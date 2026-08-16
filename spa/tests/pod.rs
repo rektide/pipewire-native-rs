@@ -178,6 +178,8 @@ fn test_pod_decode() {
         ptr: 0xdeadbeef as *const c_void,
     });
     test_a_pod(&Fd(-1));
+    test_a_pod(&Fd(-2));
+    test_a_pod(&Fd(0x1_0000_0000));
     test_a_pod(&Rectangle {
         width: 1920,
         height: 1080,

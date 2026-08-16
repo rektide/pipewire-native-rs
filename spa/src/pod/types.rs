@@ -3,7 +3,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
 use std::ffi::c_void;
-use std::os::fd::RawFd;
 
 use bitflags::bitflags;
 use pipewire_native_macros::EnumU32;
@@ -81,9 +80,12 @@ pub struct Pointer {
     pub ptr: *const c_void,
 }
 
-// We can't directly use RawFd because it conflicts with i32 (being a type alias for it)
+/// Full signed SPA_TYPE_Fd wire value.
+///
+/// This is an index or sentinel in native-protocol messages, not necessarily an
+/// operating-system file descriptor, and SPA encodes it as a signed 64-bit body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Fd(pub RawFd);
+pub struct Fd(pub i64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rectangle {

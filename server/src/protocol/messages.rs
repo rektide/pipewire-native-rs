@@ -299,7 +299,7 @@ pub struct CoreAddMemPayload {
     /// Memory type from `spa_data_type`.
     pub memory_type: u32,
     /// Index of the descriptor in the frame's FD table.
-    pub fd_index: i32,
+    pub fd_index: i64,
     /// Extra memory flags.
     pub flags: u32,
 }
@@ -449,5 +449,18 @@ mod tests {
         assert_eq!(decoded.memory_type, spa_data_type::MEM_FD);
         assert_eq!(decoded.fd_index, 2);
         assert_eq!(decoded.flags, 5);
+    }
+
+    #[test]
+    fn core_add_mem_decode_preserves_full_signed_fd_body() {
+        let mut payload = encode_core_add_mem_payload(9, spa_data_type::MEM_FD, 0, 0).unwrap();
+        payload[48..56].copy_from_slice(&0x1_0000_0000_i64.to_ne_bytes());
+        assert_eq!(
+            decode_core_add_mem_payload(&payload).unwrap().fd_index,
+            0x1_0000_0000
+        );
+
+        payload[48..56].copy_from_slice(&(-2_i64).to_ne_bytes());
+        assert_eq!(decode_core_add_mem_payload(&payload).unwrap().fd_index, -2);
     }
 }

@@ -8,7 +8,6 @@ pub mod parser;
 pub mod types;
 
 use std::ffi::c_void;
-use std::os::fd::RawFd;
 
 use types::{Choice, Fd, Fraction, Id, Pointer, Property, PropertyFlags, Rectangle, Type};
 
@@ -418,13 +417,13 @@ impl Primitive for Fd {
     }
 
     fn encode_body(&self, data: &mut [u8]) -> Result<(), Error> {
-        data[0..8].copy_from_slice(&(self.0 as i64).to_ne_bytes());
+        data[0..8].copy_from_slice(&self.0.to_ne_bytes());
         Ok(())
     }
 
     fn decode_body(data: &[u8]) -> Result<Fd, Error> {
         let val = i64::from_ne_bytes(data[0..8].try_into().unwrap());
-        Ok(Fd(val as RawFd))
+        Ok(Fd(val))
     }
 }
 

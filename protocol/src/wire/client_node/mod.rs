@@ -48,6 +48,12 @@ pub const SPA_IO_ASYNC_BUFFERS: u32 = PortIoType::AsyncBuffers as u32;
 pub const SPA_PARAM_FORMAT: u32 = 4;
 /// Client-allocation reversal, intentionally unsupported by the first output cycle.
 pub const SPA_NODE_BUFFERS_FLAG_ALLOC: u32 = 1;
+const NODE_INFO_CHANGE_MASK: u64 = 0x7;
+const PORT_INFO_CHANGE_MASK: u64 = 0xf;
+const NODE_INFO_CHANGE_PROPS: u64 = 1 << 1;
+const NODE_INFO_CHANGE_PARAMS: u64 = 1 << 2;
+const INITIAL_ENCODE_CAPACITY: usize = 1024;
+const MAX_ENCODE_CAPACITY: usize = 16 * 1024 * 1024;
 
 /// Exact `pw_node_activation.status` values used by ClientNode v6.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -865,16 +871,31 @@ fn decode_command(bytes: &[u8]) -> Result<Command, spa::pod::Error> {
 }
 
 fn encode_payload(
-    build: impl FnOnce(spa::pod::builder::StructBuilder<'_>) -> spa::pod::builder::StructBuilder<'_>,
+    build: impl Fn(spa::pod::builder::StructBuilder<'_>) -> spa::pod::builder::StructBuilder<'_>,
 ) -> io::Result<Vec<u8>> {
-    let mut data = vec![0_u8; 16 * 1024 * 1024];
-    let size = spa::pod::builder::Builder::new(&mut data)
-        .push_struct(build)
-        .build()
-        .map_err(pod_error)?
-        .len();
-    data.truncate(size);
-    Ok(data)
+    let mut capacity = INITIAL_ENCODE_CAPACITY;
+    loop {
+        let mut data = vec![0_u8; capacity];
+        match spa::pod::builder::Builder::new(&mut data)
+            .push_struct(&build)
+            .build()
+        {
+            Ok(pod) => {
+                let size = pod.len();
+                data.truncate(size);
+                return Ok(data);
+            }
+            Err(spa::pod::Error::NoSpace) if capacity < MAX_ENCODE_CAPACITY => {
+                capacity = capacity.saturating_mul(2).min(MAX_ENCODE_CAPACITY);
+            }
+            Err(spa::pod::Error::NoSpace) => {
+                return Err(invalid_input(format!(
+                    "ClientNode payload exceeds {MAX_ENCODE_CAPACITY} byte limit"
+                )))
+            }
+            Err(error) => return Err(pod_error(error)),
+        }
+    }
 }
 
 fn parse_payload<T>(
@@ -907,13 +928,24 @@ fn push_node_info<'a>(
     sb: spa::pod::builder::StructBuilder<'a>,
     info: &NodeInfo,
 ) -> spa::pod::builder::StructBuilder<'a> {
+    let change_mask = info.change_mask & NODE_INFO_CHANGE_MASK;
+    let properties = if change_mask & NODE_INFO_CHANGE_PROPS != 0 {
+        info.properties.as_slice()
+    } else {
+        &[]
+    };
+    let params = if change_mask & NODE_INFO_CHANGE_PARAMS != 0 {
+        info.params.as_slice()
+    } else {
+        &[]
+    };
     push_info_tail(
         sb.push_int(info.max_input_ports as i32)
             .push_int(info.max_output_ports as i32)
-            .push_long(info.change_mask as i64)
+            .push_long(change_mask as i64)
             .push_long(info.flags as i64),
-        &info.properties,
-        &info.params,
+        properties,
+        params,
     )
 }
 
@@ -922,7 +954,7 @@ fn push_port_info<'a>(
     info: &PortInfo,
 ) -> spa::pod::builder::StructBuilder<'a> {
     push_info_tail(
-        sb.push_long(info.change_mask as i64)
+        sb.push_long((info.change_mask & PORT_INFO_CHANGE_MASK) as i64)
             .push_long(info.flags as i64)
             .push_int(info.rate_num as i32)
             .push_int(info.rate_denom as i32),
@@ -962,7 +994,7 @@ fn pop_optional_node_info(
                 .pop_struct(|sp| {
                     let max_input_ports = sp.pop_int()? as u32;
                     let max_output_ports = sp.pop_int()? as u32;
-                    let change_mask = sp.pop_long()? as u64;
+                    let change_mask = sp.pop_long()? as u64 & NODE_INFO_CHANGE_MASK;
                     let flags = sp.pop_long()? as u64;
                     let (properties, params) = pop_info_tail(sp, limits)?;
                     if sp.available() != 0 {
@@ -996,7 +1028,7 @@ fn pop_optional_port_info(
             let mut parser = spa::pod::parser::Parser::new(pod.data());
             parser
                 .pop_struct(|sp| {
-                    let change_mask = sp.pop_long()? as u64;
+                    let change_mask = sp.pop_long()? as u64 & PORT_INFO_CHANGE_MASK;
                     let flags = sp.pop_long()? as u64;
                     let rate_num = sp.pop_int()? as u32;
                     let rate_denom = sp.pop_int()? as u32;
@@ -1063,8 +1095,12 @@ fn validate_method(value: &Method, limits: Limits) -> io::Result<()> {
     let (params, property_count, param_info_count) = match value {
         Method::Update(value) => (
             value.params.as_slice(),
-            value.info.as_ref().map_or(0, |info| info.properties.len()),
-            value.info.as_ref().map_or(0, |info| info.params.len()),
+            value.info.as_ref().map_or(0, |info| {
+                usize::from(info.change_mask & NODE_INFO_CHANGE_PROPS != 0) * info.properties.len()
+            }),
+            value.info.as_ref().map_or(0, |info| {
+                usize::from(info.change_mask & NODE_INFO_CHANGE_PARAMS != 0) * info.params.len()
+            }),
         ),
         Method::PortUpdate(value) => (
             value.params.as_slice(),
@@ -1165,7 +1201,7 @@ fn count(value: i32, max: usize, name: &str) -> Result<usize, spa::pod::Error> {
     Ok(value)
 }
 
-fn fd_index(value: i32) -> io::Result<u32> {
+fn fd_index(value: i64) -> io::Result<u32> {
     u32::try_from(value).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1174,7 +1210,7 @@ fn fd_index(value: i32) -> io::Result<u32> {
     })
 }
 
-fn pod_fd_index(value: i32) -> Result<u32, spa::pod::Error> {
+fn pod_fd_index(value: i64) -> Result<u32, spa::pod::Error> {
     u32::try_from(value)
         .map_err(|_| spa::pod::Error::Invalid(format!("negative frame FD index {value}")))
 }

@@ -41,6 +41,10 @@ fn raw_object(type_id: u32, object_id: u32) -> RawPodOwned {
     RawPodOwned::wrap(bytes).unwrap()
 }
 
+fn overwrite_fd_body(payload: &mut [u8], offset: usize, value: i64) {
+    payload[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+}
+
 fn frame_fds(fds: Vec<OwnedFd>) -> FrameFds {
     let (tx, rx) = UnixStream::pair().unwrap();
     let limits = FrameLimits::default();
@@ -117,6 +121,81 @@ fn selected_methods_round_trip_and_set_active_matches_pinned_bytes() {
     assert_eq!(
         wire::encode_method(&Method::SetActive(SetActive { active: true })).unwrap(),
         [0x10, 0, 0, 0, 0x0e, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,]
+    );
+}
+
+#[test]
+fn update_info_masks_match_pinned_upstream_emission() {
+    let update = Method::Update(Update {
+        change_mask: 1,
+        params: vec![],
+        info: Some(NodeInfo {
+            max_input_ports: 0,
+            max_output_ports: 1,
+            change_mask: u64::MAX,
+            flags: 0,
+            properties: vec![("node.name".into(), "fixture".into())],
+            params: vec![ParamInfo { id: 4, flags: 2 }],
+        }),
+    });
+    let Method::Update(decoded) = wire::decode_method(
+        update.opcode(),
+        &wire::encode_method(&update).unwrap(),
+        Limits::default(),
+    )
+    .unwrap() else {
+        panic!("wrong method")
+    };
+    let info = decoded.info.unwrap();
+    assert_eq!(info.change_mask, 0x7);
+    assert_eq!(info.properties.len(), 1);
+    assert_eq!(info.params.len(), 1);
+
+    let absent = Method::Update(Update {
+        change_mask: 1,
+        params: vec![],
+        info: Some(NodeInfo {
+            max_input_ports: 0,
+            max_output_ports: 1,
+            change_mask: 1,
+            flags: 0,
+            properties: vec![("must.not.emit".into(), "value".into())],
+            params: vec![ParamInfo { id: 4, flags: 2 }],
+        }),
+    });
+    let Method::Update(decoded) = wire::decode_method(
+        absent.opcode(),
+        &wire::encode_method(&absent).unwrap(),
+        Limits::default(),
+    )
+    .unwrap() else {
+        panic!("wrong method")
+    };
+    let info = decoded.info.unwrap();
+    assert!(info.properties.is_empty());
+    assert!(info.params.is_empty());
+}
+
+#[test]
+fn encoder_starts_small_and_enforces_total_payload_bound() {
+    let small = wire::encode_method(&Method::SetActive(SetActive { active: true })).unwrap();
+    assert!(small.capacity() <= 1024);
+
+    let oversized = Method::Update(Update {
+        change_mask: 1,
+        params: vec![],
+        info: Some(NodeInfo {
+            max_input_ports: 0,
+            max_output_ports: 1,
+            change_mask: 2,
+            flags: 0,
+            properties: vec![("x".into(), "x".repeat(16 * 1024 * 1024))],
+            params: vec![],
+        }),
+    });
+    assert_eq!(
+        wire::encode_method(&oversized).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
     );
 }
 
@@ -297,6 +376,39 @@ fn descriptor_events_resolve_exact_frame_local_indices_and_clear_without_fd() {
         .unwrap(),
         Event::SetActivation(wire::SetActivation::Remove { node_id: 55 })
     ));
+}
+
+#[test]
+fn descriptor_indices_reject_full_width_aliases_and_non_sentinel_negatives() {
+    let region = RegionRef {
+        memory_id: 4,
+        offset: 0,
+        size: 2312,
+    };
+    for invalid in [0x1_0000_0000_i64, -2] {
+        let mut transport = wire::encode_transport(0, 1, region).unwrap();
+        overwrite_fd_body(&mut transport, 16, invalid);
+        let (_, one) = pipe_fd();
+        let (_, two) = pipe_fd();
+        assert!(wire::decode_event(
+            wire::event::TRANSPORT,
+            &transport,
+            &mut frame_fds(vec![one, two]),
+            Limits::default(),
+        )
+        .is_err());
+
+        let mut activation = wire::encode_set_activation(9, Some((0, region))).unwrap();
+        overwrite_fd_body(&mut activation, 32, invalid);
+        let (_, signal) = pipe_fd();
+        assert!(wire::decode_event(
+            wire::event::SET_ACTIVATION,
+            &activation,
+            &mut frame_fds(vec![signal]),
+            Limits::default(),
+        )
+        .is_err());
+    }
 }
 
 #[test]
