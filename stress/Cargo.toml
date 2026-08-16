@@ -25,6 +25,10 @@ path = "src/main.rs"
 name = "pw-stress-report"
 path = "src/report_main.rs"
 
+[[bin]]
+name = "pw-criterion-marker"
+path = "src/criterion_marker_main.rs"
+
 [[bench]]
 name = "subsystems"
 harness = false

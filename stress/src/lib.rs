@@ -1,6 +1,8 @@
 //! Reusable correctness-first stress workloads for pipewire-native subsystems.
 
+pub mod benchmark;
 pub mod frame;
+pub mod marker;
 pub mod memory;
 pub mod pod;
 pub mod report;

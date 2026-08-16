@@ -61,6 +61,7 @@ counts, FD ownership, and lifecycle state before reporting a successful sample:
 ```sh
 cargo test --manifest-path stress/Cargo.toml
 stress/hyperfine.sh
+stress/criterion.sh --plotting-backend disabled
 ```
 
 The node crate's private activation ABI support and opt-in upstream differential

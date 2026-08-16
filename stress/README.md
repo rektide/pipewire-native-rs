@@ -1,6 +1,6 @@
 # Correctness-first stress harness
 
-`pw-stress` drives production frame transport, SPA POD, and session memory APIs. Every timed invocation deterministically generates or selects a scenario, executes it, verifies counts/checksums/lifecycle state, and exits nonzero before printing anything if verification fails. A successful run prints one JSON line.
+`pw-stress` drives production frame transport, SPA POD, and session memory APIs. Every timed invocation deterministically generates or selects a scenario, executes it, verifies counts/checksums/lifecycle state, and exits nonzero before printing anything if verification fails. A successful run prints one JSON line. Hyperfine measures end-to-end commands; Criterion tracks in-process subsystem performance over source history.
 
 ## Architecture
 
@@ -47,7 +47,49 @@ stress/target/release/pw-stress-report --help
 
 Hyperfine exports a command string rather than an argv array. The reporter applies POSIX shell-word splitting and then executes the resulting argv directly without a shell. This correctly preserves quoted spaces, but an unquoted executable path containing spaces is inherently ambiguous. In that case, pass `--argv-overrides FILE`; the file is a JSON object mapping each exact exported command string to an array containing the executable and arguments.
 
-## Interpreting results
+## Criterion history
+
+[`criterion.sh`](/stress/criterion.sh) wraps cargo-criterion 1.1.0 and Criterion 0.8.2. Unlike Hyperfine, each Criterion scenario is generated and validated once outside timing. Every measured iteration invokes the production `execute` stage and then the independent `verify` stage; only the successful `Verified` value is black-boxed. Compilation is outside cargo-criterion's measurements.
+
+Select a bounded matrix with `PW_CRITERION_PROFILE`:
+
+| Profile | Cases | Intended use |
+|---|---:|---|
+| `smoke` (default) | 6 | Fast local signal across two frame, two POD, and two memory cases. |
+| `ci` | 12 | Smoke plus meaningful medium-size and descriptor/lifecycle variants. |
+| `full` | 18 | CI plus bounded expensive payload, parser, mapping, and syscall-heavy cases. |
+
+Frame IDs include frames per batch, payload bytes, FDs per frame, FD density, coalesced/segmented progress, receive chunk bytes, load policy, and seed. POD IDs include decode-only/encode-decode mode, depth, width, values per container, payload bytes, load policy, and seed. Memory IDs include region bytes, live mappings, retire cycles, load policy, and seed. This makes an ID's meaning stable even if profile membership changes.
+
+```sh
+# Inspect source correlation without benchmarking.
+stress/criterion.sh --print-marker
+
+# Run the smoke matrix without plots.
+stress/criterion.sh --plotting-backend disabled
+
+# Run CI cases matching a benchmark regex and override Criterion statistics.
+PW_CRITERION_PROFILE=ci stress/criterion.sh --plotting-backend disabled -- 'frame|pod' --sample-size 20 --warm-up-time 1 --measurement-time 3
+
+# Give release or CI runs durable names and descriptions.
+HISTORY_ID=v0.2.0-linux-x86_64 HISTORY_DESCRIPTION='v0.2.0 dedicated runner' PW_CRITERION_PROFILE=full stress/criterion.sh
+```
+
+Arguments are preserved as an argv array without `eval`. Options before `--` are cargo-criterion options. A benchmark regex and Criterion binary options can follow `--`; inspect them with `cargo criterion --manifest-path stress/Cargo.toml --bench subsystems -- --help`. Invalid profiles fail clearly and nonzero.
+
+The default history marker uses the jj working-copy commit `@`, because jj snapshots the filesystem Cargo actually builds into `@`. After a normal `jj commit`, the new empty `@` has the same tree as `@-`; metadata records that equality, both full commit/change IDs, parent IDs, bookmarks, first-line description, and dirty state. Selecting `@-` unconditionally would mislabel uncommitted measured files. Outside jj, a clean tree uses the Git `HEAD`; a dirty tree adds a deterministic fingerprint of tracked changes and untracked file names/content. `HISTORY_ID` is sanitized to a concise filesystem-safe value, while its original value remains in metadata. `HISTORY_DESCRIPTION` replaces the rich default description.
+
+The wrapper passes `--history-id`, `--history-description`, and `--message-format json`. Human progress, confidence intervals, and change detection remain on stderr. Machine output is atomically installed at `stress/results/criterion/<history-id>/results.jsonl`; `metadata.json` records timestamp, profile, complete source IDs, tools, kernel, invoked args, and relevant build environment. Both `stress/results/` and `stress/target/` are ignored. cargo-criterion keeps baselines and history reports under `stress/target/criterion/`; retain or cache that directory between CI runs to preserve comparisons, and upload the marker directory as a CI artifact. Avoid sharing a target history cache between incompatible machines or compiler configurations.
+
+Criterion reports `Elements/s` from the exact independently verified count per measured iteration:
+
+- Frame elements are frames transported and verified.
+- POD elements are complete POD records decoded and verified; encode-decode mode also rebuilds each record.
+- Memory elements are mappings created, generation-checked, touched, retired, and verified. The generation count equals the mapping count.
+
+Compare only identical benchmark IDs on comparable hosts. Confidence intervals describe sampling uncertainty, not portability; apparent changes on shared or frequency-scaling machines can be noise. A history description and metadata make a result attributable, but CPU affinity, a fixed governor, thermal control, and longer measurement settings are still needed for publishable claims.
+
+## Interpreting Hyperfine results
 
 Hyperfine measures full process execution, including deterministic generation and mandatory verification. Reports define mean operations/s as `verified operations / Hyperfine mean elapsed seconds`; the conservative range is `operations / max elapsed` through `operations / min elapsed`. Decimal MB/s uses 1,000,000 bytes and binary MiB/s uses 1,048,576 bytes. Auxiliary rates are `fds/s` for frame, `fixture-bytes/s` for POD (the encoded fixture size divided by elapsed time, not additional processed bytes), and `generations/s` for memory. POD `decode-only` isolates parser work more closely; `encode-decode` includes Builder allocation/encoding. Frame results include socket and descriptor creation plus nonblocking progress. Memory results include sealed memfd creation, import, mmap, touching every byte, retirement, generation checks, unmap, and an FD baseline check.
 
