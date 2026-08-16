@@ -103,6 +103,23 @@ impl<'buffers, 'format> OutputBufferPublisher<'buffers, 'format> {
 }
 
 /// Exclusive, callback-scoped access to one server-selected output media plane.
+///
+/// The cycle and its media borrow cannot escape the callback scope:
+///
+/// ```compile_fail
+/// use pipewire_native_node::session::cycle::OutputCycle;
+/// fn leak(cycle: &mut OutputCycle<'_>) -> &'static mut [u8] {
+///     cycle.interleaved_pcm()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pipewire_native_node::session::cycle::OutputCycle;
+/// static mut CYCLE: Option<OutputCycle<'static>> = None;
+/// fn leak(cycle: OutputCycle<'_>) {
+///     unsafe { CYCLE = Some(cycle) };
+/// }
+/// ```
 #[derive(Debug)]
 pub struct OutputCycle<'cycle> {
     io: &'cycle BuffersIoView,

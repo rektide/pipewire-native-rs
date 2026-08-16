@@ -48,6 +48,13 @@ pub enum SessionError {
         /// Fatal activation-state failure.
         source: ActivationError,
     },
+    /// A peer became TRIGGERED but its eventfd write failed.
+    PeerSignal {
+        /// Downstream node left in the triggered state.
+        peer: NodeId,
+        /// Fatal eventfd write failure.
+        source: std::io::Error,
+    },
     /// Current configuration does not meet the command's readiness barrier.
     NotReady(&'static str),
     /// Command is not valid in the current state.

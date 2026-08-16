@@ -248,6 +248,8 @@ pub enum UnsupportedFeature {
     ClientAllocatedBuffers,
     /// Multiple planes or a non-MemId plane.
     DataPlane,
+    /// Data-plane flags outside the first writable mapping policy.
+    DataFlags(u32),
     /// Non-audio/non-raw media.
     MediaFormat,
     /// Non-S16LE sample encoding.
@@ -316,6 +318,11 @@ impl TryFrom<wire::PortUseBuffers> for BufferSetDescriptor {
             let data = buffer.datas[0];
             if DataType::try_from(data.type_id) != Ok(DataType::MemId) {
                 return Err(SessionError::Unsupported(UnsupportedFeature::DataPlane));
+            }
+            if data.flags != 0 {
+                return Err(SessionError::Unsupported(UnsupportedFeature::DataFlags(
+                    data.flags,
+                )));
             }
             buffers.push(BufferDescriptor {
                 metadata: buffer.metadata.try_into()?,

@@ -493,6 +493,21 @@ mod tests {
         unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
     }
 
+    fn fd_identity(fd: RawFd) -> (libc::dev_t, libc::ino_t) {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        assert_eq!(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, 0);
+        let stat = unsafe { stat.assume_init() };
+        (stat.st_dev, stat.st_ino)
+    }
+
+    fn fd_identity_is_open(fd: RawFd, identity: (libc::dev_t, libc::ino_t)) -> bool {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        (unsafe { libc::fstat(fd, stat.as_mut_ptr()) == 0 }) && {
+            let stat = unsafe { stat.assume_init() };
+            (stat.st_dev, stat.st_ino) == identity
+        }
+    }
+
     #[test]
     fn duplicate_active_ids_are_rejected_and_candidate_fd_is_closed() {
         let mut pool = MemoryPool::new(ShrinkPolicy::RequireSealed);
@@ -500,11 +515,12 @@ mod tests {
             .unwrap();
         let duplicate = sealed("duplicate", 64);
         let raw = duplicate.as_raw_fd();
+        let identity = fd_identity(raw);
         assert!(matches!(
             pool.add(MemoryId(7), data_type::MEM_FD, 0, duplicate),
             Err(MemoryError::DuplicateActiveId(MemoryId(7)))
         ));
-        assert!(!fd_is_open(raw));
+        assert!(!fd_identity_is_open(raw, identity));
     }
 
     #[test]
@@ -512,19 +528,21 @@ mod tests {
         let mut pool = MemoryPool::new(ShrinkPolicy::RequireSealed);
         let unsupported = sealed("unsupported", 64);
         let unsupported_raw = unsupported.as_raw_fd();
+        let unsupported_identity = fd_identity(unsupported_raw);
         assert!(matches!(
             pool.add(MemoryId(1), data_type::DMA_BUF, 0, unsupported),
             Err(MemoryError::UnsupportedMemoryType(DataType::DmaBuf))
         ));
-        assert!(!fd_is_open(unsupported_raw));
+        assert!(!fd_identity_is_open(unsupported_raw, unsupported_identity));
 
         let unknown = sealed("unknown", 64);
         let unknown_raw = unknown.as_raw_fd();
+        let unknown_identity = fd_identity(unknown_raw);
         assert!(matches!(
             pool.add(MemoryId(1), 99, 0, unknown),
             Err(MemoryError::UnknownMemoryType(99))
         ));
-        assert!(!fd_is_open(unknown_raw));
+        assert!(!fd_identity_is_open(unknown_raw, unknown_identity));
     }
 
     #[test]
@@ -547,6 +565,7 @@ mod tests {
         let mut pool = MemoryPool::new(ShrinkPolicy::RequireSealed);
         let fd = sealed("retire", 64);
         let raw = fd.as_raw_fd();
+        let identity = fd_identity(raw);
         let key = pool.add(MemoryId(3), data_type::MEM_FD, 0, fd).unwrap();
         let mut mapping = pool.map(key, 0, 64, true).unwrap();
         pool.remove(MemoryId(3)).unwrap();
@@ -561,7 +580,7 @@ mod tests {
             assert_eq!(unsafe { guard.bytes()[0] }, 0x5a);
         }
         drop(mapping);
-        assert!(!fd_is_open(raw));
+        assert!(!fd_identity_is_open(raw, identity));
     }
 
     #[test]
@@ -590,14 +609,16 @@ mod tests {
         let mut pool = MemoryPool::new(ShrinkPolicy::RequireSealed);
         let clear_fd = sealed("clear", 64);
         let clear_raw = clear_fd.as_raw_fd();
+        let clear_identity = fd_identity(clear_raw);
         pool.add(MemoryId(5), data_type::MEM_FD, 0, clear_fd)
             .unwrap();
         pool.clear();
         assert!(pool.is_empty());
-        assert!(!fd_is_open(clear_raw));
+        assert!(!fd_identity_is_open(clear_raw, clear_identity));
 
         let reuse_fd = sealed("reuse", 64);
         let reuse_raw = reuse_fd.as_raw_fd();
+        let reuse_identity = fd_identity(reuse_raw);
         let key = pool
             .add(MemoryId(5), data_type::MEM_FD, 0, reuse_fd)
             .unwrap();
@@ -614,7 +635,7 @@ mod tests {
             Err(MemoryError::Disconnected)
         ));
         drop(mapping);
-        assert!(!fd_is_open(reuse_raw));
+        assert!(!fd_identity_is_open(reuse_raw, reuse_identity));
     }
 
     #[test]
@@ -651,12 +672,13 @@ mod tests {
         let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(raw >= 0);
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let identity = fd_identity(raw);
         assert_eq!(unsafe { libc::ftruncate(raw, 64) }, 0);
         let mut pool = MemoryPool::new(ShrinkPolicy::RequireSealed);
         assert!(matches!(
             pool.add(MemoryId(10), data_type::MEM_FD, 0, fd),
             Err(MemoryError::ShrinkableMemory(MemoryId(10)))
         ));
-        assert!(!fd_is_open(raw));
+        assert!(!fd_identity_is_open(raw, identity));
     }
 }
