@@ -28,10 +28,24 @@ pub const ACTIVATION_VERSION: u32 = 1;
 /// PipeWire invalid-ID sentinel.
 pub const INVALID_ID: u32 = u32::MAX;
 
-/// Synchronous port IO used by the first output cycle.
-pub const SPA_IO_BUFFERS: u32 = 1;
-/// Double-buffered port IO, decoded on the wire but not processed by the first cycle.
-pub const SPA_IO_ASYNC_BUFFERS: u32 = 10;
+/// Public SPA port IO identifiers relevant to output buffer exchange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PortIoType {
+    /// Synchronous `spa_io_buffers` used by the first output cycle.
+    Buffers = 1,
+    /// Double-buffered `spa_io_async_buffers`, not processed by the first cycle.
+    AsyncBuffers = 10,
+}
+
+/// Wire value for synchronous `spa_io_buffers`.
+pub const SPA_IO_BUFFERS: u32 = PortIoType::Buffers as u32;
+/// Wire value for double-buffered `spa_io_async_buffers`.
+pub const SPA_IO_ASYNC_BUFFERS: u32 = PortIoType::AsyncBuffers as u32;
+/// Format parameter selected for the first output port.
+pub const SPA_PARAM_FORMAT: u32 = 4;
+/// Client-allocation reversal, intentionally unsupported by the first output cycle.
+pub const SPA_NODE_BUFFERS_FLAG_ALLOC: u32 = 1;
 
 /// Exact `pw_node_activation.status` values used by ClientNode v6.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -398,6 +412,12 @@ pub enum Event {
 
 /// Encode one selected client-to-server method payload.
 pub fn encode_method(value: &Method) -> io::Result<Vec<u8>> {
+    encode_method_with_limits(value, Limits::default())
+}
+
+/// Encode one selected method after applying explicit peer-style bounds.
+pub fn encode_method_with_limits(value: &Method, limits: Limits) -> io::Result<Vec<u8>> {
+    validate_method(value, limits)?;
     match value {
         Method::Update(value) => encode_payload(|sb| {
             let mut sb = sb
@@ -439,7 +459,11 @@ pub fn decode_method(opcode: u8, payload: &[u8], limits: Limits) -> io::Result<M
             let count = count(sp.pop_int()?, limits.max_params, "params")?;
             let params = pop_pods(sp, count, limits.max_pod_bytes)?;
             let info = pop_optional_node_info(sp, limits)?;
-            Ok(Method::Update(Update { change_mask, params, info }))
+            Ok(Method::Update(Update {
+                change_mask,
+                params,
+                info,
+            }))
         }),
         method::PORT_UPDATE => parse_payload(payload, |sp| {
             let direction = direction(sp.pop_int()?)?;
@@ -478,6 +502,12 @@ pub fn decode_event(
     fds: &mut FrameFds,
     limits: Limits,
 ) -> io::Result<Event> {
+    if matches!(
+        opcode,
+        event::COMMAND | event::PORT_SET_PARAM | event::PORT_USE_BUFFERS | event::PORT_SET_IO
+    ) {
+        require_fds(fds, &[])?;
+    }
     match opcode {
         event::TRANSPORT => {
             let (trigger, completion, activation) = parse_payload(payload, |sp| {
@@ -500,7 +530,7 @@ pub fn decode_event(
             let direction = direction(sp.pop_int()?)?;
             let port_id = sp.pop_int()? as u32;
             let param_id = sp.pop_id::<u32>()?.0;
-            if param_id != 4 {
+            if param_id != SPA_PARAM_FORMAT {
                 return Err(spa::pod::Error::Invalid(format!(
                     "unsupported first-cycle port parameter {param_id}"
                 )));
@@ -509,19 +539,42 @@ pub fn decode_event(
             let pod = sp.pop_raw_pod()?;
             let param = match pod.type_() {
                 Type::None => None,
-                Type::Object => Some(RawPodOwned::wrap(pod.data().to_vec())?),
-                type_ => return Err(spa::pod::Error::Invalid(format!("port parameter must be Object or None, got {type_:?}"))),
+                Type::Object => {
+                    validate_format_object(pod.data())?;
+                    Some(RawPodOwned::wrap(pod.data().to_vec())?)
+                }
+                type_ => {
+                    return Err(spa::pod::Error::Invalid(format!(
+                        "port parameter must be Object or None, got {type_:?}"
+                    )))
+                }
             };
-            if param.as_ref().is_some_and(|pod| pod.total_size() > limits.max_pod_bytes) {
-                return Err(spa::pod::Error::Invalid("port parameter exceeds configured byte limit".into()));
+            if param
+                .as_ref()
+                .is_some_and(|pod| pod.total_size() > limits.max_pod_bytes)
+            {
+                return Err(spa::pod::Error::Invalid(
+                    "port parameter exceeds configured byte limit".into(),
+                ));
             }
-            Ok(Event::PortSetParam(PortSetParam { direction, port_id, param_id, flags, param }))
+            Ok(Event::PortSetParam(PortSetParam {
+                direction,
+                port_id,
+                param_id,
+                flags,
+                param,
+            }))
         }),
         event::PORT_USE_BUFFERS => parse_payload(payload, |sp| {
             let direction = direction(sp.pop_int()?)?;
             let port_id = sp.pop_int()? as u32;
             let mix_id = optional_id(sp.pop_int()? as u32);
             let flags = sp.pop_int()? as u32;
+            if flags & SPA_NODE_BUFFERS_FLAG_ALLOC != 0 {
+                return Err(spa::pod::Error::Invalid(
+                    "client-allocated buffers are outside the first-cycle surface".into(),
+                ));
+            }
             let n_buffers = count(sp.pop_int()?, limits.max_buffers, "buffers")?;
             let mut buffers = Vec::with_capacity(n_buffers);
             for _ in 0..n_buffers {
@@ -545,31 +598,50 @@ pub fn decode_event(
                         map_offset: sp.pop_int()? as u32,
                         max_size: sp.pop_int()? as u32,
                     };
-                    if data.max_size == 0 || data.map_offset.checked_add(data.max_size).is_none() {
-                        return Err(spa::pod::Error::Invalid("invalid data-plane range".into()));
-                    }
+                    validate_data(data)?;
                     datas.push(data);
                 }
-                buffers.push(BufferDescriptor { metadata, metas, datas });
+                buffers.push(BufferDescriptor {
+                    metadata,
+                    metas,
+                    datas,
+                });
             }
-            Ok(Event::PortUseBuffers(PortUseBuffers { direction, port_id, mix_id, flags, buffers }))
+            Ok(Event::PortUseBuffers(PortUseBuffers {
+                direction,
+                port_id,
+                mix_id,
+                flags,
+                buffers,
+            }))
         }),
         event::PORT_SET_IO => parse_payload(payload, |sp| {
             let direction = direction(sp.pop_int()?)?;
             let port_id = sp.pop_int()? as u32;
             let mix_id = optional_id(sp.pop_int()? as u32);
             let io_id = sp.pop_id::<u32>()?.0;
-            if io_id != 1 {
+            if io_id != SPA_IO_BUFFERS {
                 return Err(spa::pod::Error::Invalid(format!(
                     "unsupported first-cycle port IO {io_id}"
                 )));
             }
             let region = pop_region(sp)?;
             let update = if is_clear_region(region) {
-                PortSetIo::Clear { direction, port_id, mix_id, io_id }
+                PortSetIo::Clear {
+                    direction,
+                    port_id,
+                    mix_id,
+                    io_id,
+                }
             } else {
                 reject_partial_clear(region)?;
-                PortSetIo::Set { direction, port_id, mix_id, io_id, region }
+                PortSetIo::Set {
+                    direction,
+                    port_id,
+                    mix_id,
+                    io_id,
+                    region,
+                }
             };
             Ok(Event::PortSetIo(update))
         }),
@@ -585,7 +657,11 @@ pub fn decode_event(
             let index = fd_index(fd)?;
             require_fds(fds, &[index])?;
             let signal_fd = take_fd(fds, index)?;
-            Ok(Event::SetActivation(SetActivation::Set { node_id, signal_fd, activation }))
+            Ok(Event::SetActivation(SetActivation::Set {
+                node_id,
+                signal_fd,
+                activation,
+            }))
         }
         event::COMMAND => parse_payload(payload, |sp| {
             let pod = sp.pop_raw_pod()?;
@@ -599,27 +675,79 @@ pub fn decode_event(
 }
 
 /// Encode a Transport event payload using frame-local FD indices.
-pub fn encode_transport(trigger_index: u32, completion_index: u32, activation: RegionRef) -> io::Result<Vec<u8>> {
-    encode_payload(|sb| sb.push_fd(trigger_index as i32).push_fd(completion_index as i32).push_int(activation.memory_id as i32).push_int(activation.offset as i32).push_int(activation.size as i32))
+pub fn encode_transport(
+    trigger_index: u32,
+    completion_index: u32,
+    activation: RegionRef,
+) -> io::Result<Vec<u8>> {
+    reject_partial_clear(activation).map_err(pod_error)?;
+    let trigger_index = i32::try_from(trigger_index)
+        .map_err(|_| invalid_input("transport trigger FD index exceeds i32"))?;
+    let completion_index = i32::try_from(completion_index)
+        .map_err(|_| invalid_input("transport completion FD index exceeds i32"))?;
+    encode_payload(|sb| {
+        sb.push_fd(trigger_index)
+            .push_fd(completion_index)
+            .push_int(activation.memory_id as i32)
+            .push_int(activation.offset as i32)
+            .push_int(activation.size as i32)
+    })
 }
 
 /// Encode a PortSetParam event payload.
 pub fn encode_port_set_param(value: &PortSetParam) -> io::Result<Vec<u8>> {
+    if value.param_id != SPA_PARAM_FORMAT {
+        return Err(invalid_input(
+            "only SPA_PARAM_Format is in the first-cycle surface",
+        ));
+    }
+    if let Some(param) = &value.param {
+        validate_format_object(param.data()).map_err(pod_error)?;
+    }
     encode_payload(|sb| {
-        let sb = sb.push_int(value.direction as i32).push_int(value.port_id as i32).push_id(spa::pod::types::Id(value.param_id)).push_int(value.flags as i32);
-        if let Some(param) = &value.param { sb.push_pod(param) } else { sb.push_none() }
+        let sb = sb
+            .push_int(value.direction as i32)
+            .push_int(value.port_id as i32)
+            .push_id(spa::pod::types::Id(value.param_id))
+            .push_int(value.flags as i32);
+        if let Some(param) = &value.param {
+            sb.push_pod(param)
+        } else {
+            sb.push_none()
+        }
     })
 }
 
 /// Encode a PortUseBuffers event payload.
 pub fn encode_port_use_buffers(value: &PortUseBuffers) -> io::Result<Vec<u8>> {
+    validate_port_use_buffers(value, Limits::default())?;
     encode_payload(|sb| {
-        let mut sb = sb.push_int(value.direction as i32).push_int(value.port_id as i32).push_int(wire_id(value.mix_id) as i32).push_int(value.flags as i32).push_int(value.buffers.len() as i32);
+        let mut sb = sb
+            .push_int(value.direction as i32)
+            .push_int(value.port_id as i32)
+            .push_int(wire_id(value.mix_id) as i32)
+            .push_int(value.flags as i32)
+            .push_int(value.buffers.len() as i32);
         for buffer in &value.buffers {
-            sb = sb.push_int(buffer.metadata.memory_id as i32).push_int(buffer.metadata.offset as i32).push_int(buffer.metadata.size as i32).push_int(buffer.metas.len() as i32);
-            for meta in &buffer.metas { sb = sb.push_id(spa::pod::types::Id(meta.type_id)).push_int(meta.size as i32); }
+            sb = sb
+                .push_int(buffer.metadata.memory_id as i32)
+                .push_int(buffer.metadata.offset as i32)
+                .push_int(buffer.metadata.size as i32)
+                .push_int(buffer.metas.len() as i32);
+            for meta in &buffer.metas {
+                sb = sb
+                    .push_id(spa::pod::types::Id(meta.type_id))
+                    .push_int(meta.size as i32);
+            }
             sb = sb.push_int(buffer.datas.len() as i32);
-            for data in &buffer.datas { sb = sb.push_id(spa::pod::types::Id(data.type_id)).push_int(data.data_id as i32).push_int(data.flags as i32).push_int(data.map_offset as i32).push_int(data.max_size as i32); }
+            for data in &buffer.datas {
+                sb = sb
+                    .push_id(spa::pod::types::Id(data.type_id))
+                    .push_int(data.data_id as i32)
+                    .push_int(data.flags as i32)
+                    .push_int(data.map_offset as i32)
+                    .push_int(data.max_size as i32);
+            }
         }
         sb
     })
@@ -628,16 +756,74 @@ pub fn encode_port_use_buffers(value: &PortUseBuffers) -> io::Result<Vec<u8>> {
 /// Encode a PortSetIo event payload, preserving the canonical clear sentinel.
 pub fn encode_port_set_io(value: PortSetIo) -> io::Result<Vec<u8>> {
     let (direction, port_id, mix_id, io_id, region) = match value {
-        PortSetIo::Set { direction, port_id, mix_id, io_id, region } => (direction, port_id, mix_id, io_id, region),
-        PortSetIo::Clear { direction, port_id, mix_id, io_id } => (direction, port_id, mix_id, io_id, RegionRef { memory_id: INVALID_ID, offset: 0, size: 0 }),
+        PortSetIo::Set {
+            direction,
+            port_id,
+            mix_id,
+            io_id,
+            region,
+        } => (direction, port_id, mix_id, io_id, region),
+        PortSetIo::Clear {
+            direction,
+            port_id,
+            mix_id,
+            io_id,
+        } => (
+            direction,
+            port_id,
+            mix_id,
+            io_id,
+            RegionRef {
+                memory_id: INVALID_ID,
+                offset: 0,
+                size: 0,
+            },
+        ),
     };
-    encode_payload(|sb| sb.push_int(direction as i32).push_int(port_id as i32).push_int(wire_id(mix_id) as i32).push_id(spa::pod::types::Id(io_id)).push_int(region.memory_id as i32).push_int(region.offset as i32).push_int(region.size as i32))
+    if io_id != SPA_IO_BUFFERS {
+        return Err(invalid_input(
+            "only SPA_IO_Buffers is in the first-cycle surface",
+        ));
+    }
+    if !is_clear_region(region) {
+        reject_partial_clear(region).map_err(pod_error)?;
+    }
+    encode_payload(|sb| {
+        sb.push_int(direction as i32)
+            .push_int(port_id as i32)
+            .push_int(wire_id(mix_id) as i32)
+            .push_id(spa::pod::types::Id(io_id))
+            .push_int(region.memory_id as i32)
+            .push_int(region.offset as i32)
+            .push_int(region.size as i32)
+    })
 }
 
 /// Encode a SetActivation event payload using an optional frame-local FD index.
 pub fn encode_set_activation(node_id: u32, value: Option<(u32, RegionRef)>) -> io::Result<Vec<u8>> {
-    let (fd, region) = value.unwrap_or((-1_i32 as u32, RegionRef { memory_id: INVALID_ID, offset: 0, size: 0 }));
-    encode_payload(|sb| sb.push_int(node_id as i32).push_fd(fd as i32).push_int(region.memory_id as i32).push_int(region.offset as i32).push_int(region.size as i32))
+    let (fd, region) = match value {
+        Some((fd, region)) => {
+            reject_partial_clear(region).map_err(pod_error)?;
+            let fd =
+                i32::try_from(fd).map_err(|_| invalid_input("activation FD index exceeds i32"))?;
+            (fd, region)
+        }
+        None => (
+            -1,
+            RegionRef {
+                memory_id: INVALID_ID,
+                offset: 0,
+                size: 0,
+            },
+        ),
+    };
+    encode_payload(|sb| {
+        sb.push_int(node_id as i32)
+            .push_fd(fd)
+            .push_int(region.memory_id as i32)
+            .push_int(region.offset as i32)
+            .push_int(region.size as i32)
+    })
 }
 
 /// Encode one selected command event payload.
@@ -656,127 +842,334 @@ fn command_pod(command: Command) -> io::Result<RawPodOwned> {
 }
 
 fn decode_command(bytes: &[u8]) -> Result<Command, spa::pod::Error> {
-    if bytes.len() != 16 || u32::from_ne_bytes(bytes[4..8].try_into().unwrap()) != Type::Object as u32 || u32::from_ne_bytes(bytes[8..12].try_into().unwrap()) != 0x30002 {
-        return Err(spa::pod::Error::Invalid("command is not an exact SPA Node command object".into()));
+    if bytes.len() != 16
+        || u32::from_ne_bytes(bytes[0..4].try_into().expect("checked command length")) != 8
+        || u32::from_ne_bytes(bytes[4..8].try_into().expect("checked command length"))
+            != Type::Object as u32
+        || u32::from_ne_bytes(bytes[8..12].try_into().expect("checked command length")) != 0x30002
+    {
+        return Err(spa::pod::Error::Invalid(
+            "command is not an exact SPA Node command object".into(),
+        ));
     }
-    match u32::from_ne_bytes(bytes[12..16].try_into().unwrap()) {
+    match u32::from_ne_bytes(bytes[12..16].try_into().expect("checked command length")) {
         0 => Ok(Command::Suspend),
         1 => Ok(Command::Pause),
         2 => Ok(Command::Start),
-        id => Err(spa::pod::Error::Invalid(format!("unsupported node command {id}"))),
+        id => Err(spa::pod::Error::Invalid(format!(
+            "unsupported node command {id}"
+        ))),
     }
 }
 
-fn encode_payload(build: impl FnOnce(spa::pod::builder::StructBuilder<'_>) -> spa::pod::builder::StructBuilder<'_>) -> io::Result<Vec<u8>> {
+fn encode_payload(
+    build: impl FnOnce(spa::pod::builder::StructBuilder<'_>) -> spa::pod::builder::StructBuilder<'_>,
+) -> io::Result<Vec<u8>> {
     let mut data = vec![0_u8; 16 * 1024 * 1024];
-    let size = spa::pod::builder::Builder::new(&mut data).push_struct(build).build().map_err(pod_error)?.len();
+    let size = spa::pod::builder::Builder::new(&mut data)
+        .push_struct(build)
+        .build()
+        .map_err(pod_error)?
+        .len();
     data.truncate(size);
     Ok(data)
 }
 
-fn parse_payload<T>(payload: &[u8], parse: impl FnOnce(&mut spa::pod::parser::Parser<'_>) -> Result<T, spa::pod::Error>) -> io::Result<T> {
+fn parse_payload<T>(
+    payload: &[u8],
+    parse: impl FnOnce(&mut spa::pod::parser::Parser<'_>) -> Result<T, spa::pod::Error>,
+) -> io::Result<T> {
     let mut outer = spa::pod::parser::Parser::new(payload);
-    let (value, size) = outer.pop_struct(|sp| {
-        let value = parse(sp)?;
-        if sp.available() != 0 { return Err(spa::pod::Error::Invalid(format!("{} trailing bytes in ClientNode struct", sp.available()))); }
-        Ok(value)
-    }).map_err(pod_error)?;
-    if size != payload.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "trailing POD after ClientNode message struct")); }
+    let (value, size) = outer
+        .pop_struct(|sp| {
+            let value = parse(sp)?;
+            if sp.available() != 0 {
+                return Err(spa::pod::Error::Invalid(format!(
+                    "{} trailing bytes in ClientNode struct",
+                    sp.available()
+                )));
+            }
+            Ok(value)
+        })
+        .map_err(pod_error)?;
+    if size != payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing POD after ClientNode message struct",
+        ));
+    }
     Ok(value)
 }
 
-fn push_node_info<'a>(sb: spa::pod::builder::StructBuilder<'a>, info: &NodeInfo) -> spa::pod::builder::StructBuilder<'a> {
-    push_info_tail(sb.push_int(info.max_input_ports as i32).push_int(info.max_output_ports as i32).push_long(info.change_mask as i64).push_long(info.flags as i64), &info.properties, &info.params)
+fn push_node_info<'a>(
+    sb: spa::pod::builder::StructBuilder<'a>,
+    info: &NodeInfo,
+) -> spa::pod::builder::StructBuilder<'a> {
+    push_info_tail(
+        sb.push_int(info.max_input_ports as i32)
+            .push_int(info.max_output_ports as i32)
+            .push_long(info.change_mask as i64)
+            .push_long(info.flags as i64),
+        &info.properties,
+        &info.params,
+    )
 }
 
-fn push_port_info<'a>(sb: spa::pod::builder::StructBuilder<'a>, info: &PortInfo) -> spa::pod::builder::StructBuilder<'a> {
-    push_info_tail(sb.push_long(info.change_mask as i64).push_long(info.flags as i64).push_int(info.rate_num as i32).push_int(info.rate_denom as i32), &info.properties, &info.params)
+fn push_port_info<'a>(
+    sb: spa::pod::builder::StructBuilder<'a>,
+    info: &PortInfo,
+) -> spa::pod::builder::StructBuilder<'a> {
+    push_info_tail(
+        sb.push_long(info.change_mask as i64)
+            .push_long(info.flags as i64)
+            .push_int(info.rate_num as i32)
+            .push_int(info.rate_denom as i32),
+        &info.properties,
+        &info.params,
+    )
 }
 
-fn push_info_tail<'a>(mut sb: spa::pod::builder::StructBuilder<'a>, properties: &[(String, String)], params: &[ParamInfo]) -> spa::pod::builder::StructBuilder<'a> {
+fn push_info_tail<'a>(
+    mut sb: spa::pod::builder::StructBuilder<'a>,
+    properties: &[(String, String)],
+    params: &[ParamInfo],
+) -> spa::pod::builder::StructBuilder<'a> {
     sb = sb.push_int(properties.len() as i32);
-    for (key, value) in properties { sb = sb.push_string(key).push_string(value); }
+    for (key, value) in properties {
+        sb = sb.push_string(key).push_string(value);
+    }
     sb = sb.push_int(params.len() as i32);
-    for param in params { sb = sb.push_id(spa::pod::types::Id(param.id)).push_int(param.flags as i32); }
+    for param in params {
+        sb = sb
+            .push_id(spa::pod::types::Id(param.id))
+            .push_int(param.flags as i32);
+    }
     sb
 }
 
-fn pop_optional_node_info(sp: &mut spa::pod::parser::Parser<'_>, limits: Limits) -> Result<Option<NodeInfo>, spa::pod::Error> {
+fn pop_optional_node_info(
+    sp: &mut spa::pod::parser::Parser<'_>,
+    limits: Limits,
+) -> Result<Option<NodeInfo>, spa::pod::Error> {
     let pod = sp.pop_raw_pod()?;
     match pod.type_() {
         Type::None => Ok(None),
         Type::Struct => {
             let mut parser = spa::pod::parser::Parser::new(pod.data());
-            parser.pop_struct(|sp| {
-                let max_input_ports = sp.pop_int()? as u32;
-                let max_output_ports = sp.pop_int()? as u32;
-                let change_mask = sp.pop_long()? as u64;
-                let flags = sp.pop_long()? as u64;
-                let (properties, params) = pop_info_tail(sp, limits)?;
-                if sp.available() != 0 { return Err(spa::pod::Error::Invalid("trailing node info fields".into())); }
-                Ok(NodeInfo { max_input_ports, max_output_ports, change_mask, flags, properties, params })
-            }).map(|v| Some(v.0))
+            parser
+                .pop_struct(|sp| {
+                    let max_input_ports = sp.pop_int()? as u32;
+                    let max_output_ports = sp.pop_int()? as u32;
+                    let change_mask = sp.pop_long()? as u64;
+                    let flags = sp.pop_long()? as u64;
+                    let (properties, params) = pop_info_tail(sp, limits)?;
+                    if sp.available() != 0 {
+                        return Err(spa::pod::Error::Invalid("trailing node info fields".into()));
+                    }
+                    Ok(NodeInfo {
+                        max_input_ports,
+                        max_output_ports,
+                        change_mask,
+                        flags,
+                        properties,
+                        params,
+                    })
+                })
+                .map(|v| Some(v.0))
         }
-        type_ => Err(spa::pod::Error::Invalid(format!("node info must be Struct or None, got {type_:?}"))),
+        type_ => Err(spa::pod::Error::Invalid(format!(
+            "node info must be Struct or None, got {type_:?}"
+        ))),
     }
 }
 
-fn pop_optional_port_info(sp: &mut spa::pod::parser::Parser<'_>, limits: Limits) -> Result<Option<PortInfo>, spa::pod::Error> {
+fn pop_optional_port_info(
+    sp: &mut spa::pod::parser::Parser<'_>,
+    limits: Limits,
+) -> Result<Option<PortInfo>, spa::pod::Error> {
     let pod = sp.pop_raw_pod()?;
     match pod.type_() {
         Type::None => Ok(None),
         Type::Struct => {
             let mut parser = spa::pod::parser::Parser::new(pod.data());
-            parser.pop_struct(|sp| {
-                let change_mask = sp.pop_long()? as u64;
-                let flags = sp.pop_long()? as u64;
-                let rate_num = sp.pop_int()? as u32;
-                let rate_denom = sp.pop_int()? as u32;
-                let (properties, params) = pop_info_tail(sp, limits)?;
-                if sp.available() != 0 { return Err(spa::pod::Error::Invalid("trailing port info fields".into())); }
-                Ok(PortInfo { change_mask, flags, rate_num, rate_denom, properties, params })
-            }).map(|v| Some(v.0))
+            parser
+                .pop_struct(|sp| {
+                    let change_mask = sp.pop_long()? as u64;
+                    let flags = sp.pop_long()? as u64;
+                    let rate_num = sp.pop_int()? as u32;
+                    let rate_denom = sp.pop_int()? as u32;
+                    let (properties, params) = pop_info_tail(sp, limits)?;
+                    if sp.available() != 0 {
+                        return Err(spa::pod::Error::Invalid("trailing port info fields".into()));
+                    }
+                    Ok(PortInfo {
+                        change_mask,
+                        flags,
+                        rate_num,
+                        rate_denom,
+                        properties,
+                        params,
+                    })
+                })
+                .map(|v| Some(v.0))
         }
-        type_ => Err(spa::pod::Error::Invalid(format!("port info must be Struct or None, got {type_:?}"))),
+        type_ => Err(spa::pod::Error::Invalid(format!(
+            "port info must be Struct or None, got {type_:?}"
+        ))),
     }
 }
 
-fn pop_info_tail(sp: &mut spa::pod::parser::Parser<'_>, limits: Limits) -> Result<(Vec<(String, String)>, Vec<ParamInfo>), spa::pod::Error> {
+fn pop_info_tail(
+    sp: &mut spa::pod::parser::Parser<'_>,
+    limits: Limits,
+) -> Result<(Vec<(String, String)>, Vec<ParamInfo>), spa::pod::Error> {
     let n_properties = count(sp.pop_int()?, limits.max_properties, "properties")?;
     let mut properties = Vec::with_capacity(n_properties);
-    for _ in 0..n_properties { properties.push((sp.pop_string()?, sp.pop_string()?)); }
+    for _ in 0..n_properties {
+        properties.push((sp.pop_string()?, sp.pop_string()?));
+    }
     let n_params = count(sp.pop_int()?, limits.max_param_info, "param info")?;
     let mut params = Vec::with_capacity(n_params);
-    for _ in 0..n_params { params.push(ParamInfo { id: sp.pop_id::<u32>()?.0, flags: sp.pop_int()? as u32 }); }
+    for _ in 0..n_params {
+        params.push(ParamInfo {
+            id: sp.pop_id::<u32>()?.0,
+            flags: sp.pop_int()? as u32,
+        });
+    }
     Ok((properties, params))
 }
 
-fn pop_pods(sp: &mut spa::pod::parser::Parser<'_>, count: usize, max_bytes: usize) -> Result<Vec<RawPodOwned>, spa::pod::Error> {
+fn pop_pods(
+    sp: &mut spa::pod::parser::Parser<'_>,
+    count: usize,
+    max_bytes: usize,
+) -> Result<Vec<RawPodOwned>, spa::pod::Error> {
     let mut pods = Vec::with_capacity(count);
     for _ in 0..count {
         let pod = sp.pop_raw_pod()?;
-        if pod.total_size() > max_bytes { return Err(spa::pod::Error::Invalid("parameter POD exceeds configured byte limit".into())); }
+        if pod.total_size() > max_bytes {
+            return Err(spa::pod::Error::Invalid(
+                "parameter POD exceeds configured byte limit".into(),
+            ));
+        }
         pods.push(RawPodOwned::wrap(pod.data().to_vec())?);
     }
     Ok(pods)
 }
 
+fn validate_method(value: &Method, limits: Limits) -> io::Result<()> {
+    let (params, property_count, param_info_count) = match value {
+        Method::Update(value) => (
+            value.params.as_slice(),
+            value.info.as_ref().map_or(0, |info| info.properties.len()),
+            value.info.as_ref().map_or(0, |info| info.params.len()),
+        ),
+        Method::PortUpdate(value) => (
+            value.params.as_slice(),
+            value.info.as_ref().map_or(0, |info| info.properties.len()),
+            value.info.as_ref().map_or(0, |info| info.params.len()),
+        ),
+        Method::SetActive(_) => return Ok(()),
+    };
+    ensure_count(params.len(), limits.max_params, "params")?;
+    ensure_count(property_count, limits.max_properties, "properties")?;
+    ensure_count(param_info_count, limits.max_param_info, "param info")?;
+    if params
+        .iter()
+        .any(|pod| pod.total_size() > limits.max_pod_bytes)
+    {
+        return Err(invalid_input("parameter POD exceeds configured byte limit"));
+    }
+    Ok(())
+}
+
+fn validate_port_use_buffers(value: &PortUseBuffers, limits: Limits) -> io::Result<()> {
+    if value.flags & SPA_NODE_BUFFERS_FLAG_ALLOC != 0 {
+        return Err(invalid_input(
+            "client-allocated buffers are outside the first-cycle surface",
+        ));
+    }
+    ensure_count(value.buffers.len(), limits.max_buffers, "buffers")?;
+    for buffer in &value.buffers {
+        reject_partial_clear(buffer.metadata).map_err(pod_error)?;
+        ensure_count(buffer.metas.len(), limits.max_metas, "metas")?;
+        ensure_count(buffer.datas.len(), limits.max_datas, "datas")?;
+        for data in &buffer.datas {
+            validate_data(*data).map_err(pod_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_format_object(bytes: &[u8]) -> Result<(), spa::pod::Error> {
+    if bytes.len() < 16
+        || u32::from_ne_bytes(bytes[8..12].try_into().expect("checked object header"))
+            != spa::pod::types::ObjectType::Format as u32
+    {
+        return Err(spa::pod::Error::Invalid(
+            "SPA_PARAM_Format payload is not a Format object".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_data(data: DataDescriptor) -> Result<(), spa::pod::Error> {
+    if data.max_size == 0 {
+        return Err(spa::pod::Error::Invalid(
+            "data descriptor has zero max_size".into(),
+        ));
+    }
+    data.map_offset
+        .checked_add(data.max_size)
+        .ok_or_else(|| spa::pod::Error::Invalid("data mapping range overflows u32".into()))?;
+    Ok(())
+}
+
+fn ensure_count(value: usize, max: usize, name: &str) -> io::Result<()> {
+    if value > max || value > i32::MAX as usize {
+        return Err(invalid_input(format!(
+            "{name} count {value} exceeds limit {max}"
+        )));
+    }
+    Ok(())
+}
+
 fn pop_region(sp: &mut spa::pod::parser::Parser<'_>) -> Result<RegionRef, spa::pod::Error> {
-    Ok(RegionRef { memory_id: sp.pop_int()? as u32, offset: sp.pop_int()? as u32, size: sp.pop_int()? as u32 })
+    Ok(RegionRef {
+        memory_id: sp.pop_int()? as u32,
+        offset: sp.pop_int()? as u32,
+        size: sp.pop_int()? as u32,
+    })
 }
 
 fn direction(value: i32) -> Result<Direction, spa::pod::Error> {
-    match value { 0 => Ok(Direction::Input), 1 => Ok(Direction::Output), _ => Err(spa::pod::Error::Invalid(format!("invalid SPA direction {value}"))) }
+    match value {
+        0 => Ok(Direction::Input),
+        1 => Ok(Direction::Output),
+        _ => Err(spa::pod::Error::Invalid(format!(
+            "invalid SPA direction {value}"
+        ))),
+    }
 }
 
 fn count(value: i32, max: usize, name: &str) -> Result<usize, spa::pod::Error> {
-    let value = usize::try_from(value).map_err(|_| spa::pod::Error::Invalid(format!("negative {name} count")))?;
-    if value > max { return Err(spa::pod::Error::Invalid(format!("{name} count {value} exceeds limit {max}"))); }
+    let value = usize::try_from(value)
+        .map_err(|_| spa::pod::Error::Invalid(format!("negative {name} count")))?;
+    if value > max {
+        return Err(spa::pod::Error::Invalid(format!(
+            "{name} count {value} exceeds limit {max}"
+        )));
+    }
     Ok(value)
 }
 
 fn fd_index(value: i32) -> io::Result<u32> {
-    u32::try_from(value).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("negative frame FD index {value}")))
+    u32::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("negative frame FD index {value}"),
+        )
+    })
 }
 
 fn pod_fd_index(value: i32) -> Result<u32, spa::pod::Error> {
@@ -785,26 +1178,63 @@ fn pod_fd_index(value: i32) -> Result<u32, spa::pod::Error> {
 }
 
 fn require_fds(fds: &FrameFds, indices: &[u32]) -> io::Result<()> {
-    if fds.len() != indices.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, format!("ClientNode event references {} descriptors but frame carries {}", indices.len(), fds.len()))); }
+    if fds.len() != indices.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ClientNode event references {} descriptors but frame carries {}",
+                indices.len(),
+                fds.len()
+            ),
+        ));
+    }
     for (position, index) in indices.iter().enumerate() {
-        if indices[..position].contains(index) { return Err(io::Error::new(io::ErrorKind::InvalidData, format!("descriptor index {index} is referenced more than once"))); }
-        fds.get(*index).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if indices[..position].contains(index) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("descriptor index {index} is referenced more than once"),
+            ));
+        }
+        fds.get(*index)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     }
     Ok(())
 }
 
 fn take_fd(fds: &mut FrameFds, index: u32) -> io::Result<OwnedFd> {
-    fds.take(index).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    fds.take(index)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn optional_id(value: u32) -> Option<u32> { (value != INVALID_ID).then_some(value) }
-fn wire_id(value: Option<u32>) -> u32 { value.unwrap_or(INVALID_ID) }
-fn is_clear_region(region: RegionRef) -> bool { region.memory_id == INVALID_ID && region.offset == 0 && region.size == 0 }
+fn optional_id(value: u32) -> Option<u32> {
+    (value != INVALID_ID).then_some(value)
+}
+fn wire_id(value: Option<u32>) -> u32 {
+    value.unwrap_or(INVALID_ID)
+}
+fn is_clear_region(region: RegionRef) -> bool {
+    region.memory_id == INVALID_ID && region.offset == 0 && region.size == 0
+}
 
 fn reject_partial_clear(region: RegionRef) -> Result<(), spa::pod::Error> {
-    if region.memory_id == INVALID_ID || region.size == 0 { return Err(spa::pod::Error::Invalid("invalid partial region-clear sentinel".into())); }
-    region.offset.checked_add(region.size).ok_or_else(|| spa::pod::Error::Invalid("region range overflows u32".into()))?;
+    if region.memory_id == INVALID_ID || region.size == 0 {
+        return Err(spa::pod::Error::Invalid(
+            "invalid partial region-clear sentinel".into(),
+        ));
+    }
+    region
+        .offset
+        .checked_add(region.size)
+        .ok_or_else(|| spa::pod::Error::Invalid("region range overflows u32".into()))?;
     Ok(())
 }
 
-fn pod_error(error: spa::pod::Error) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, format!("ClientNode POD codec error: {error:?}")) }
+fn pod_error(error: spa::pod::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("ClientNode POD codec error: {error:?}"),
+    )
+}
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}

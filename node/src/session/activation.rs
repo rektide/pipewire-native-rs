@@ -11,6 +11,8 @@ use std::{
     sync::atomic::{AtomicI32, AtomicU32, Ordering},
 };
 
+pub use pipewire_native_protocol::wire::client_node::{ActivationStatus, ACTIVATION_VERSION};
+
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")))]
 compile_error!(
     "pipewire-native-node activation ABI is currently supported only on x86_64-unknown-linux-gnu; add and differentially verify a target-specific ABI table before enabling another target"
@@ -18,40 +20,6 @@ compile_error!(
 
 #[path = "abi/x86_64_unknown_linux_gnu.rs"]
 mod abi;
-
-/// The activation shared-memory ABI version used by ClientNode v6.
-pub const ACTIVATION_VERSION: u32 = 1;
-
-/// Exact values of `PW_NODE_ACTIVATION_*`.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ActivationStatus {
-    /// Prepared but not yet triggered.
-    NotTriggered = 0,
-    /// Triggered and waiting for the client to claim the cycle.
-    Triggered = 1,
-    /// Claimed by the processing client.
-    Awake = 2,
-    /// Processing is complete and the node can be prepared again.
-    Finished = 3,
-    /// The node is not schedulable.
-    Inactive = 4,
-}
-
-impl TryFrom<u32> for ActivationStatus {
-    type Error = ActivationError;
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::NotTriggered),
-            1 => Ok(Self::Triggered),
-            2 => Ok(Self::Awake),
-            3 => Ok(Self::Finished),
-            4 => Ok(Self::Inactive),
-            value => Err(ActivationError::UnknownStatus(value)),
-        }
-    }
-}
 
 /// Failure to construct or operate on an activation view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +62,17 @@ impl fmt::Display for ActivationError {
 }
 
 impl std::error::Error for ActivationError {}
+
+fn activation_status(value: u32) -> Result<ActivationStatus, ActivationError> {
+    match value {
+        0 => Ok(ActivationStatus::NotTriggered),
+        1 => Ok(ActivationStatus::Triggered),
+        2 => Ok(ActivationStatus::Awake),
+        3 => Ok(ActivationStatus::Finished),
+        4 => Ok(ActivationStatus::Inactive),
+        value => Err(ActivationError::UnknownStatus(value)),
+    }
+}
 
 /// Result of decrementing a peer's pending dependency count.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,7 +150,7 @@ impl<'a> ActivationView<'a> {
 
     /// Atomically reads the current activation status.
     pub fn status(&self) -> Result<ActivationStatus, ActivationError> {
-        self.status_atomic().load(Ordering::SeqCst).try_into()
+        activation_status(self.status_atomic().load(Ordering::SeqCst))
     }
 
     /// Makes a ClientNode v6 activation schedulable (`INACTIVE -> FINISHED`).
@@ -181,9 +160,10 @@ impl<'a> ActivationView<'a> {
 
     /// Removes scheduling authorization regardless of the prior status.
     pub fn deactivate(&self) -> Result<ActivationStatus, ActivationError> {
-        self.status_atomic()
-            .swap(ActivationStatus::Inactive as u32, Ordering::SeqCst)
-            .try_into()
+        activation_status(
+            self.status_atomic()
+                .swap(ActivationStatus::Inactive as u32, Ordering::SeqCst),
+        )
     }
 
     /// Claims one triggered process cycle and records its awake time.
@@ -296,7 +276,7 @@ impl<'a> ActivationView<'a> {
             Ok(_) => Ok(()),
             Err(actual) => Err(ActivationError::InvalidTransition {
                 expected: from,
-                actual: actual.try_into()?,
+                actual: activation_status(actual)?,
             }),
         }
     }

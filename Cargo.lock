@@ -845,6 +845,7 @@ name = "pipewire-native-node"
 version = "0.1.4"
 dependencies = [
  "libc",
+ "pipewire-native-protocol",
  "pipewire-native-spa",
  "static_assertions",
  "tokio",
@@ -855,6 +856,7 @@ name = "pipewire-native-protocol"
 version = "0.1.4"
 dependencies = [
  "libc",
+ "pipewire-native-spa",
 ]
 
 [[package]]

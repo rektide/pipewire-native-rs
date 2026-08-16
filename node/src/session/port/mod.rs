@@ -5,6 +5,8 @@
 
 use std::{cell::UnsafeCell, fmt, marker::PhantomData, ptr::NonNull};
 
+pub use pipewire_native_protocol::wire::client_node::{BufferStatus, PortIoType};
+
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")))]
 compile_error!(
     "pipewire-native-node SPA buffer ABI is currently supported only on x86_64-unknown-linux-gnu; add and differentially verify a target-specific ABI table before enabling another target"
@@ -12,32 +14,6 @@ compile_error!(
 
 #[path = "abi/x86_64_unknown_linux_gnu.rs"]
 mod abi;
-
-/// Public SPA port IO identifiers relevant to output buffer exchange.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PortIoType {
-    /// Synchronous `spa_io_buffers`.
-    Buffers = 1,
-    /// Double-buffered `spa_io_async_buffers`, not yet supported.
-    AsyncBuffers = 10,
-}
-
-/// Exact synchronous `spa_io_buffers.status` values.
-#[repr(i32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BufferStatus {
-    /// The IO area should be ignored.
-    Ok = 0,
-    /// The host requests output data.
-    NeedData = 1,
-    /// The node has published output data.
-    HaveData = 2,
-    /// Processing stopped because of an error.
-    Stopped = 4,
-    /// Previously published data was drained.
-    Drained = 8,
-}
 
 /// One volatile snapshot of synchronous buffer IO.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
