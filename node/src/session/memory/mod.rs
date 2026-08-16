@@ -130,6 +130,37 @@ pub struct MemoryPool {
     _not_sync: PhantomData<Cell<()>>,
 }
 
+/// Runtime-neutral exact-generation memory resolution used by node sessions.
+pub trait MemoryResolver {
+    /// Returns the currently active generation for a numeric memory ID.
+    fn resolve(&self, id: MemoryId) -> Result<MemoryKey, MemoryError>;
+
+    /// Maps only the requested exact generation.
+    fn map(
+        &self,
+        key: MemoryKey,
+        offset: usize,
+        len: usize,
+        writable: bool,
+    ) -> Result<MemoryMapping, MemoryError>;
+}
+
+impl MemoryResolver for MemoryPool {
+    fn resolve(&self, id: MemoryId) -> Result<MemoryKey, MemoryError> {
+        MemoryPool::resolve(self, id)
+    }
+
+    fn map(
+        &self,
+        key: MemoryKey,
+        offset: usize,
+        len: usize,
+        writable: bool,
+    ) -> Result<MemoryMapping, MemoryError> {
+        MemoryPool::map(self, key, offset, len, writable)
+    }
+}
+
 impl MemoryPool {
     /// Creates an empty pool with an explicit backing-file shrink policy.
     pub fn new(shrink_policy: ShrinkPolicy) -> Self {
