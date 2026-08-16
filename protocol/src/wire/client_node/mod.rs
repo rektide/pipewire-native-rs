@@ -211,7 +211,7 @@ pub struct PortInfo {
 }
 
 /// ClientNode `Update` method.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Update {
     /// Changed node fields.
     pub change_mask: u32,
@@ -222,7 +222,7 @@ pub struct Update {
 }
 
 /// ClientNode `PortUpdate` method.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PortUpdate {
     /// Port direction.
     pub direction: Direction,
@@ -244,6 +244,7 @@ pub struct SetActive {
 }
 
 /// Selected outgoing ClientNode method.
+#[derive(Clone, Debug)]
 pub enum Method {
     /// Node advertisement.
     Update(Update),

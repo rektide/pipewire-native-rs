@@ -202,11 +202,11 @@ impl ScriptedServer {
                     ),
                 ));
             }
-            let inbound = protocol::decode_inbound_message_with_client_nodes(
+            let inbound = protocol::decode_inbound_message_with_routes(
                 header.object_id,
                 header.opcode,
                 frame.payload(),
-                &state.client_node_ids,
+                &state.object_routes,
             )?;
 
             trace!(
@@ -235,7 +235,7 @@ impl ScriptedServer {
                 ));
             }
 
-            update_state_from_inbound(&mut state, &inbound);
+            update_state_from_inbound(&mut state, &inbound)?;
             if config.single_client_enabled() {
                 reject_pending_clients(&listener, &mut state)?;
             }
@@ -471,7 +471,7 @@ fn apply_action(
             Ok(true)
         }
         Action::SendClientNodeCommand(command) => {
-            let object_id = state.client_node_ids.last().copied().ok_or_else(|| {
+            let object_id = last_client_node_id(state).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SendClientNodeCommand requires previous ClientNode CreateObject",
@@ -485,6 +485,86 @@ fn apply_action(
                 object_id,
                 protocol::client_node::event::COMMAND,
                 payload,
+            )?;
+            Ok(true)
+        }
+        Action::SendClientNodeTransport {
+            trigger_index,
+            completion_index,
+            activation,
+        } => {
+            let object_id = require_client_node_id(state, "SendClientNodeTransport")?;
+            let payload = protocol::client_node::encode_transport(
+                *trigger_index,
+                *completion_index,
+                *activation,
+            )?;
+            send_event_with_fds(
+                client,
+                sender,
+                deadline,
+                object_id,
+                protocol::client_node::event::TRANSPORT,
+                payload,
+                vec![create_eventfd()?, create_eventfd()?],
+            )?;
+            Ok(true)
+        }
+        Action::SendClientNodePortSetParam(value) => {
+            send_client_node_event(
+                client,
+                sender,
+                deadline,
+                state,
+                protocol::client_node::event::PORT_SET_PARAM,
+                protocol::client_node::encode_port_set_param(value)?,
+            )?;
+            Ok(true)
+        }
+        Action::SendClientNodePortUseBuffers(value) => {
+            send_client_node_event(
+                client,
+                sender,
+                deadline,
+                state,
+                protocol::client_node::event::PORT_USE_BUFFERS,
+                protocol::client_node::encode_port_use_buffers(value)?,
+            )?;
+            Ok(true)
+        }
+        Action::SendClientNodePortSetIo(value) => {
+            send_client_node_event(
+                client,
+                sender,
+                deadline,
+                state,
+                protocol::client_node::event::PORT_SET_IO,
+                protocol::client_node::encode_port_set_io(*value)?,
+            )?;
+            Ok(true)
+        }
+        Action::SendClientNodeSetActivation {
+            node_id,
+            activation,
+        } => {
+            let object_id = require_client_node_id(state, "SendClientNodeSetActivation")?;
+            let payload = protocol::client_node::encode_set_activation(
+                *node_id,
+                activation.map(|region| (0, region)),
+            )?;
+            let fds = if activation.is_some() {
+                vec![create_eventfd()?]
+            } else {
+                vec![]
+            };
+            send_event_with_fds(
+                client,
+                sender,
+                deadline,
+                object_id,
+                protocol::client_node::event::SET_ACTIVATION,
+                payload,
+                fds,
             )?;
             Ok(true)
         }
@@ -555,6 +635,24 @@ fn send_event(
     )
 }
 
+fn send_client_node_event(
+    client: &UnixStream,
+    sender: &mut FrameSender,
+    deadline: Instant,
+    state: &ExecutionState,
+    opcode: u8,
+    payload: Vec<u8>,
+) -> io::Result<()> {
+    send_event(
+        client,
+        sender,
+        deadline,
+        require_client_node_id(state, "ClientNode event")?,
+        opcode,
+        payload,
+    )
+}
+
 fn send_event_with_fds(
     client: &UnixStream,
     sender: &mut FrameSender,
@@ -588,27 +686,75 @@ fn frame_error(error: FrameError) -> io::Error {
     io::Error::new(kind, error)
 }
 
-fn update_state_from_inbound(state: &mut ExecutionState, inbound: &protocol::InboundMessage) {
+fn update_state_from_inbound(
+    state: &mut ExecutionState,
+    inbound: &protocol::InboundMessage,
+) -> io::Result<()> {
     match inbound {
         protocol::InboundMessage::CoreSync { id, seq } => {
             state.last_sync = Some(SyncState { id: *id, seq: *seq });
         }
         protocol::InboundMessage::CoreGetRegistry { new_id, .. } => {
             state.last_registry_proxy_id = Some(*new_id);
+            insert_route(state, *new_id, "PipeWire:Interface:Registry", 3)?;
         }
         protocol::InboundMessage::CoreCreateObject {
             factory_name,
             type_,
             version,
             new_id,
-        } if factory_name == protocol::client_node::FACTORY_NAME
-            && type_ == protocol::client_node::INTERFACE
-            && *version == protocol::client_node::INTERFACE_VERSION =>
-        {
-            state.client_node_ids.push(*new_id);
+        } => {
+            let _ = factory_name;
+            insert_route(state, *new_id, type_, *version)?;
+        }
+        protocol::InboundMessage::CoreDestroy { object_id } => {
+            if state.object_routes.remove(object_id).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Core::Destroy references unknown object id {object_id}"),
+                ));
+            }
         }
         _ => {}
     }
+    Ok(())
+}
+
+fn insert_route(
+    state: &mut ExecutionState,
+    object_id: u32,
+    interface: &str,
+    version: u32,
+) -> io::Result<()> {
+    if state.object_routes.contains_key(&object_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("object route collision for id {object_id}"),
+        ));
+    }
+    state.object_routes.insert(
+        object_id,
+        protocol::ObjectRoute {
+            interface: interface.to_owned(),
+            version,
+        },
+    );
+    Ok(())
+}
+
+fn last_client_node_id(state: &ExecutionState) -> Option<u32> {
+    state.object_routes.iter().rev().find_map(|(id, route)| {
+        (route.interface == protocol::client_node::INTERFACE).then_some(*id)
+    })
+}
+
+fn require_client_node_id(state: &ExecutionState, action: &str) -> io::Result<u32> {
+    last_client_node_id(state).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{action} requires previous live ClientNode CreateObject"),
+        )
+    })
 }
 
 fn reject_pending_clients(listener: &UnixListener, state: &mut ExecutionState) -> io::Result<()> {
@@ -659,6 +805,14 @@ fn create_memfd_for_add_mem(id: u32, size: usize) -> io::Result<OwnedFd> {
     }
 
     Ok(fd)
+}
+
+fn create_eventfd() -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 struct SocketPathGuard {

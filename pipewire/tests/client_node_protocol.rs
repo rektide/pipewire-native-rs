@@ -67,15 +67,23 @@ fn typed_client_node_creation_and_advertisement_reach_scripted_peer() {
                 .actions(vec![])
                 .build(),
             ScriptStep::builder()
-                .expect(Expectation::ClientNodeUpdate)
+                .expect(Expectation::ClientNodeUpdate {
+                    info: true,
+                    min_params: 0,
+                })
                 .actions(vec![])
                 .build(),
             ScriptStep::builder()
-                .expect(Expectation::ClientNodePortUpdate)
+                .expect(Expectation::ClientNodePortUpdate {
+                    direction: Direction::Output,
+                    port_id: 0,
+                    info: true,
+                    min_params: 0,
+                })
                 .actions(vec![])
                 .build(),
             ScriptStep::builder()
-                .expect(Expectation::ClientNodeSetActive)
+                .expect(Expectation::ClientNodeSetActive { active: true })
                 .actions(vec![
                     Action::SendClientNodeCommand(Command::Start),
                     Action::SendCoreError(

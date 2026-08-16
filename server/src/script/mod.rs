@@ -41,11 +41,28 @@ pub enum Expectation {
     /// Match canonical ClientNode v6 object creation.
     ClientNodeCreate,
     /// Match ClientNode `Update`.
-    ClientNodeUpdate,
+    ClientNodeUpdate {
+        /// Whether node info must be present.
+        info: bool,
+        /// Minimum number of advertised parameter PODs.
+        min_params: usize,
+    },
     /// Match ClientNode `PortUpdate`.
-    ClientNodePortUpdate,
+    ClientNodePortUpdate {
+        /// Required port direction.
+        direction: pipewire_native_protocol::wire::client_node::Direction,
+        /// Required port ID.
+        port_id: u32,
+        /// Whether port info must be present.
+        info: bool,
+        /// Minimum number of advertised parameter PODs.
+        min_params: usize,
+    },
     /// Match ClientNode `SetActive`.
-    ClientNodeSetActive,
+    ClientNodeSetActive {
+        /// Required active state.
+        active: bool,
+    },
     /// Match `Registry::Bind`.
     RegistryBind,
     /// Match `Registry::Destroy`.
@@ -81,15 +98,33 @@ impl Expectation {
                     && type_ == crate::protocol::client_node::INTERFACE
                     && *version == crate::protocol::client_node::INTERFACE_VERSION
             ),
-            Self::ClientNodeUpdate => {
-                matches!(inbound, InboundMessage::ClientNodeMethod { opcode, .. } if *opcode == crate::protocol::client_node::method::UPDATE)
-            }
-            Self::ClientNodePortUpdate => {
-                matches!(inbound, InboundMessage::ClientNodeMethod { opcode, .. } if *opcode == crate::protocol::client_node::method::PORT_UPDATE)
-            }
-            Self::ClientNodeSetActive => {
-                matches!(inbound, InboundMessage::ClientNodeMethod { opcode, .. } if *opcode == crate::protocol::client_node::method::SET_ACTIVE)
-            }
+            Self::ClientNodeUpdate { info, min_params } => matches!(
+                inbound,
+                InboundMessage::ClientNodeMethod {
+                    method: pipewire_native_protocol::wire::client_node::Method::Update(update),
+                    ..
+                } if update.info.is_some() == *info && update.params.len() >= *min_params
+            ),
+            Self::ClientNodePortUpdate {
+                direction,
+                port_id,
+                info,
+                min_params,
+            } => matches!(
+                inbound,
+                InboundMessage::ClientNodeMethod {
+                    method: pipewire_native_protocol::wire::client_node::Method::PortUpdate(update),
+                    ..
+                } if update.direction == *direction && update.port_id == *port_id
+                    && update.info.is_some() == *info && update.params.len() >= *min_params
+            ),
+            Self::ClientNodeSetActive { active } => matches!(
+                inbound,
+                InboundMessage::ClientNodeMethod {
+                    method: pipewire_native_protocol::wire::client_node::Method::SetActive(value),
+                    ..
+                } if value.active == *active
+            ),
             Self::RegistryBind => matches!(inbound, InboundMessage::RegistryBind { .. }),
             Self::RegistryDestroy => matches!(inbound, InboundMessage::RegistryDestroy { .. }),
             Self::Exact {
@@ -185,6 +220,28 @@ pub enum Action {
     },
     /// Emit one canonical ClientNode command on the most recently created node.
     SendClientNodeCommand(pipewire_native_protocol::wire::client_node::Command),
+    /// Emit ClientNode transport with two frame-local eventfds.
+    SendClientNodeTransport {
+        /// Trigger eventfd table index.
+        trigger_index: u32,
+        /// Completion eventfd table index.
+        completion_index: u32,
+        /// Activation memory region.
+        activation: pipewire_native_protocol::wire::client_node::RegionRef,
+    },
+    /// Emit a canonical ClientNode port parameter event.
+    SendClientNodePortSetParam(pipewire_native_protocol::wire::client_node::PortSetParam),
+    /// Emit a canonical ClientNode buffer configuration event.
+    SendClientNodePortUseBuffers(pipewire_native_protocol::wire::client_node::PortUseBuffers),
+    /// Emit a canonical ClientNode port IO event.
+    SendClientNodePortSetIo(pipewire_native_protocol::wire::client_node::PortSetIo),
+    /// Emit a ClientNode downstream activation set or remove event.
+    SendClientNodeSetActivation {
+        /// Downstream node ID.
+        node_id: u32,
+        /// Activation region, or `None` for the canonical removal sentinel.
+        activation: Option<pipewire_native_protocol::wire::client_node::RegionRef>,
+    },
     /// Emit `Registry::Global` on last known registry proxy id.
     SendRegistryGlobalOnLastRegistry(RegistryGlobalAction),
     /// Emit `Registry::GlobalRemove` on last known registry proxy id.

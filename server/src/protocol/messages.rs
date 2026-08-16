@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright (c) 2026 Asymptotic Inc.
 
+use std::collections::BTreeMap;
 use std::io;
 
 use pipewire_native_spa as spa;
@@ -20,6 +21,8 @@ pub mod core_method {
     pub const GET_REGISTRY: u8 = 5;
     /// Core::CreateObject.
     pub const CREATE_OBJECT: u8 = 6;
+    /// Core::Destroy.
+    pub const DESTROY: u8 = 7;
 }
 
 /// Core event opcodes.
@@ -61,7 +64,7 @@ pub mod registry_event {
 }
 
 /// Decoded subset of inbound methods relevant for scripted scenarios.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum InboundMessage {
     /// Core hello.
     CoreHello {
@@ -93,12 +96,17 @@ pub enum InboundMessage {
         /// Client-allocated proxy ID.
         new_id: u32,
     },
+    /// Core object destruction request.
+    CoreDestroy {
+        /// Client object ID to destroy.
+        object_id: u32,
+    },
     /// Canonically decoded ClientNode method.
     ClientNodeMethod {
         /// ClientNode object ID.
         object_id: u32,
-        /// Canonical method opcode.
-        opcode: u8,
+        /// Full canonical method content.
+        method: pipewire_native_protocol::wire::client_node::Method,
     },
     /// Client update properties.
     ClientUpdateProperties,
@@ -127,29 +135,40 @@ pub enum InboundMessage {
     },
 }
 
+/// Interface and negotiated version assigned to one client object ID.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ObjectRoute {
+    /// PipeWire interface type.
+    pub interface: String,
+    /// Negotiated interface version.
+    pub version: u32,
+}
+
 /// Decodes a known subset of methods from a packet header + payload.
 pub fn decode_inbound_message(
     object_id: u32,
     opcode: u8,
     payload: &[u8],
 ) -> io::Result<InboundMessage> {
-    decode_inbound_message_with_client_nodes(object_id, opcode, payload, &[])
+    decode_inbound_message_with_routes(object_id, opcode, payload, &BTreeMap::new())
 }
 
-/// Decode an inbound message with object IDs known to be ClientNode proxies.
-pub fn decode_inbound_message_with_client_nodes(
+/// Decode an inbound message using lifecycle-aware object interface routes.
+pub fn decode_inbound_message_with_routes(
     object_id: u32,
     opcode: u8,
     payload: &[u8],
-    client_node_ids: &[u32],
+    routes: &BTreeMap<u32, ObjectRoute>,
 ) -> io::Result<InboundMessage> {
-    if client_node_ids.contains(&object_id) {
-        pipewire_native_protocol::wire::client_node::decode_method(
+    if routes.get(&object_id).is_some_and(|route| {
+        route.interface == pipewire_native_protocol::wire::client_node::INTERFACE
+    }) {
+        let method = pipewire_native_protocol::wire::client_node::decode_method(
             opcode,
             payload,
             pipewire_native_protocol::wire::client_node::Limits::default(),
         )?;
-        return Ok(InboundMessage::ClientNodeMethod { object_id, opcode });
+        return Ok(InboundMessage::ClientNodeMethod { object_id, method });
     }
     match (object_id, opcode) {
         (CORE_ID, core_method::HELLO) => {
@@ -206,6 +225,10 @@ pub fn decode_inbound_message_with_client_nodes(
                 new_id,
             })
         }
+        (CORE_ID, core_method::DESTROY) => {
+            let object_id = parse_struct(payload, |sp| Ok(sp.pop_int()? as u32))?;
+            Ok(InboundMessage::CoreDestroy { object_id })
+        }
         (CLIENT_ID, client_method::UPDATE_PROPERTIES) => {
             // Shape check only: Struct(Struct(PairList))
             parse_struct(payload, |sp| {
@@ -223,7 +246,11 @@ pub fn decode_inbound_message_with_client_nodes(
 
             Ok(InboundMessage::ClientUpdateProperties)
         }
-        (_, registry_method::BIND) => {
+        (_, registry_method::BIND)
+            if routes
+                .get(&object_id)
+                .is_some_and(|route| route.interface == "PipeWire:Interface:Registry") =>
+        {
             let (id, type_, version, new_id) = parse_struct(payload, |sp| {
                 let id = sp.pop_int()?;
                 let type_ = sp.pop_string()?;
@@ -239,7 +266,11 @@ pub fn decode_inbound_message_with_client_nodes(
                 new_id,
             })
         }
-        (_, registry_method::DESTROY) => {
+        (_, registry_method::DESTROY)
+            if routes
+                .get(&object_id)
+                .is_some_and(|route| route.interface == "PipeWire:Interface:Registry") =>
+        {
             let id = parse_struct(payload, |sp| {
                 let id = sp.pop_int()?;
                 Ok(id as u32)
@@ -437,7 +468,7 @@ mod tests {
         let payload = encode_core_sync_payload(11, 22).unwrap();
         let msg = decode_inbound_message(CORE_ID, super::core_method::SYNC, &payload).unwrap();
 
-        assert_eq!(msg, InboundMessage::CoreSync { id: 11, seq: 22 });
+        assert!(matches!(msg, InboundMessage::CoreSync { id: 11, seq: 22 }));
     }
 
     #[test]
