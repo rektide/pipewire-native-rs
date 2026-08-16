@@ -169,6 +169,36 @@ impl OutputGeneration {
         Ok((Some(published), BufferStatus::HaveData as i32))
     }
 
+    pub(crate) fn abort_published(&mut self) -> Result<(), SessionError> {
+        let io = unsafe {
+            BuffersIoView::from_raw_parts(PortIoType::Buffers, self.io.as_mut_ptr(), self.io.len())?
+        };
+        let state = io.state();
+        if state.status != BufferStatus::HaveData as i32 {
+            return Ok(());
+        }
+        let selected = state.buffer_id as usize;
+        let buffer = self
+            .buffers
+            .get_mut(selected)
+            .ok_or(SessionError::InvalidTransition(
+                "published output buffer ID",
+            ))?;
+        let output = unsafe {
+            OutputBuffer::from_raw_parts(
+                buffer.metadata.as_mut_ptr().add(buffer.chunk_offset),
+                CHUNK_SIZE,
+                buffer.media.as_mut_ptr(),
+                buffer.media.len(),
+                0,
+                buffer.media.len(),
+            )?
+        };
+        output.abort();
+        io.publish_need_data(state.buffer_id);
+        Ok(())
+    }
+
     pub(crate) fn intervals(&self) -> impl Iterator<Item = MemoryInterval> + '_ {
         std::iter::once(self.io.interval()).chain(
             self.buffers

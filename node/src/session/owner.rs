@@ -477,8 +477,8 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
                 self.state = SessionState::Running;
                 Ok(WakeOutcome::NotClaimed { drained, missed })
             }
-            ClaimCompletion::Finished(result) => match result {
-                Ok(published) => match self.peers.trigger_all(awake_ns) {
+            ClaimCompletion::Finished { result, finish_ns } => match result {
+                Ok(published) => match self.peers.trigger_all(finish_ns) {
                     Ok(()) => {
                         self.state = SessionState::Running;
                         Ok(WakeOutcome::Processed {
@@ -493,6 +493,9 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
                     }
                 },
                 Err(error) => {
+                    if matches!(error, SessionError::FinishClockPanicked) {
+                        let _ = self.output.as_mut().unwrap().abort_published();
+                    }
                     self.fail();
                     Err(error)
                 }
@@ -998,7 +1001,9 @@ mod tests {
         trigger.signal(3).unwrap();
         let mut process = PatternProcess { calls: 0 };
         assert_eq!(
-            session.on_wake(generation, 77, &mut process).unwrap(),
+            session
+                .on_wake_with_finish(generation, 77, || 91, &mut process)
+                .unwrap(),
             WakeOutcome::Processed {
                 drained: 3,
                 missed: 2,
@@ -1006,6 +1011,12 @@ mod tests {
             }
         );
         assert_eq!(process.calls, 1);
+
+        let mut own = resolver.bytes(own_key, ActivationView::required_size());
+        let own_view =
+            unsafe { ActivationView::from_raw_parts(own.as_mut_ptr(), own.len()).unwrap() };
+        assert_eq!(unsafe { own_view.awake_time() }, 77);
+        assert_eq!(unsafe { own_view.finish_time() }, 91);
 
         let mut media = resolver.bytes(media_key, 64);
         let media_guard = media.borrow();
@@ -1039,7 +1050,7 @@ mod tests {
             unsafe { ActivationView::from_raw_parts(peer.as_mut_ptr(), peer.len()).unwrap() };
         assert_eq!(peer_view.pending(), 0);
         assert_eq!(peer_view.status().unwrap(), ActivationStatus::Triggered);
-        assert_eq!(unsafe { peer_view.signal_time() }, 77);
+        assert_eq!(unsafe { peer_view.signal_time() }, 91);
 
         trigger.signal(2).unwrap();
         assert_eq!(
@@ -1291,6 +1302,74 @@ mod tests {
                 ApplyOutcome::AlreadyDisconnected
             );
         }
+    }
+
+    #[test]
+    fn finish_clock_panic_aborts_output_publishes_failure_and_deactivates() {
+        let resolver = FakeResolver::new();
+        let own_key = initialize_activation(&resolver, 1, ActivationStatus::Inactive, 0);
+        let metadata_key = resolver.add(2, 16);
+        resolver.add(3, 64);
+        let io_key = resolver.add(4, 8);
+        {
+            let mut io = resolver.bytes(io_key, 8);
+            let mut guard = io.borrow();
+            let bytes = unsafe { guard.bytes_mut() };
+            bytes[0..4].copy_from_slice(&(BufferStatus::NeedData as i32).to_ne_bytes());
+        }
+        let (descriptor, trigger, _, _, _) = transport(MemoryId(1));
+        let mut session = ClientNodeSession::new(resolver.clone());
+        session
+            .apply(SessionCommand::ReplaceTransport(descriptor))
+            .unwrap();
+        let generation = session.transport_generation().unwrap();
+        let (buffers, io) = output_descriptors();
+        session.apply(SessionCommand::UseBuffers(buffers)).unwrap();
+        session.apply(SessionCommand::SetPortIo(io)).unwrap();
+        session
+            .apply(SessionCommand::SetFormat(
+                NegotiatedAudioFormat::pcm_s16le(48_000, 2).unwrap(),
+            ))
+            .unwrap();
+        session.apply(SessionCommand::SetActive(true)).unwrap();
+        session
+            .apply(SessionCommand::SetNodeCommand(NodeCommandState::Start))
+            .unwrap();
+        {
+            let mut own = resolver.bytes(own_key, ActivationView::required_size());
+            let mut guard = own.borrow();
+            let bytes = unsafe { guard.bytes_mut() };
+            bytes[0..4].copy_from_slice(&(ActivationStatus::Triggered as u32).to_ne_bytes());
+        }
+        trigger.signal(1).unwrap();
+
+        let error = session
+            .on_wake_with_finish(
+                generation,
+                100,
+                || panic!("finish clock panic"),
+                &mut PatternProcess { calls: 0 },
+            )
+            .unwrap_err();
+        assert!(matches!(error, SessionError::FinishClockPanicked));
+        assert_eq!(session.state(), SessionState::Failed);
+
+        let mut own = resolver.bytes(own_key, ActivationView::required_size());
+        let activation =
+            unsafe { ActivationView::from_raw_parts(own.as_mut_ptr(), own.len()).unwrap() };
+        assert_eq!(activation.status().unwrap(), ActivationStatus::Inactive);
+        assert_eq!(activation.process_result(), -libc::EIO);
+        assert_eq!(unsafe { activation.awake_time() }, 100);
+        assert_eq!(unsafe { activation.finish_time() }, 100);
+
+        let mut io = resolver.bytes(io_key, 8);
+        let io = unsafe {
+            BuffersIoView::from_raw_parts(PortIoType::Buffers, io.as_mut_ptr(), 8).unwrap()
+        };
+        assert_eq!(io.state().status, BufferStatus::NeedData as i32);
+        let mut metadata = resolver.bytes(metadata_key, 16);
+        let chunk = unsafe { ChunkView::from_raw_parts(metadata.as_mut_ptr(), 16).unwrap() };
+        assert_eq!(chunk.state().size, 0);
     }
 
     #[test]

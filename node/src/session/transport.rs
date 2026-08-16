@@ -18,8 +18,11 @@ use crate::signal::EventFd;
 pub(crate) enum ClaimCompletion<T> {
     /// Activation was not TRIGGERED, so no callback ran.
     NotClaimed,
-    /// Activation was claimed and finished; callback result is retained.
-    Finished(Result<T, SessionError>),
+    /// Activation was claimed and finished; callback result and completion time are retained.
+    Finished {
+        result: Result<T, SessionError>,
+        finish_ns: u64,
+    },
 }
 
 /// Owns one exact activation mapping and both transport eventfds.
@@ -118,13 +121,21 @@ impl TransportGeneration {
             Err(error) => return Err(error.into()),
         };
         let processed = catch_unwind(AssertUnwindSafe(process));
-        let (result, status) = match processed {
+        let (mut result, mut status) = match processed {
             Ok(Ok((value, status))) => (Ok(value), status),
             Ok(Err(error)) => (Err(error), -libc::EIO),
             Err(_) => (Err(SessionError::CallbackPanicked), -libc::EIO),
         };
-        claim.publish_result_and_finish(status, finish_time())?;
-        Ok(ClaimCompletion::Finished(result))
+        let finish_ns = match catch_unwind(AssertUnwindSafe(finish_time)) {
+            Ok(finish_ns) => finish_ns,
+            Err(_) => {
+                result = Err(SessionError::FinishClockPanicked);
+                status = -libc::EIO;
+                awake_ns
+            }
+        };
+        claim.publish_result_and_finish(status, finish_ns)?;
+        Ok(ClaimCompletion::Finished { result, finish_ns })
     }
 
     fn activation_view(&mut self) -> Result<ActivationView<'_>, SessionError> {

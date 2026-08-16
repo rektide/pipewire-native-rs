@@ -63,6 +63,8 @@ pub enum SessionError {
     Callback(String),
     /// Callback panicked after claiming a cycle.
     CallbackPanicked,
+    /// Finish-clock sampling panicked after claiming a cycle.
+    FinishClockPanicked,
     /// Session has disconnected terminally.
     Disconnected,
 }
