@@ -91,9 +91,7 @@ impl ClientNode {
     /// Install the sole typed event owner. Replacing or clearing the handler drops
     /// any resources retained by the previous owner.
     pub fn set_event_handler(&self, handler: Option<ClientNodeEventHandler>) {
-        let mut state = self.inner.event_dispatch.lock().unwrap();
-        state.generation = state.generation.wrapping_add(1);
-        state.handler = handler;
+        set_event_handler(&self.inner.event_dispatch, handler);
     }
 
     pub(crate) fn methods(&self) -> Arc<Mutex<ClientNodeMethods>> {
@@ -103,6 +101,17 @@ impl ClientNode {
     pub(crate) fn dispatch(&self, event: wire::Event) {
         dispatch_event(&self.inner.event_dispatch, event);
     }
+}
+
+fn set_event_handler(state: &Mutex<EventDispatch>, handler: Option<ClientNodeEventHandler>) {
+    let displaced = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        std::mem::replace(&mut state.handler, handler)
+    };
+    drop(displaced);
 }
 
 fn dispatch_event(state: &Mutex<EventDispatch>, event: wire::Event) {
@@ -128,20 +137,35 @@ fn dispatch_event(state: &Mutex<EventDispatch>, event: wire::Event) {
         generation,
     };
     loop {
-        let event = {
+        let (generation_changed, replacement) = {
             let mut state = active
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.generation != active.generation {
-                active.handler = state.handler.take();
                 active.generation = state.generation;
+                (true, state.handler.take())
+            } else {
+                (false, None)
             }
-            let Some(_) = active.handler else {
-                state.queued.clear();
+        };
+        if generation_changed {
+            active.handler = replacement;
+            continue;
+        }
+
+        let event = {
+            let mut state = active
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if active.handler.is_none() {
+                let queued = std::mem::take(&mut state.queued);
                 state.dispatching = false;
+                drop(state);
+                drop(queued);
                 return;
-            };
+            }
             let Some(event) = state.queued.pop_front() else {
                 state.handler = active.handler.take();
                 state.dispatching = false;
@@ -161,14 +185,21 @@ struct ActiveHandler<'a> {
 
 impl Drop for ActiveHandler<'_> {
     fn drop(&mut self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.generation == self.generation && state.handler.is_none() {
-            state.handler = self.handler.take();
-        }
-        state.dispatching = false;
+        let displaced = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let displaced = if state.generation == self.generation && state.handler.is_none() {
+                state.handler = self.handler.take();
+                None
+            } else {
+                self.handler.take()
+            };
+            state.dispatching = false;
+            displaced
+        };
+        drop(displaced);
     }
 }
 
@@ -177,12 +208,29 @@ mod tests {
     use std::{
         io::{pipe, Read},
         panic::{catch_unwind, AssertUnwindSafe},
-        sync::{Arc, Mutex},
+        sync::{mpsc, Arc, Mutex},
+        time::Duration,
     };
 
     use pipewire_native_protocol::wire::client_node::{Command, Event, RegionRef, Transport};
 
-    use super::{dispatch_event, EventDispatch};
+    use super::{dispatch_event, set_event_handler, ClientNodeEventHandler, EventDispatch};
+
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+
+    struct ReentrantHandlerDrop {
+        state: Arc<Mutex<EventDispatch>>,
+        replacement: Option<ClientNodeEventHandler>,
+        dropped: mpsc::Sender<()>,
+        _retained_fd: std::os::fd::OwnedFd,
+    }
+
+    impl Drop for ReentrantHandlerDrop {
+        fn drop(&mut self) {
+            set_event_handler(&self.state, self.replacement.take());
+            self.dropped.send(()).unwrap();
+        }
+    }
 
     #[test]
     fn nested_dispatch_is_queued_in_order() {
@@ -202,6 +250,50 @@ mod tests {
 
         dispatch_event(&state, Event::Command(Command::Start));
         assert_eq!(*observed.lock().unwrap(), [Command::Start, Command::Pause]);
+    }
+
+    #[test]
+    fn displaced_handler_drop_can_reenter_during_generation_handoff() {
+        let state = Arc::new(Mutex::new(EventDispatch::default()));
+        let (dropped, drop_complete) = mpsc::channel();
+        let (observed, observation) = mpsc::channel();
+        let (mut retained_reader, retained_writer) = pipe().unwrap();
+        let capture = ReentrantHandlerDrop {
+            state: state.clone(),
+            replacement: Some(Box::new(move |event| observed.send(event).unwrap())),
+            dropped,
+            _retained_fd: retained_writer.into(),
+        };
+        let callback_state = state.clone();
+        set_event_handler(
+            &state,
+            Some(Box::new(move |event| {
+                let _capture = &capture;
+                assert!(matches!(event, Event::Command(Command::Start)));
+                set_event_handler(&callback_state, Some(Box::new(|_| {})));
+                dispatch_event(&callback_state, Event::Command(Command::Pause));
+            })),
+        );
+
+        let dispatch_state = state.clone();
+        let (finished, dispatch_complete) = mpsc::channel();
+        std::thread::spawn(move || {
+            dispatch_event(&dispatch_state, Event::Command(Command::Start));
+            finished.send(()).unwrap();
+        });
+
+        drop_complete
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .expect("handler destructor deadlocked while replacing the event handler");
+        dispatch_complete
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .expect("dispatch did not complete after generation replacement");
+        assert!(matches!(
+            observation.recv_timeout(COMPLETION_TIMEOUT).unwrap(),
+            Event::Command(Command::Pause)
+        ));
+        assert_eq!(retained_reader.read(&mut [0]).unwrap(), 0);
+        assert!(state.lock().unwrap().handler.is_some());
     }
 
     #[test]
