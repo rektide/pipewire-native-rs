@@ -253,6 +253,12 @@ impl Client {
                     .unwrap();
                 super::marshal::client::Events::demarshal(&mut message, client)
             }
+            types::interface::CLIENT_NODE => {
+                let client_node = core
+                    .find_object::<proxy::client_node::ClientNode>(header.object_id)
+                    .unwrap();
+                super::marshal::client_node::demarshal(&mut message, client_node)
+            }
             types::interface::DEVICE => {
                 let device = core
                     .find_object::<proxy::device::Device>(header.object_id)

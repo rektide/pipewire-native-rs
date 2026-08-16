@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Arun Raghavan
 
 pub(crate) mod client;
+pub(crate) mod client_node;
 pub(crate) mod core;
 pub(crate) mod device;
 pub(crate) mod factory;

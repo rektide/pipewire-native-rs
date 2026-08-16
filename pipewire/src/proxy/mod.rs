@@ -14,6 +14,8 @@ use crate::{types::ObjectType, Id};
 
 /// A proxy representing client objects.
 pub mod client;
+/// A proxy representing a client-created processing node.
+pub mod client_node;
 /// A proxy representing device objects.
 pub mod device;
 /// A proxy for representing factory objects.

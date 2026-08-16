@@ -18,6 +18,8 @@ pub mod core_method {
     pub const SYNC: u8 = 2;
     /// Core::GetRegistry.
     pub const GET_REGISTRY: u8 = 5;
+    /// Core::CreateObject.
+    pub const CREATE_OBJECT: u8 = 6;
 }
 
 /// Core event opcodes.
@@ -80,6 +82,24 @@ pub enum InboundMessage {
         /// Proxy id allocated by client for registry.
         new_id: u32,
     },
+    /// Core object creation request.
+    CoreCreateObject {
+        /// Factory name.
+        factory_name: String,
+        /// Interface type.
+        type_: String,
+        /// Requested interface version.
+        version: u32,
+        /// Client-allocated proxy ID.
+        new_id: u32,
+    },
+    /// Canonically decoded ClientNode method.
+    ClientNodeMethod {
+        /// ClientNode object ID.
+        object_id: u32,
+        /// Canonical method opcode.
+        opcode: u8,
+    },
     /// Client update properties.
     ClientUpdateProperties,
     /// Registry bind.
@@ -113,6 +133,24 @@ pub fn decode_inbound_message(
     opcode: u8,
     payload: &[u8],
 ) -> io::Result<InboundMessage> {
+    decode_inbound_message_with_client_nodes(object_id, opcode, payload, &[])
+}
+
+/// Decode an inbound message with object IDs known to be ClientNode proxies.
+pub fn decode_inbound_message_with_client_nodes(
+    object_id: u32,
+    opcode: u8,
+    payload: &[u8],
+    client_node_ids: &[u32],
+) -> io::Result<InboundMessage> {
+    if client_node_ids.contains(&object_id) {
+        pipewire_native_protocol::wire::client_node::decode_method(
+            opcode,
+            payload,
+            pipewire_native_protocol::wire::client_node::Limits::default(),
+        )?;
+        return Ok(InboundMessage::ClientNodeMethod { object_id, opcode });
+    }
     match (object_id, opcode) {
         (CORE_ID, core_method::HELLO) => {
             let version = parse_struct(payload, |sp| {
@@ -139,6 +177,34 @@ pub fn decode_inbound_message(
             })?;
 
             Ok(InboundMessage::CoreGetRegistry { version, new_id })
+        }
+        (CORE_ID, core_method::CREATE_OBJECT) => {
+            let (factory_name, type_, version, new_id) = parse_struct(payload, |sp| {
+                let factory_name = sp.pop_string()?;
+                let type_ = sp.pop_string()?;
+                let version = sp.pop_int()? as u32;
+                sp.pop_struct(|props| {
+                    let count = props.pop_int()?;
+                    if count < 0 || count > 256 {
+                        return Err(spa::pod::Error::Invalid(
+                            "invalid CreateObject property count".into(),
+                        ));
+                    }
+                    for _ in 0..count {
+                        let _ = props.pop_string()?;
+                        let _ = props.pop_string()?;
+                    }
+                    Ok(())
+                })?;
+                let new_id = sp.pop_int()? as u32;
+                Ok((factory_name, type_, version, new_id))
+            })?;
+            Ok(InboundMessage::CoreCreateObject {
+                factory_name,
+                type_,
+                version,
+                new_id,
+            })
         }
         (CLIENT_ID, client_method::UPDATE_PROPERTIES) => {
             // Shape check only: Struct(Struct(PairList))

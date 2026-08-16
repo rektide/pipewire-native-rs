@@ -25,4 +25,6 @@ pub struct ExecutionState {
     pub rejected_clients: usize,
     /// Memory ids announced via `Core::AddMem` by scripted actions.
     pub exported_mem_ids: Vec<u32>,
+    /// ClientNode proxy IDs learned from canonical Core::CreateObject methods.
+    pub client_node_ids: Vec<u32>,
 }

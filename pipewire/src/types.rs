@@ -9,6 +9,8 @@ pub type ObjectType = &'static str;
 pub mod interface {
     /// The Client interface.
     pub const CLIENT: &str = "PipeWire:Interface:Client";
+    /// The ClientNode interface.
+    pub const CLIENT_NODE: &str = pipewire_native_protocol::wire::client_node::INTERFACE;
     /// The Core interface
     pub const CORE: &str = "PipeWire:Interface:Core";
     /// The Device interface

@@ -38,6 +38,14 @@ pub enum Expectation {
     CoreGetRegistry,
     /// Match `Core::Sync`.
     CoreSync,
+    /// Match canonical ClientNode v6 object creation.
+    ClientNodeCreate,
+    /// Match ClientNode `Update`.
+    ClientNodeUpdate,
+    /// Match ClientNode `PortUpdate`.
+    ClientNodePortUpdate,
+    /// Match ClientNode `SetActive`.
+    ClientNodeSetActive,
     /// Match `Registry::Bind`.
     RegistryBind,
     /// Match `Registry::Destroy`.
@@ -62,6 +70,26 @@ impl Expectation {
             }
             Self::CoreGetRegistry => matches!(inbound, InboundMessage::CoreGetRegistry { .. }),
             Self::CoreSync => matches!(inbound, InboundMessage::CoreSync { .. }),
+            Self::ClientNodeCreate => matches!(
+                inbound,
+                InboundMessage::CoreCreateObject {
+                    factory_name,
+                    type_,
+                    version,
+                    ..
+                } if factory_name == crate::protocol::client_node::FACTORY_NAME
+                    && type_ == crate::protocol::client_node::INTERFACE
+                    && *version == crate::protocol::client_node::INTERFACE_VERSION
+            ),
+            Self::ClientNodeUpdate => {
+                matches!(inbound, InboundMessage::ClientNodeMethod { opcode, .. } if *opcode == crate::protocol::client_node::method::UPDATE)
+            }
+            Self::ClientNodePortUpdate => {
+                matches!(inbound, InboundMessage::ClientNodeMethod { opcode, .. } if *opcode == crate::protocol::client_node::method::PORT_UPDATE)
+            }
+            Self::ClientNodeSetActive => {
+                matches!(inbound, InboundMessage::ClientNodeMethod { opcode, .. } if *opcode == crate::protocol::client_node::method::SET_ACTIVE)
+            }
             Self::RegistryBind => matches!(inbound, InboundMessage::RegistryBind { .. }),
             Self::RegistryDestroy => matches!(inbound, InboundMessage::RegistryDestroy { .. }),
             Self::Exact {
@@ -155,6 +183,8 @@ pub enum Action {
         /// Server memory id to revoke.
         id: u32,
     },
+    /// Emit one canonical ClientNode command on the most recently created node.
+    SendClientNodeCommand(pipewire_native_protocol::wire::client_node::Command),
     /// Emit `Registry::Global` on last known registry proxy id.
     SendRegistryGlobalOnLastRegistry(RegistryGlobalAction),
     /// Emit `Registry::GlobalRemove` on last known registry proxy id.

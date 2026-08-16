@@ -187,6 +187,7 @@ impl Core {
     pub(crate) fn new_object(&self, type_: &str) -> std::io::Result<Box<dyn HasProxy>> {
         let new_object: Box<dyn HasProxy> = match type_ {
             types::interface::CLIENT => Box::new(proxy::client::Client::new(self)),
+            types::interface::CLIENT_NODE => Box::new(proxy::client_node::ClientNode::new(self)),
             types::interface::DEVICE => Box::new(proxy::device::Device::new(self)),
             types::interface::FACTORY => Box::new(proxy::factory::Factory::new(self)),
             types::interface::LINK => Box::new(proxy::link::Link::new(self)),
@@ -307,6 +308,22 @@ impl Core {
         props: &Properties,
     ) -> std::io::Result<Box<dyn HasProxy>> {
         object_invoke!(self, create_object, factory_name, type_, version, props)
+    }
+
+    /// Create a canonical ClientNode v6 object and return its typed proxy.
+    pub fn create_client_node(
+        &self,
+        props: &Properties,
+    ) -> std::io::Result<proxy::client_node::ClientNode> {
+        let object = self.create_object(
+            pipewire_native_protocol::wire::client_node::FACTORY_NAME,
+            types::interface::CLIENT_NODE,
+            pipewire_native_protocol::wire::client_node::INTERFACE_VERSION,
+            props,
+        )?;
+        object
+            .downcast::<proxy::client_node::ClientNode>()
+            .ok_or_else(|| std::io::Error::other("created ClientNode has the wrong proxy type"))
     }
 
     /// Destroy a proxy.

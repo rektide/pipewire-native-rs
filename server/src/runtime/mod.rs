@@ -21,10 +21,9 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     protocol::{
-        self, core_event, decode_inbound_message, encode_core_add_mem_payload,
-        encode_core_done_payload, encode_core_error_payload, encode_core_info_payload,
-        encode_core_remove_mem_payload, encode_registry_global_payload,
-        encode_registry_global_remove_payload,
+        self, core_event, encode_core_add_mem_payload, encode_core_done_payload,
+        encode_core_error_payload, encode_core_info_payload, encode_core_remove_mem_payload,
+        encode_registry_global_payload, encode_registry_global_remove_payload,
     },
     script::{Action, Scenario},
     state::{ExecutionState, SyncState},
@@ -203,7 +202,12 @@ impl ScriptedServer {
                     ),
                 ));
             }
-            let inbound = decode_inbound_message(header.object_id, header.opcode, frame.payload())?;
+            let inbound = protocol::decode_inbound_message_with_client_nodes(
+                header.object_id,
+                header.opcode,
+                frame.payload(),
+                &state.client_node_ids,
+            )?;
 
             trace!(
                 trace_name = config.trace_name(),
@@ -257,6 +261,7 @@ impl ScriptedServer {
                         }
                     })?;
                 if !keep_running {
+                    state.completed_steps += 1;
                     return Ok(to_run_report(state));
                 }
             }
@@ -465,6 +470,24 @@ fn apply_action(
             )?;
             Ok(true)
         }
+        Action::SendClientNodeCommand(command) => {
+            let object_id = state.client_node_ids.last().copied().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SendClientNodeCommand requires previous ClientNode CreateObject",
+                )
+            })?;
+            let payload = protocol::client_node::encode_command(*command)?;
+            send_event(
+                client,
+                sender,
+                deadline,
+                object_id,
+                protocol::client_node::event::COMMAND,
+                payload,
+            )?;
+            Ok(true)
+        }
         Action::SendRegistryGlobalOnLastRegistry(global) => {
             let Some(registry_id) = state.last_registry_proxy_id else {
                 return Err(io::Error::new(
@@ -572,6 +595,17 @@ fn update_state_from_inbound(state: &mut ExecutionState, inbound: &protocol::Inb
         }
         protocol::InboundMessage::CoreGetRegistry { new_id, .. } => {
             state.last_registry_proxy_id = Some(*new_id);
+        }
+        protocol::InboundMessage::CoreCreateObject {
+            factory_name,
+            type_,
+            version,
+            new_id,
+        } if factory_name == protocol::client_node::FACTORY_NAME
+            && type_ == protocol::client_node::INTERFACE
+            && *version == protocol::client_node::INTERFACE_VERSION =>
+        {
+            state.client_node_ids.push(*new_id);
         }
         _ => {}
     }

@@ -88,6 +88,48 @@ impl<'a> InboundMessage<'a> {
             .take(index)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
+
+    pub(crate) fn decode_client_node_event(
+        &mut self,
+    ) -> std::io::Result<pipewire_native_protocol::wire::client_node::Event> {
+        let body_size = pipewire_native_spa::pod::RawPod::wrap(self.payload)
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("could not locate ClientNode message body: {error:?}"),
+                )
+            })?
+            .total_size();
+        let event = pipewire_native_protocol::wire::client_node::decode_event(
+            self.opcode,
+            &self.payload[..body_size],
+            self.fds,
+            pipewire_native_protocol::wire::client_node::Limits::default(),
+        )?;
+        let (footer, footer_size) = if body_size < self.payload.len() {
+            let (footer, size) =
+                CoreFooter::decode(&self.payload[body_size..]).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("could not decode message footer: {error:?}"),
+                    )
+                })?;
+            (Some(footer), size)
+        } else {
+            (None, 0)
+        };
+        if body_size + footer_size != self.payload.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ClientNode payload has trailing bytes after its footer",
+            ));
+        }
+        self.footer = footer;
+        if let (Some(handler), Some(footer)) = (self.footer_handler, self.footer.as_ref()) {
+            handler(footer);
+        }
+        Ok(event)
+    }
 }
 
 pub(crate) struct CoreFooter {
