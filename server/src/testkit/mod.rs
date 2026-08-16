@@ -106,8 +106,14 @@ impl ServerHandle {
 /// Spawns a scripted server on a dedicated thread.
 pub fn spawn(server: ScriptedServer) -> ServerHandle {
     let (sender, result) = mpsc::sync_channel(1);
+    let (ready_sender, ready) = mpsc::sync_channel(0);
     let thread = thread::spawn(move || {
-        let _ = sender.send(server.run());
+        let run = server.run_with_ready(|| {
+            let _ = ready_sender.send(());
+        });
+        let _ = sender.send(run);
     });
+    // A disconnected channel means startup failed; the error is retained by `result`.
+    let _ = ready.recv();
     ServerHandle { result, thread }
 }

@@ -21,6 +21,29 @@ use pipewire_native_server::{
 };
 
 #[test]
+fn spawn_waits_until_socket_is_ready() {
+    for iteration in 0..50 {
+        let deadline = testkit::TestDeadline::after(Duration::from_secs(2));
+        let socket_path =
+            testkit::unique_socket_path(&format!("pipewire-native-server-ready-{iteration}"));
+        let server = ScriptedServer::builder()
+            .config(
+                ServerConfig::builder()
+                    .socket_path(socket_path.clone())
+                    .build(),
+            )
+            .scenario(Scenario::builder().steps(vec![]).build())
+            .build();
+
+        let handle = testkit::spawn(server);
+        let stream = UnixStream::connect(&socket_path).unwrap();
+        drop(stream);
+        let report = handle.wait(deadline).unwrap();
+        assert_eq!(report.accepted_clients, 1);
+    }
+}
+
+#[test]
 fn scripted_bootstrap_flow_is_deterministic() {
     let deadline = testkit::TestDeadline::after(Duration::from_secs(2));
     let socket_path = testkit::unique_socket_path("pipewire-native-server-bootstrap");

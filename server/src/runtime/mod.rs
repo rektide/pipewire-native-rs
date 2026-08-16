@@ -89,6 +89,11 @@ pub struct RunReport {
 impl ScriptedServer {
     /// Runs the scripted server until all scenario steps complete.
     pub fn run(self) -> io::Result<RunReport> {
+        self.run_with_ready(|| {})
+    }
+
+    /// Runs the scripted server and reports when its listener is ready.
+    pub fn run_with_ready(self, ready: impl FnOnce()) -> io::Result<RunReport> {
         let config = self.config;
         let scenario = self.scenario;
         let deadline = Instant::now() + config.run_timeout();
@@ -113,6 +118,7 @@ impl ScriptedServer {
 
         let listener = UnixListener::bind(&config.socket_path)?;
         listener.set_nonblocking(true)?;
+        ready();
         let limits = FrameLimits::default();
         let mut receiver = FrameReceiver::new(limits);
         let mut sender = FrameSender::new(limits);
