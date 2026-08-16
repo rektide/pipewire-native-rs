@@ -175,11 +175,12 @@ impl Drop for ActiveHandler<'_> {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::{pipe, Read},
         panic::{catch_unwind, AssertUnwindSafe},
         sync::{Arc, Mutex},
     };
 
-    use pipewire_native_protocol::wire::client_node::{Command, Event};
+    use pipewire_native_protocol::wire::client_node::{Command, Event, RegionRef, Transport};
 
     use super::{dispatch_event, EventDispatch};
 
@@ -231,5 +232,32 @@ mod tests {
             *observed.lock().unwrap(),
             [Command::Start, Command::Pause, Command::Suspend]
         );
+    }
+
+    #[test]
+    fn panic_drops_event_owned_fds() {
+        let state = Mutex::new(EventDispatch::default());
+        state.lock().unwrap().handler = Some(Box::new(|_| panic!("handler panic")));
+        let (mut trigger_reader, trigger_writer) = pipe().unwrap();
+        let (mut completion_reader, completion_writer) = pipe().unwrap();
+
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            dispatch_event(
+                &state,
+                Event::Transport(Transport {
+                    trigger_fd: trigger_writer.into(),
+                    completion_fd: completion_writer.into(),
+                    activation: RegionRef {
+                        memory_id: 1,
+                        offset: 0,
+                        size: 8,
+                    },
+                }),
+            );
+        }))
+        .is_err());
+        assert_eq!(trigger_reader.read(&mut [0]).unwrap(), 0);
+        assert_eq!(completion_reader.read(&mut [0]).unwrap(), 0);
+        assert!(state.lock().unwrap().handler.is_some());
     }
 }
