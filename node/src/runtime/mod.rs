@@ -4,6 +4,7 @@
 use std::io;
 
 use tokio::{
+    io::unix::AsyncFd,
     sync::watch,
     task::{JoinError, JoinHandle},
 };
@@ -38,6 +39,7 @@ impl NodeRuntime {
 
     /// Runs the worker until shutdown is requested or an error occurs.
     pub async fn run(mut self, mut stop_rx: watch::Receiver<bool>) -> io::Result<()> {
+        let trigger = AsyncFd::new(self.transport.trigger().try_clone()?)?;
         loop {
             tokio::select! {
                 changed = stop_rx.changed() => {
@@ -45,8 +47,8 @@ impl NodeRuntime {
                         break;
                     }
                 }
-                trigger = self.transport.wait_cycle() => {
-                    let trigger_count = trigger?;
+                trigger_count = wait_eventfd(&trigger) => {
+                    let trigger_count = trigger_count?;
                     let mut cycle = ProcessCycle {
                         trigger_count,
                         activation: self.transport.activation_mut(),
@@ -59,6 +61,22 @@ impl NodeRuntime {
         }
 
         Ok(())
+    }
+}
+
+async fn wait_eventfd(
+    trigger: &AsyncFd<crate::signal::EventFd>,
+) -> io::Result<u64> {
+    loop {
+        let mut ready = trigger.readable().await?;
+        match trigger.get_ref().drain() {
+            Ok(value) => {
+                ready.clear_ready();
+                return Ok(value);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => ready.clear_ready(),
+            Err(error) => return Err(error),
+        }
     }
 }
 

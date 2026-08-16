@@ -3,15 +3,13 @@
 
 use std::{
     io,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
 };
 
-use tokio::io::unix::AsyncFd;
-
-/// Async wrapper around an `eventfd`.
+/// Runtime-independent owner of a non-blocking `eventfd`.
 #[derive(Debug)]
 pub struct EventFd {
-    io: AsyncFd<OwnedFd>,
+    fd: OwnedFd,
 }
 
 impl EventFd {
@@ -29,38 +27,40 @@ impl EventFd {
     /// Wraps an existing eventfd.
     pub fn from_owned_fd(fd: OwnedFd) -> io::Result<Self> {
         set_nonblocking(fd.as_raw_fd())?;
-        Ok(Self {
-            io: AsyncFd::new(fd)?,
-        })
+        Ok(Self { fd })
+    }
+
+    /// Duplicates this handle while retaining the same kernel event counter.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let fd = self.fd.try_clone()?;
+        Self::from_owned_fd(fd)
     }
 
     /// Returns the underlying file descriptor.
     pub fn raw_fd(&self) -> RawFd {
-        self.io.get_ref().as_raw_fd()
+        self.fd.as_raw_fd()
     }
 
-    /// Waits until the eventfd is readable and drains one counter value.
-    pub async fn wait(&self) -> io::Result<u64> {
-        loop {
-            let mut guard = self.io.readable().await?;
-
-            match read_eventfd(self.raw_fd()) {
-                Ok(value) => {
-                    guard.clear_ready();
-                    return Ok(value);
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    guard.clear_ready();
-                    continue;
-                }
-                Err(err) => return Err(err),
-            }
-        }
+    /// Drains one counter value without waiting.
+    pub fn drain(&self) -> io::Result<u64> {
+        read_eventfd(self.raw_fd())
     }
 
     /// Writes a value to the eventfd counter.
     pub fn signal(&self, value: u64) -> io::Result<()> {
         write_eventfd(self.raw_fd(), value)
+    }
+}
+
+impl AsFd for EventFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl AsRawFd for EventFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }
 
@@ -136,21 +136,13 @@ fn write_eventfd(fd: RawFd, value: u64) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use tokio::runtime::Builder;
-
     use super::EventFd;
 
     #[test]
     fn signals_and_drains_counter() {
-        let runtime = Builder::new_current_thread().enable_io().build().unwrap();
-
-        runtime.block_on(async {
-            let event = EventFd::new().unwrap();
-
-            event.signal(7).unwrap();
-            let drained = event.wait().await.unwrap();
-
-            assert_eq!(drained, 7);
-        });
+        let event = EventFd::new().unwrap();
+        assert_eq!(event.drain().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        event.signal(7).unwrap();
+        assert_eq!(event.drain().unwrap(), 7);
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright (c) 2026 Asymptotic Inc.
 
-use std::{future::Future, io, os::fd::OwnedFd};
+use std::{io, os::fd::OwnedFd};
 
 use crate::{
     shm::{MappedRegion, MemoryRegistry, ShrinkPolicy},
@@ -68,9 +68,14 @@ impl BoundTransport {
         })
     }
 
-    /// Waits for a processing trigger.
-    pub fn wait_cycle(&self) -> impl Future<Output = io::Result<u64>> + Send + '_ {
-        self.trigger.wait()
+    /// Returns the non-blocking process-wake eventfd for a runtime adapter.
+    pub fn trigger(&self) -> &EventFd {
+        &self.trigger
+    }
+
+    /// Drains one process-wake counter without waiting.
+    pub fn drain_cycle(&self) -> io::Result<u64> {
+        self.trigger.drain()
     }
 
     /// Signals processing completion.
