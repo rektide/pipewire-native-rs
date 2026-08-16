@@ -975,6 +975,11 @@ mod tests {
             ApplyOutcome::PendingMemory
         );
         assert!(session.transport_generation().is_none());
+        session.apply(SessionCommand::SetActive(true)).unwrap();
+        assert!(matches!(
+            session.apply(SessionCommand::SetNodeCommand(NodeCommandState::Start)),
+            Err(SessionError::NotReady(_))
+        ));
         initialize_activation(&resolver, 10, ActivationStatus::Inactive, 0);
         session
             .apply(SessionCommand::MemoryAvailable(MemoryId(10)))
