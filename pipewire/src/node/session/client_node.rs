@@ -182,3 +182,90 @@ fn record_send_failure(failure: &Mutex<Option<String>>, error: CommandSendError)
 fn command_error(error: CommandSendError) -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, error)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+    use pipewire_native_node::session::{
+        cycle::{CommittedOutput, OutputCycle},
+        output::{OutputProcess, ProcessError},
+    };
+    use pipewire_native_protocol::wire::client_node::{Command, Event, RegionRef, Transport};
+
+    use super::*;
+    use crate::{
+        context::Context, main_loop::MainLoop, properties::Properties,
+        proxy::client_node::ClientNode,
+    };
+
+    struct UncalledProcess;
+
+    impl OutputProcess for UncalledProcess {
+        fn process(&mut self, _cycle: OutputCycle<'_>) -> Result<CommittedOutput, ProcessError> {
+            panic!("overflowed bridge must not invoke its process callback")
+        }
+    }
+
+    fn eventfd() -> OwnedFd {
+        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(raw >= 0);
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    }
+
+    fn fdinfo(fd: RawFd) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canonical_event_queue_overflow_is_terminal_and_closes_fds() {
+        crate::init();
+        let main_loop = MainLoop::new(&Properties::new()).unwrap();
+        let context = Context::new(&main_loop, Properties::new()).unwrap();
+        let core = crate::core::Core::new_disconnected_for_test(&context);
+        let memory = MemoryPoolHandle::install(
+            &core,
+            pipewire_native_node::shm::ShrinkPolicy::RequireSealed,
+        );
+        let proxy = ClientNode::new(&core);
+        let bridge = ClientNodeSessionBridge::spawn_tokio(
+            proxy.clone(),
+            memory,
+            Box::new(UncalledProcess),
+            1,
+        )
+        .unwrap();
+
+        // The current-thread runtime cannot poll the spawned owner until this test yields.
+        proxy.dispatch(Event::Command(Command::Pause));
+        let trigger = eventfd();
+        let completion = eventfd();
+        let trigger_raw = trigger.as_raw_fd();
+        let completion_raw = completion.as_raw_fd();
+        let trigger_identity = fdinfo(trigger_raw).unwrap();
+        let completion_identity = fdinfo(completion_raw).unwrap();
+        proxy.dispatch(Event::Transport(Transport {
+            trigger_fd: trigger,
+            completion_fd: completion,
+            activation: RegionRef {
+                memory_id: 1,
+                offset: 0,
+                size: 8,
+            },
+        }));
+
+        assert_eq!(
+            bridge.terminal_error().as_deref(),
+            Some("ClientNode command queue Full")
+        );
+        assert_ne!(
+            fdinfo(trigger_raw).as_deref(),
+            Some(trigger_identity.as_str())
+        );
+        assert_ne!(
+            fdinfo(completion_raw).as_deref(),
+            Some(completion_identity.as_str())
+        );
+        bridge.shutdown().await.unwrap();
+    }
+}

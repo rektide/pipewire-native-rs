@@ -164,6 +164,15 @@ impl Core {
         Ok(this)
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_disconnected_for_test(context: &Context) -> Self {
+        let core = Self {
+            inner: new_refcounted(InnerCore::new(context, Properties::new())),
+        };
+        core.inner.client.set_core(core.downgrade());
+        core
+    }
+
     /// Disconnect connection with the PipeWire server. This will immediately trigger the `removed`
     /// and `destroy` events on all tracked proxies. Callers should ensure that this will not
     /// result in deadlocks with their own synchronisation primitives (for example, taking a lock

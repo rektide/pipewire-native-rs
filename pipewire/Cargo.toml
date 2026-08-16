@@ -21,6 +21,7 @@ tinyjson = "2.5.1"
 pipewire-native-server.workspace = true
 serial_test = "3"
 tempfile = "3"
+tokio = { version = "1.44.1", features = ["macros", "rt"] }
 
 [build-dependencies]
 pkg-config = "0.3.32"
