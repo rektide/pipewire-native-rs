@@ -114,6 +114,7 @@ pub struct CycleSnapshot {
 #[derive(Debug, Default)]
 struct Coordination {
     callbacks: u64,
+    completed_callbacks: u64,
     hold_second: bool,
     second_entered: bool,
     release_second: bool,
@@ -184,16 +185,23 @@ impl ClientNodeFixture {
     pub fn before_callback(&self) {
         let mut state = self.0.coordination.lock().unwrap();
         state.callbacks += 1;
-        let callbacks = state.callbacks;
-        if let Some(snapshot) = state.snapshot.as_mut() {
-            snapshot.callbacks = callbacks;
-        }
         if state.callbacks == 2 && state.hold_second {
             state.second_entered = true;
             self.0.changed.notify_all();
             while !state.release_second {
                 state = self.0.changed.wait(state).unwrap();
             }
+        }
+        self.0.changed.notify_all();
+    }
+
+    /// Called by the application callback immediately before returning its committed output.
+    pub fn after_callback(&self) {
+        let mut state = self.0.coordination.lock().unwrap();
+        state.completed_callbacks += 1;
+        let completed = state.completed_callbacks;
+        if let Some(snapshot) = state.snapshot.as_mut() {
+            snapshot.callbacks = completed;
         }
         self.0.changed.notify_all();
     }
@@ -274,7 +282,7 @@ impl ClientNodeFixture {
             deadline,
             scenario,
             &format!("callback count {count}"),
-            |state| state.callbacks >= count,
+            |state| state.completed_callbacks >= count,
         )
     }
 
@@ -308,7 +316,7 @@ impl ClientNodeFixture {
     pub(crate) fn assert_first_cycle(&self) -> io::Result<()> {
         let mut snapshot = self.with_resources(Resources::snapshot)?;
         let state = self.0.coordination.lock().unwrap();
-        snapshot.callbacks = state.callbacks;
+        snapshot.callbacks = state.completed_callbacks;
         drop(state);
         let expected_chunk = (0, 16, 4, 0);
         if snapshot.media != PCM_BYTES
@@ -331,6 +339,27 @@ impl ClientNodeFixture {
         }
         self.0.coordination.lock().unwrap().snapshot = Some(snapshot);
         Ok(())
+    }
+
+    pub(crate) fn assert_held_cycle_published(&self) -> io::Result<()> {
+        let snapshot = self.with_resources(Resources::snapshot)?;
+        if snapshot.media != PCM_BYTES
+            || snapshot.chunk != (0, 16, 4, 0)
+            || snapshot.io_status != BufferStatus::HaveData as i32
+            || snapshot.io_buffer_id != 1
+            || snapshot.peer_event_count != 1
+        {
+            return Err(io::Error::other(format!(
+                "held cycle did not publish through its retained generation: {snapshot:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wait_peer_signal(&self, deadline: Instant, scenario: &str) -> io::Result<()> {
+        self.wait_resources(deadline, scenario, "held cycle peer signal", |resources| {
+            peek_eventfd(&resources.peer_signal) == 1
+        })
     }
 
     pub(crate) fn mark_teardown_sent(&self) {
@@ -401,8 +430,11 @@ impl ClientNodeFixture {
         io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "scenario={scenario} last_step={step} callbacks={} stale_confirmed={} media_removed={} {resources}; roles=own-activation,metadata,media,io,peer-activation,trigger,hidden-completion,peer-signal",
-                coordination.callbacks, coordination.stale_confirmed, coordination.media_removed
+                "scenario={scenario} last_step={step} callbacks_entered={} callbacks_completed={} stale_confirmed={} media_removed={} {resources}; roles=own-activation,metadata,media,io,peer-activation,trigger,hidden-completion,peer-signal",
+                coordination.callbacks,
+                coordination.completed_callbacks,
+                coordination.stale_confirmed,
+                coordination.media_removed
             ),
         )
     }

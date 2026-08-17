@@ -82,9 +82,11 @@ impl OutputProcess for FixedOutput {
         assert_eq!(cycle.format().rate.get(), 48_000);
         assert_eq!(cycle.format().channels.len(), 2);
         cycle.interleaved_pcm()[..PCM_BYTES.len()].copy_from_slice(&PCM_BYTES);
-        cycle.commit(4).map_err(|error| ProcessError {
+        let committed = cycle.commit(4).map_err(|error| ProcessError {
             message: error.to_string(),
-        })
+        })?;
+        self.fixture.after_callback();
+        Ok(committed)
     }
 }
 

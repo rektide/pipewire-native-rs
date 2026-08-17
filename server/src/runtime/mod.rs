@@ -680,6 +680,8 @@ fn apply_action(
             fixture.wait_media_removed(deadline, scenario_name)?;
             fixture.release_second_callback();
             fixture.wait_callbacks(2, deadline, scenario_name)?;
+            fixture.wait_peer_signal(deadline, scenario_name)?;
+            fixture.assert_held_cycle_published()?;
             Ok(true)
         }
         Action::MarkClientNodeFixtureTeardown(fixture) => {
