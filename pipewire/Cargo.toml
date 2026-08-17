@@ -16,6 +16,7 @@ pipewire-native-node.workspace = true
 pipewire-native-protocol.workspace = true
 pipewire-native-spa.workspace = true
 tinyjson = "2.5.1"
+tokio = { version = "1.44.1", features = ["rt"] }
 
 [dev-dependencies]
 pipewire-native-server.workspace = true

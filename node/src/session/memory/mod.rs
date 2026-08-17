@@ -167,6 +167,43 @@ pub trait MemoryResolver {
     ) -> Result<MemoryMapping, MemoryError>;
 }
 
+/// Queue-safe ownership of one exact imported-memory generation.
+///
+/// A lease remains mappable after the numeric ID is removed or reused. Protocol
+/// adapters attach it to the corresponding ordered `Available` command, so its
+/// lifetime is bounded by that command and any session generation built from it.
+#[derive(Clone)]
+pub struct MemoryLease {
+    entry: Arc<MemoryEntry>,
+    shrink_policy: ShrinkPolicy,
+}
+
+impl fmt::Debug for MemoryLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemoryLease")
+            .field("key", &self.key())
+            .finish()
+    }
+}
+
+impl MemoryLease {
+    /// Returns the exact generation retained by this lease.
+    pub fn key(&self) -> MemoryKey {
+        self.entry.key
+    }
+
+    /// Maps a checked region from this retained generation.
+    pub fn map(
+        &self,
+        offset: usize,
+        len: usize,
+        writable: bool,
+    ) -> Result<MemoryMapping, MemoryError> {
+        map_entry(&self.entry, self.shrink_policy, offset, len, writable)
+    }
+}
+
 impl MemoryResolver for MemoryPool {
     fn resolve(&self, id: MemoryId) -> Result<MemoryKey, MemoryError> {
         MemoryPool::resolve(self, id)
@@ -282,32 +319,27 @@ impl MemoryPool {
                 active: Some(entry.key),
             });
         }
-        let valid = len > 0
-            && len <= isize::MAX as usize
-            && offset
-                .checked_add(len)
-                .is_some_and(|end| end <= entry.file_len);
-        if !valid {
-            return Err(MemoryError::InvalidRegion {
-                key,
-                offset,
-                len,
-                file_len: entry.file_len,
+        map_entry(entry, self.shrink_policy, offset, len, writable)
+    }
+
+    /// Retains one currently active exact generation for ordered command delivery.
+    pub fn lease(&self, key: MemoryKey) -> Result<MemoryLease, MemoryError> {
+        if self.disconnected {
+            return Err(MemoryError::Disconnected);
+        }
+        let entry = self.live.get(&key.id).ok_or(MemoryError::StaleGeneration {
+            requested: key,
+            active: None,
+        })?;
+        if entry.key != key {
+            return Err(MemoryError::StaleGeneration {
+                requested: key,
+                active: Some(entry.key),
             });
         }
-
-        let mapped = MappedRegion::map_shared_with_policy(
-            entry.fd.as_fd(),
-            offset,
-            len,
-            writable,
-            self.shrink_policy,
-        )
-        .map_err(|source| MemoryError::Map { key, source })?;
-        Ok(MemoryMapping {
-            mapped,
+        Ok(MemoryLease {
             entry: Arc::clone(entry),
-            offset,
+            shrink_policy: self.shrink_policy,
         })
     }
 
@@ -342,6 +374,47 @@ impl MemoryPool {
     pub fn is_empty(&self) -> bool {
         self.live.is_empty()
     }
+
+    /// Snapshots active exact keys for terminal lifecycle notification.
+    pub fn active_keys(&self) -> Vec<MemoryKey> {
+        self.live.values().map(|entry| entry.key).collect()
+    }
+}
+
+fn map_entry(
+    entry: &Arc<MemoryEntry>,
+    shrink_policy: ShrinkPolicy,
+    offset: usize,
+    len: usize,
+    writable: bool,
+) -> Result<MemoryMapping, MemoryError> {
+    let key = entry.key;
+    let valid = len > 0
+        && len <= isize::MAX as usize
+        && offset
+            .checked_add(len)
+            .is_some_and(|end| end <= entry.file_len);
+    if !valid {
+        return Err(MemoryError::InvalidRegion {
+            key,
+            offset,
+            len,
+            file_len: entry.file_len,
+        });
+    }
+    let mapped = MappedRegion::map_shared_with_policy(
+        entry.fd.as_fd(),
+        offset,
+        len,
+        writable,
+        shrink_policy,
+    )
+    .map_err(|source| MemoryError::Map { key, source })?;
+    Ok(MemoryMapping {
+        mapped,
+        entry: Arc::clone(entry),
+        offset,
+    })
 }
 
 /// Owned checked mapping that pins its imported FD generation until drop.

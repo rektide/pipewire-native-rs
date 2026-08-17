@@ -3,10 +3,15 @@
 
 //! Adapts Core memory events to a ClientNode session memory pool.
 
-use std::{fmt, io, os::fd::OwnedFd, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt, io,
+    os::fd::OwnedFd,
+    sync::{Arc, Weak},
+};
 
 use parking_lot::Mutex;
-use pipewire_native_node::session::memory::{MemoryPool, MemoryResolver};
+use pipewire_native_node::session::memory::{MemoryLease, MemoryPool, MemoryResolver};
 
 use crate::{
     core::{Core, CoreMemoryImporter},
@@ -38,20 +43,45 @@ impl fmt::Debug for MemoryPoolHandle {
 
 struct MemoryPoolInner {
     pool: Mutex<MemoryPool>,
-    event_handler: Mutex<Option<MemoryPoolEventHandler>>,
+    events: Mutex<MemoryEventDispatch>,
 }
 
 /// A successful Core memory-pool mutation delivered after the pool lock is released.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MemoryPoolEvent {
+#[derive(Clone, Debug)]
+pub(crate) enum MemoryPoolEvent {
     /// A numeric ID now resolves to this exact generation.
-    Available(MemoryKey),
+    Available(MemoryLease),
     /// This exact generation was retired and can no longer be resolved.
     Removed(MemoryKey),
+    /// The Core importer was replaced or the connection disconnected.
+    Disconnected,
 }
 
-/// Sole owner callback for connection memory lifecycle events.
-pub type MemoryPoolEventHandler = Box<dyn FnMut(MemoryPoolEvent) + Send>;
+type MemoryPoolEventHandler = Box<dyn FnMut(MemoryPoolEvent) + Send>;
+
+#[derive(Default)]
+struct MemoryEventDispatch {
+    next_id: u64,
+    subscribers: BTreeMap<u64, Option<MemoryPoolEventHandler>>,
+    queued: VecDeque<MemoryPoolEvent>,
+    dispatching: bool,
+}
+
+/// One independently removable internal memory lifecycle subscription.
+pub(crate) struct MemoryPoolSubscription {
+    inner: Weak<MemoryPoolInner>,
+    id: u64,
+}
+
+impl Drop for MemoryPoolSubscription {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let callback = inner.events.lock().subscribers.remove(&self.id).flatten();
+        drop(callback);
+    }
+}
 
 impl MemoryPoolHandle {
     /// Creates a pool, installs its private importer into `core`, and returns session access.
@@ -60,7 +90,7 @@ impl MemoryPoolHandle {
     pub fn install(core: &Core, shrink_policy: ShrinkPolicy) -> Self {
         let inner = Arc::new(MemoryPoolInner {
             pool: Mutex::new(MemoryPool::new(shrink_policy)),
-            event_handler: Mutex::new(None),
+            events: Mutex::new(MemoryEventDispatch::default()),
         });
         core.set_memory_importer(Some(Box::new(MemoryPoolImporter {
             inner: Arc::clone(&inner),
@@ -68,12 +98,22 @@ impl MemoryPoolHandle {
         Self { inner }
     }
 
-    /// Installs the sole owner of post-mutation memory lifecycle events.
-    ///
-    /// Replacing the handler drops the previous handler after releasing the handler lock.
-    pub fn set_event_handler(&self, handler: Option<MemoryPoolEventHandler>) {
-        let previous = std::mem::replace(&mut *self.inner.event_handler.lock(), handler);
-        drop(previous);
+    /// Adds an independently identified bridge subscription.
+    pub(crate) fn subscribe(&self, handler: MemoryPoolEventHandler) -> MemoryPoolSubscription {
+        let id = {
+            let mut events = self.inner.events.lock();
+            let id = events.next_id;
+            events.next_id = events
+                .next_id
+                .checked_add(1)
+                .expect("memory subscription IDs exhausted");
+            events.subscribers.insert(id, Some(handler));
+            id
+        };
+        MemoryPoolSubscription {
+            inner: Arc::downgrade(&self.inner),
+            id,
+        }
     }
 
     /// Returns the current generation key for an active Core memory ID.
@@ -130,13 +170,14 @@ struct MemoryPoolImporter {
 
 impl CoreMemoryImporter for MemoryPoolImporter {
     fn add_memory(&mut self, id: Id, type_: u32, fd: OwnedFd, flags: u32) -> io::Result<()> {
-        let key = self
-            .inner
-            .pool
-            .lock()
-            .add(MemoryId(id), type_, flags, fd)
-            .map_err(import_error)?;
-        notify(&self.inner, MemoryPoolEvent::Available(key));
+        let lease = {
+            let mut pool = self.inner.pool.lock();
+            let key = pool
+                .add(MemoryId(id), type_, flags, fd)
+                .map_err(import_error)?;
+            pool.lease(key).map_err(import_error)?
+        };
+        notify(&self.inner, MemoryPoolEvent::Available(lease));
         Ok(())
     }
 
@@ -154,13 +195,79 @@ impl CoreMemoryImporter for MemoryPoolImporter {
 
 impl Drop for MemoryPoolImporter {
     fn drop(&mut self) {
-        self.inner.pool.lock().disconnect();
+        let keys = {
+            let mut pool = self.inner.pool.lock();
+            let keys = pool.active_keys();
+            pool.disconnect();
+            keys
+        };
+        for key in keys {
+            notify(&self.inner, MemoryPoolEvent::Removed(key));
+        }
+        notify(&self.inner, MemoryPoolEvent::Disconnected);
     }
 }
 
 fn notify(inner: &MemoryPoolInner, event: MemoryPoolEvent) {
-    if let Some(handler) = inner.event_handler.lock().as_mut() {
-        handler(event);
+    {
+        let mut events = inner.events.lock();
+        events.queued.push_back(event);
+        if events.dispatching {
+            return;
+        }
+        events.dispatching = true;
+    }
+
+    loop {
+        let (event, subscribers) = {
+            let mut events = inner.events.lock();
+            let Some(event) = events.queued.pop_front() else {
+                events.dispatching = false;
+                return;
+            };
+            let subscribers = events.subscribers.keys().copied().collect::<Vec<_>>();
+            (event, subscribers)
+        };
+        for id in subscribers {
+            let callback = inner
+                .events
+                .lock()
+                .subscribers
+                .get_mut(&id)
+                .and_then(Option::take);
+            let Some(callback) = callback else { continue };
+            let mut active = ActiveSubscription {
+                inner,
+                id,
+                callback: Some(callback),
+            };
+            active.callback.as_mut().expect("active callback")(event.clone());
+        }
+    }
+}
+
+struct ActiveSubscription<'a> {
+    inner: &'a MemoryPoolInner,
+    id: u64,
+    callback: Option<MemoryPoolEventHandler>,
+}
+
+impl Drop for ActiveSubscription<'_> {
+    fn drop(&mut self) {
+        let callback = {
+            let mut events = self.inner.events.lock();
+            if let Some(slot) = events.subscribers.get_mut(&self.id) {
+                if slot.is_none() {
+                    *slot = self.callback.take();
+                    None
+                } else {
+                    self.callback.take()
+                }
+            } else {
+                self.callback.take()
+            }
+        };
+        drop(callback);
     }
 }
 
@@ -186,7 +293,10 @@ fn import_error(error: MemoryError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::{
+        os::fd::{AsRawFd, RawFd},
+        sync::Mutex as StdMutex,
+    };
 
     use pipewire_native_node::{session::memory::MemoryPool, shm::create_memfd};
     use pipewire_native_spa::buffer::data_type;
@@ -208,12 +318,16 @@ mod tests {
         }
     }
 
+    fn inner() -> Arc<MemoryPoolInner> {
+        Arc::new(MemoryPoolInner {
+            pool: Mutex::new(MemoryPool::new(ShrinkPolicy::Allow)),
+            events: Mutex::new(MemoryEventDispatch::default()),
+        })
+    }
+
     #[test]
     fn importer_errors_preserve_pool_error_and_close_candidate_fd() {
-        let inner = Arc::new(MemoryPoolInner {
-            pool: Mutex::new(MemoryPool::new(ShrinkPolicy::Allow)),
-            event_handler: Mutex::new(None),
-        });
+        let inner = inner();
         let mut importer = MemoryPoolImporter {
             inner: Arc::clone(&inner),
         };
@@ -254,10 +368,7 @@ mod tests {
 
     #[test]
     fn importer_drop_terminally_disconnects_shared_pool() {
-        let inner = Arc::new(MemoryPoolInner {
-            pool: Mutex::new(MemoryPool::new(ShrinkPolicy::Allow)),
-            event_handler: Mutex::new(None),
-        });
+        let inner = inner();
         let handle = MemoryPoolHandle {
             inner: Arc::clone(&inner),
         };
@@ -278,23 +389,27 @@ mod tests {
 
     #[test]
     fn notifications_follow_mutation_and_preserve_exact_generation() {
-        let inner = Arc::new(MemoryPoolInner {
-            pool: Mutex::new(MemoryPool::new(ShrinkPolicy::Allow)),
-            event_handler: Mutex::new(None),
-        });
+        let inner = inner();
         let handle = MemoryPoolHandle {
             inner: Arc::clone(&inner),
         };
         let observed = Arc::new(Mutex::new(Vec::new()));
         let callback_handle = handle.clone();
         let callback_observed = Arc::clone(&observed);
-        handle.set_event_handler(Some(Box::new(move |event| {
+        let _subscription = handle.subscribe(Box::new(move |event| {
             // Resolving in the callback proves the pool lock is not held across notification.
-            if let MemoryPoolEvent::Available(key) = event {
-                assert_eq!(callback_handle.resolve(key.id).unwrap(), key);
+            if let MemoryPoolEvent::Available(lease) = &event {
+                assert_eq!(
+                    callback_handle.resolve(lease.key().id).unwrap(),
+                    lease.key()
+                );
             }
-            callback_observed.lock().push(event);
-        })));
+            callback_observed.lock().push(match event {
+                MemoryPoolEvent::Available(lease) => (0, Some(lease.key())),
+                MemoryPoolEvent::Removed(key) => (1, Some(key)),
+                MemoryPoolEvent::Disconnected => (2, None),
+            });
+        }));
         let mut importer = MemoryPoolImporter { inner };
 
         importer
@@ -308,16 +423,82 @@ mod tests {
         let key = handle.resolve(MemoryId(12)).unwrap();
         importer.remove_memory(12).unwrap();
 
-        assert_eq!(
-            *observed.lock(),
-            [
-                MemoryPoolEvent::Available(key),
-                MemoryPoolEvent::Removed(key)
-            ]
-        );
+        assert_eq!(*observed.lock(), [(0, Some(key)), (1, Some(key))]);
         assert!(matches!(
             handle.map(key, 0, 1, false),
             Err(MemoryError::StaleGeneration { requested, active: None }) if requested == key
         ));
+    }
+
+    #[test]
+    fn subscriptions_are_independent_ordered_and_reentrant() {
+        let inner = inner();
+        let handle = MemoryPoolHandle { inner };
+        let first_events = Arc::new(StdMutex::new(Vec::new()));
+        let second_events = Arc::new(StdMutex::new(Vec::new()));
+        let replacement_events = Arc::new(StdMutex::new(Vec::new()));
+        let first_slot = Arc::new(StdMutex::new(None));
+        let replacement_slot = Arc::new(StdMutex::new(None));
+
+        let callback_handle = handle.clone();
+        let callback_slot = Arc::clone(&first_slot);
+        let callback_events = Arc::clone(&first_events);
+        let callback_replacement = Arc::clone(&replacement_events);
+        let callback_replacement_slot = Arc::clone(&replacement_slot);
+        let first = handle.subscribe(Box::new(move |event| {
+            callback_events.lock().unwrap().push(match &event {
+                MemoryPoolEvent::Available(lease) => lease.key(),
+                MemoryPoolEvent::Removed(key) => *key,
+                MemoryPoolEvent::Disconnected => return,
+            });
+            if let MemoryPoolEvent::Available(lease) = event {
+                callback_slot.lock().unwrap().take();
+                let replacement = Arc::clone(&callback_replacement);
+                let subscription = callback_handle.subscribe(Box::new(move |event| {
+                    if let MemoryPoolEvent::Removed(key) = event {
+                        replacement.lock().unwrap().push(key);
+                    }
+                }));
+                *callback_replacement_slot.lock().unwrap() = Some(subscription);
+                notify(
+                    &callback_handle.inner,
+                    MemoryPoolEvent::Removed(lease.key()),
+                );
+            }
+        }));
+        *first_slot.lock().unwrap() = Some(first);
+
+        let second_observed = Arc::clone(&second_events);
+        let second = handle.subscribe(Box::new(move |event| {
+            second_observed.lock().unwrap().push(match event {
+                MemoryPoolEvent::Available(lease) => Some(lease.key()),
+                MemoryPoolEvent::Removed(key) => Some(key),
+                MemoryPoolEvent::Disconnected => None,
+            });
+        }));
+
+        let key = {
+            let mut pool = handle.inner.pool.lock();
+            let key = pool
+                .add(
+                    MemoryId(30),
+                    data_type::MEM_FD,
+                    0,
+                    create_memfd("reentrant", 64).unwrap(),
+                )
+                .unwrap();
+            let lease = pool.lease(key).unwrap();
+            drop(pool);
+            notify(&handle.inner, MemoryPoolEvent::Available(lease));
+            key
+        };
+
+        assert_eq!(*first_events.lock().unwrap(), [key]);
+        assert_eq!(*second_events.lock().unwrap(), [Some(key), Some(key)]);
+        replacement_slot.lock().unwrap().take();
+        assert_eq!(*replacement_events.lock().unwrap(), [key]);
+        drop(second);
+        notify(&handle.inner, MemoryPoolEvent::Removed(key));
+        assert_eq!(*second_events.lock().unwrap(), [Some(key), Some(key)]);
     }
 }

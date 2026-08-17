@@ -236,7 +236,13 @@ where
     let (stop, stop_rx) = watch::channel(false);
     let counters = Arc::new(RuntimeCounters::default());
     let worker_counters = Arc::clone(&counters);
-    let join = tokio::spawn(run_session(
+    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!("ClientNode session requires a Tokio runtime: {error}"),
+        )
+    })?;
+    let join = runtime.spawn(run_session(
         session,
         receiver,
         stop_rx,
@@ -279,54 +285,63 @@ where
     R: MemoryResolver + Send + 'static,
     C: RuntimeClock,
 {
-    let mut registration = desired_registration(&session)?;
-    loop {
-        if *stop.borrow() {
-            break;
-        }
-        if let Some(trigger) = registration.as_ref() {
-            tokio::select! {
-                biased;
-                changed = stop.changed() => {
-                    if changed.is_err() || *stop.borrow() {
-                        break;
+    let result: io::Result<()> = async {
+        let mut registration = desired_registration(&session)?;
+        loop {
+            if *stop.borrow() {
+                break;
+            }
+            if let Some(trigger) = registration.as_ref() {
+                tokio::select! {
+                    biased;
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() {
+                            break;
+                        }
+                    }
+                    command = commands.recv() => {
+                        let Some(command) = command else { break };
+                        session.apply(command).map_err(session_error)?;
+                        if session.state() == SessionState::Disconnected { break; }
+                        registration = desired_registration(&session)?;
+                    }
+                    ready = trigger.readable() => {
+                        let mut ready = ready?;
+                        let generation = trigger.get_ref().generation;
+                        let awake_ns = clock.monotonic_ns();
+                        let outcome = session
+                            .on_wake_with_finish(generation, awake_ns, || clock.monotonic_ns(), &mut *process)
+                            .map_err(session_error)?;
+                        ready.clear_ready();
+                        record_outcome(&counters, outcome);
+                        registration = desired_registration(&session)?;
                     }
                 }
-                command = commands.recv() => {
-                    let Some(command) = command else { break };
-                    session.apply(command).map_err(session_error)?;
-                    registration = desired_registration(&session)?;
-                }
-                ready = trigger.readable() => {
-                    let mut ready = ready?;
-                    let generation = trigger.get_ref().generation;
-                    let awake_ns = clock.monotonic_ns();
-                    let outcome = session
-                        .on_wake_with_finish(generation, awake_ns, || clock.monotonic_ns(), &mut *process)
-                        .map_err(session_error)?;
-                    ready.clear_ready();
-                    record_outcome(&counters, outcome);
-                    registration = desired_registration(&session)?;
-                }
-            }
-        } else {
-            tokio::select! {
-                biased;
-                changed = stop.changed() => {
-                    if changed.is_err() || *stop.borrow() {
-                        break;
+            } else {
+                tokio::select! {
+                    biased;
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() {
+                            break;
+                        }
                     }
-                }
-                command = commands.recv() => {
-                    let Some(command) = command else { break };
-                    session.apply(command).map_err(session_error)?;
-                    registration = desired_registration(&session)?;
+                    command = commands.recv() => {
+                        let Some(command) = command else { break };
+                        session.apply(command).map_err(session_error)?;
+                        if session.state() == SessionState::Disconnected { break; }
+                        registration = desired_registration(&session)?;
+                    }
                 }
             }
         }
+        Ok(())
     }
-    let _ = session.apply(SessionCommand::Disconnect);
-    Ok(())
+    .await;
+    let cleanup = session
+        .apply(SessionCommand::Disconnect)
+        .map(|_| ())
+        .map_err(session_error);
+    result.and(cleanup)
 }
 
 fn desired_registration<R: MemoryResolver>(
@@ -430,6 +445,17 @@ mod tests {
                 )
                 .unwrap()
         }
+
+        fn session(&self) -> ClientNodeSession<Self> {
+            let mut session = ClientNodeSession::new(self.clone());
+            let pool = self.0.lock().unwrap();
+            for key in pool.active_keys() {
+                session
+                    .apply(SessionCommand::MemoryAvailable(pool.lease(key).unwrap()))
+                    .unwrap();
+            }
+            session
+        }
     }
 
     impl MemoryResolver for SharedMemory {
@@ -516,7 +542,7 @@ mod tests {
         let trigger_raw = trigger_fd.as_raw_fd();
         let (completion_fd, completion) = event_pair();
         let completion_raw = completion_fd.as_raw_fd();
-        let mut session = ClientNodeSession::new(memory.clone());
+        let mut session = memory.session();
         session
             .apply(SessionCommand::ReplaceTransport(TransportDescriptor {
                 trigger_fd,
@@ -599,7 +625,7 @@ mod tests {
         .unwrap();
 
         trigger.signal(3).unwrap();
-        for _ in 0..100 {
+        for _ in 0..10_000 {
             if calls.load(Ordering::Relaxed) == 1 {
                 break;
             }
@@ -655,6 +681,12 @@ mod tests {
         .unwrap();
         handle
             .command_sender()
+            .try_send(SessionCommand::MemoryAvailable(
+                memory.0.lock().unwrap().lease(replacement_key).unwrap(),
+            ))
+            .unwrap();
+        handle
+            .command_sender()
             .try_send(SessionCommand::ReplaceTransport(TransportDescriptor {
                 trigger_fd: new_trigger_fd,
                 completion_fd: new_completion_fd,
@@ -666,7 +698,7 @@ mod tests {
             }))
             .unwrap();
 
-        for _ in 0..100 {
+        for _ in 0..10_000 {
             let mut activation = memory
                 .map(replacement_key, 0, ActivationView::required_size(), true)
                 .unwrap();
@@ -760,6 +792,66 @@ mod tests {
                 fdinfo(completion_raw).as_deref(),
                 Some(completion_identity.as_str())
             );
+        }
+    }
+
+    #[test]
+    fn spawn_without_tokio_runtime_returns_error() {
+        let memory = SharedMemory::new();
+        let session = ClientNodeSession::new(memory);
+        let result = spawn_tokio(
+            session,
+            Box::new(CountingProcess(Arc::new(AtomicUsize::new(0)))),
+            1,
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_drop_and_runtime_error_deactivate_activation() {
+        for fail_runtime in [false, true] {
+            let (session, memory, activation_key, _trigger, _completion, _, _) =
+                configure_running();
+            let handle = spawn_tokio(
+                session,
+                Box::new(CountingProcess(Arc::new(AtomicUsize::new(0)))),
+                8,
+            )
+            .unwrap();
+            if fail_runtime {
+                let bad_key = memory.add(80, 8);
+                let (trigger_fd, _) = event_pair();
+                let (completion_fd, _) = event_pair();
+                let sender = handle.command_sender();
+                sender
+                    .try_send(SessionCommand::MemoryAvailable(
+                        memory.0.lock().unwrap().lease(bad_key).unwrap(),
+                    ))
+                    .unwrap();
+                sender
+                    .try_send(SessionCommand::ReplaceTransport(TransportDescriptor {
+                        trigger_fd,
+                        completion_fd,
+                        activation: RegionRef {
+                            memory: MemoryId(80),
+                            offset: 0,
+                            len: 8,
+                        },
+                    }))
+                    .unwrap();
+                assert!(handle.wait().await.is_err());
+            } else {
+                drop(handle);
+                tokio::task::yield_now().await;
+            }
+            let mut activation = memory
+                .map(activation_key, 0, ActivationView::required_size(), true)
+                .unwrap();
+            let view = unsafe {
+                ActivationView::from_raw_parts(activation.as_mut_ptr(), activation.len()).unwrap()
+            };
+            assert_eq!(view.status().unwrap(), ActivationStatus::Inactive);
         }
     }
 }

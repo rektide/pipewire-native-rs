@@ -35,6 +35,14 @@ pub struct TransportGeneration {
     activation: MemoryMapping,
 }
 
+impl Drop for TransportGeneration {
+    fn drop(&mut self) {
+        // Runtime-task cancellation drops the owner synchronously. Deactivate before
+        // the activation mapping and transport descriptors are released.
+        let _ = self.deactivate();
+    }
+}
+
 impl TransportGeneration {
     /// Builds and initializes a candidate before it can replace a live transport.
     pub fn bind(

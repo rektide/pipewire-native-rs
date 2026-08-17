@@ -346,6 +346,12 @@ impl Core {
         memory: crate::node::session::memory::MemoryPoolHandle,
         process: Box<dyn pipewire_native_node::session::output::OutputProcess>,
     ) -> std::io::Result<crate::node::session::client_node::ClientNodeSessionBridge> {
+        tokio::runtime::Handle::try_current().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("ClientNode session requires a Tokio runtime: {error}"),
+            )
+        })?;
         let proxy = self.create_client_node(props)?;
         crate::node::session::client_node::ClientNodeSessionBridge::spawn_tokio(
             proxy,

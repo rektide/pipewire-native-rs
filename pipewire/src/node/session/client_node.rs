@@ -21,6 +21,7 @@ use crate::{
     HookId,
 };
 
+use super::memory::MemoryPoolSubscription;
 use super::memory::{MemoryPoolEvent, MemoryPoolHandle};
 
 /// Semantic owner associating one typed proxy, connection memory pool, callback, and runtime task.
@@ -30,7 +31,7 @@ use super::memory::{MemoryPoolEvent, MemoryPoolHandle};
 /// mappings, activation records, eventfds, or chunks.
 pub struct ClientNodeSessionBridge {
     proxy: ClientNode,
-    memory: MemoryPoolHandle,
+    memory_subscription: Option<MemoryPoolSubscription>,
     proxy_listener: Option<HookId>,
     runtime: Option<TokioSessionHandle>,
     failure: Arc<Mutex<Option<String>>>,
@@ -48,8 +49,8 @@ impl std::fmt::Debug for ClientNodeSessionBridge {
 }
 
 impl ClientNodeSessionBridge {
-    /// Spawns the process owner on the current Tokio runtime and installs the sole event owners.
-    pub fn spawn_tokio(
+    /// Spawns the process owner on the current Tokio runtime and installs private event owners.
+    pub(crate) fn spawn_tokio(
         proxy: ClientNode,
         memory: MemoryPoolHandle,
         process: Box<dyn OutputProcess>,
@@ -77,15 +78,16 @@ impl ClientNodeSessionBridge {
 
         let memory_sender = sender.clone();
         let memory_failure = Arc::clone(&failure);
-        memory.set_event_handler(Some(Box::new(move |event| {
+        let memory_subscription = memory.subscribe(Box::new(move |event| {
             let command = match event {
-                MemoryPoolEvent::Available(key) => SessionCommand::MemoryAvailable(key.id),
+                MemoryPoolEvent::Available(lease) => SessionCommand::MemoryAvailable(lease),
                 MemoryPoolEvent::Removed(key) => SessionCommand::RemoveMemory(key),
+                MemoryPoolEvent::Disconnected => SessionCommand::MemoryDisconnected,
             };
             if let Err(error) = memory_sender.try_send(command) {
                 record_send_failure(&memory_failure, error);
             }
-        })));
+        }));
 
         let removed_sender = sender;
         let removed_failure = Arc::clone(&failure);
@@ -100,16 +102,24 @@ impl ClientNodeSessionBridge {
 
         Ok(Self {
             proxy,
-            memory,
+            memory_subscription: Some(memory_subscription),
             proxy_listener: Some(proxy_listener),
             runtime: Some(runtime),
             failure,
         })
     }
 
-    /// Returns the typed ClientNode proxy for semantic advertisement methods.
-    pub fn proxy(&self) -> &ClientNode {
-        &self.proxy
+    /// Experimentally advertises one node and one output port as one bridge operation.
+    ///
+    /// The raw protocol-shaped arguments are temporary until `OutputNodeSpec` is stabilized;
+    /// callers cannot access the proxy or displace bridge callbacks.
+    pub fn advertise_output(
+        &self,
+        node: pipewire_native_protocol::wire::client_node::Update,
+        port: pipewire_native_protocol::wire::client_node::PortUpdate,
+    ) -> io::Result<()> {
+        self.proxy.update(node)?;
+        self.proxy.port_update(port)
     }
 
     /// Sends graph-active intent and applies it to the process owner after successful delivery.
@@ -148,7 +158,7 @@ impl ClientNodeSessionBridge {
 
     fn detach_callbacks(&mut self) {
         self.proxy.set_event_handler(None);
-        self.memory.set_event_handler(None);
+        self.memory_subscription.take();
         if let Some(listener) = self.proxy_listener.take() {
             self.proxy.proxy().remove_listener(listener);
         }
@@ -267,5 +277,73 @@ mod tests {
             Some(completion_identity.as_str())
         );
         bridge.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn synchronous_constructors_return_error_without_tokio_runtime() {
+        crate::init();
+        let main_loop = MainLoop::new(&Properties::new()).unwrap();
+        let context = Context::new(&main_loop, Properties::new()).unwrap();
+        let core = crate::core::Core::new_disconnected_for_test(&context);
+        let memory = MemoryPoolHandle::install(
+            &core,
+            pipewire_native_node::shm::ShrinkPolicy::RequireSealed,
+        );
+        let proxy = ClientNode::new(&core);
+        let error = ClientNodeSessionBridge::spawn_tokio(
+            proxy,
+            memory.clone(),
+            Box::new(UncalledProcess),
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+
+        let error = core
+            .create_tokio_client_node_session(&Properties::new(), memory, Box::new(UncalledProcess))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_removal_and_importer_disconnect_stop_every_bridge() {
+        crate::init();
+        let main_loop = MainLoop::new(&Properties::new()).unwrap();
+        let context = Context::new(&main_loop, Properties::new()).unwrap();
+        let core = crate::core::Core::new_disconnected_for_test(&context);
+        let memory = MemoryPoolHandle::install(
+            &core,
+            pipewire_native_node::shm::ShrinkPolicy::RequireSealed,
+        );
+
+        let proxy = ClientNode::new(&core);
+        let mut removed = ClientNodeSessionBridge::spawn_tokio(
+            proxy.clone(),
+            memory.clone(),
+            Box::new(UncalledProcess),
+            8,
+        )
+        .unwrap();
+        pipewire_native_spa::emit_hook!(proxy.proxy().events(), removed);
+        removed.runtime.take().unwrap().wait().await.unwrap();
+        drop(removed);
+
+        let first = ClientNodeSessionBridge::spawn_tokio(
+            ClientNode::new(&core),
+            memory.clone(),
+            Box::new(UncalledProcess),
+            8,
+        )
+        .unwrap();
+        let mut second = ClientNodeSessionBridge::spawn_tokio(
+            ClientNode::new(&core),
+            memory,
+            Box::new(UncalledProcess),
+            8,
+        )
+        .unwrap();
+        drop(first);
+        core.set_memory_importer(None);
+        second.runtime.take().unwrap().wait().await.unwrap();
     }
 }

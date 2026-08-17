@@ -3,7 +3,7 @@
 
 //! Runtime-independent single-owner ClientNode session state machine.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use pipewire_native_protocol::wire::client_node as wire;
 
@@ -13,7 +13,7 @@ use super::{
         PeerActivationUpdate, PortIoDescriptor, PortIoUpdate, TransportDescriptor,
     },
     error::SessionError,
-    memory::{MemoryError, MemoryId, MemoryInterval, MemoryResolver},
+    memory::{MemoryError, MemoryId, MemoryInterval, MemoryLease, MemoryResolver},
     output::{OutputGeneration, OutputProcess},
     peer::{PeerActivation, PeerSet},
     transport::{ClaimCompletion, TransportGeneration},
@@ -73,10 +73,12 @@ pub enum SessionCommand {
     SetPeerActivation(PeerActivationDescriptor),
     /// Idempotently remove a downstream activation.
     RemovePeerActivation(NodeId),
-    /// Notify that an unresolved memory ID may now resolve.
-    MemoryAvailable(MemoryId),
+    /// Make one exact imported generation available in command order.
+    MemoryAvailable(MemoryLease),
     /// Invalidate mappings retaining this exact retired memory generation.
     RemoveMemory(super::memory::MemoryKey),
+    /// The connection importer was replaced or disconnected.
+    MemoryDisconnected,
     /// Join or leave graph scheduling.
     SetActive(bool),
     /// Apply Start, Pause, or Suspend intent.
@@ -187,7 +189,8 @@ pub struct RuntimeRegistration {
 /// Coherent owner of one node's mappings, descriptors, state, and cycle authority.
 #[derive(Debug)]
 pub struct ClientNodeSession<R> {
-    memory: R,
+    _memory: R,
+    available_memory: HashMap<MemoryId, MemoryLease>,
     next_generation: u64,
     transport: Option<TransportGeneration>,
     pending_transport: Option<TransportDescriptor>,
@@ -206,7 +209,8 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
     /// Creates an empty configuring session over a runtime-neutral resolver.
     pub fn new(memory: R) -> Self {
         Self {
-            memory,
+            _memory: memory,
+            available_memory: HashMap::new(),
             next_generation: 1,
             transport: None,
             pending_transport: None,
@@ -371,9 +375,23 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
                 self.peers.remove(node);
                 ApplyOutcome::Applied
             }
-            SessionCommand::MemoryAvailable(_) => self.retry_pending()?,
+            SessionCommand::MemoryAvailable(lease) => {
+                self.available_memory.insert(lease.key().id, lease);
+                self.retry_pending()?
+            }
             SessionCommand::RemoveMemory(key) => {
+                if self
+                    .available_memory
+                    .get(&key.id)
+                    .is_some_and(|lease| lease.key() == key)
+                {
+                    self.available_memory.remove(&key.id);
+                }
                 self.remove_memory(key)?;
+                ApplyOutcome::Applied
+            }
+            SessionCommand::MemoryDisconnected => {
+                self.disconnect();
                 ApplyOutcome::Applied
             }
             SessionCommand::SetActive(active) => {
@@ -401,16 +419,7 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
                 ApplyOutcome::Applied
             }
             SessionCommand::Disconnect => {
-                let _ = self.stop();
-                self.pending_peers.clear();
-                self.peers = PeerSet::default();
-                self.output = None;
-                self.io_descriptor = None;
-                self.buffer_descriptor = None;
-                self.format = None;
-                self.pending_transport = None;
-                self.transport = None;
-                self.state = SessionState::Disconnected;
+                self.disconnect();
                 ApplyOutcome::Applied
             }
         };
@@ -507,12 +516,14 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
         let Some(descriptor) = self.pending_transport.as_ref() else {
             return Ok(ApplyOutcome::Applied);
         };
-        if unresolved(self.memory.resolve(descriptor.activation.memory))? {
+        let memory = OrderedMemory(&self.available_memory);
+        if unresolved(memory.resolve(descriptor.activation.memory))? {
             return Ok(ApplyOutcome::PendingMemory);
         }
         let descriptor = self.pending_transport.take().unwrap();
         let generation = self.allocate_generation()?;
-        let candidate = TransportGeneration::bind(generation, descriptor, &self.memory)?;
+        let memory = OrderedMemory(&self.available_memory);
+        let candidate = TransportGeneration::bind(generation, descriptor, &memory)?;
         let existing: Vec<_> = self
             .output
             .iter()
@@ -547,13 +558,15 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
         buffers: &BufferSetDescriptor,
         io: PortIoDescriptor,
     ) -> Result<Option<OutputGeneration>, SessionError> {
+        let memory = OrderedMemory(&self.available_memory);
         for id in buffer_memory_ids(buffers).chain(std::iter::once(io.region.memory)) {
-            if unresolved(self.memory.resolve(id))? {
+            if unresolved(memory.resolve(id))? {
                 return Ok(None);
             }
         }
         let generation = self.allocate_generation()?;
-        let candidate = OutputGeneration::bind(generation, format, buffers, io, &self.memory)?;
+        let memory = OrderedMemory(&self.available_memory);
+        let candidate = OutputGeneration::bind(generation, format, buffers, io, &memory)?;
         let existing: Vec<_> = self
             .transport
             .iter()
@@ -566,12 +579,14 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
 
     fn bind_peer(&mut self, node: NodeId) -> Result<ApplyOutcome, SessionError> {
         let descriptor = self.pending_peers.get(&node).unwrap();
-        if unresolved(self.memory.resolve(descriptor.activation.memory))? {
+        let memory = OrderedMemory(&self.available_memory);
+        if unresolved(memory.resolve(descriptor.activation.memory))? {
             return Ok(ApplyOutcome::PendingMemory);
         }
         let descriptor = self.pending_peers.remove(&node).unwrap();
         let generation = self.allocate_generation()?;
-        let candidate = PeerActivation::bind(generation, descriptor, &self.memory)?;
+        let memory = OrderedMemory(&self.available_memory);
+        let candidate = PeerActivation::bind(generation, descriptor, &memory)?;
         let existing: Vec<_> = self
             .transport
             .iter()
@@ -630,7 +645,7 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
         }
         if !self.is_ready() {
             self.state = SessionState::Configuring;
-            return Err(SessionError::NotReady("Start has unresolved configuration"));
+            return Ok(());
         }
         let transport = self.transport.as_mut().unwrap();
         match transport.status()? {
@@ -663,6 +678,20 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
         self.state = SessionState::Failed;
     }
 
+    fn disconnect(&mut self) {
+        let _ = self.stop();
+        self.pending_peers.clear();
+        self.peers = PeerSet::default();
+        self.output = None;
+        self.io_descriptor = None;
+        self.buffer_descriptor = None;
+        self.format = None;
+        self.pending_transport = None;
+        self.transport = None;
+        self.available_memory.clear();
+        self.state = SessionState::Disconnected;
+    }
+
     fn is_ready(&self) -> bool {
         self.transport.is_some() && self.format.is_some() && self.output.is_some()
     }
@@ -690,6 +719,37 @@ impl<R: MemoryResolver> ClientNodeSession<R> {
             .checked_add(1)
             .ok_or(SessionError::Overflow("session generation"))?;
         Ok(generation)
+    }
+}
+
+struct OrderedMemory<'a>(&'a HashMap<MemoryId, MemoryLease>);
+
+impl MemoryResolver for OrderedMemory<'_> {
+    fn resolve(&self, id: MemoryId) -> Result<super::memory::MemoryKey, MemoryError> {
+        self.0
+            .get(&id)
+            .map(MemoryLease::key)
+            .ok_or(MemoryError::UnknownMemory(id))
+    }
+
+    fn map(
+        &self,
+        key: super::memory::MemoryKey,
+        offset: usize,
+        len: usize,
+        writable: bool,
+    ) -> Result<super::memory::MemoryMapping, MemoryError> {
+        let lease = self.0.get(&key.id).ok_or(MemoryError::StaleGeneration {
+            requested: key,
+            active: None,
+        })?;
+        if lease.key() != key {
+            return Err(MemoryError::StaleGeneration {
+                requested: key,
+                active: Some(lease.key()),
+            });
+        }
+        lease.map(offset, len, writable)
     }
 }
 
@@ -789,6 +849,21 @@ mod tests {
 
         fn remove(&self, id: MemoryId) -> MemoryKey {
             self.0.borrow_mut().remove(id).unwrap()
+        }
+
+        fn lease(&self, key: MemoryKey) -> MemoryLease {
+            self.0.borrow().lease(key).unwrap()
+        }
+
+        fn session(&self) -> ClientNodeSession<Self> {
+            let keys = self.0.borrow().active_keys();
+            let mut session = ClientNodeSession::new(self.clone());
+            for key in keys {
+                session
+                    .apply(SessionCommand::MemoryAvailable(self.lease(key)))
+                    .unwrap();
+            }
+            session
         }
     }
 
@@ -941,7 +1016,7 @@ mod tests {
         let trigger_identity = fdinfo(trigger_raw).unwrap();
         let completion_identity = fdinfo(completion_raw).unwrap();
         let (peer_signal_fd, peer_signal) = event_pair();
-        let mut session = ClientNodeSession::new(resolver.clone());
+        let mut session = resolver.session();
         session
             .apply(SessionCommand::ReplaceTransport(transport))
             .unwrap();
@@ -1104,17 +1179,21 @@ mod tests {
         );
         assert!(session.transport_generation().is_none());
         session.apply(SessionCommand::SetActive(true)).unwrap();
-        assert!(matches!(
-            session.apply(SessionCommand::SetNodeCommand(NodeCommandState::Start)),
-            Err(SessionError::NotReady(_))
-        ));
-        initialize_activation(&resolver, 10, ActivationStatus::Inactive, 0);
         session
-            .apply(SessionCommand::MemoryAvailable(MemoryId(10)))
+            .apply(SessionCommand::SetNodeCommand(NodeCommandState::Start))
+            .unwrap();
+        let key = initialize_activation(&resolver, 10, ActivationStatus::Inactive, 0);
+        session
+            .apply(SessionCommand::MemoryAvailable(resolver.lease(key)))
             .unwrap();
         let old = session.transport_generation().unwrap();
 
         let resolver_bad_key = resolver.add(11, 8);
+        session
+            .apply(SessionCommand::MemoryAvailable(
+                resolver.lease(resolver_bad_key),
+            ))
+            .unwrap();
         let (bad, _, _, _, _) = transport(MemoryId(11));
         let bad = TransportDescriptor {
             activation: RegionRef {
@@ -1142,7 +1221,7 @@ mod tests {
             bytes[544..548].copy_from_slice(&1_u32.to_ne_bytes());
         }
         let (transport, _, _, _, _) = transport(MemoryId(1));
-        let mut session = ClientNodeSession::new(resolver.clone());
+        let mut session = resolver.session();
         session
             .apply(SessionCommand::ReplaceTransport(transport))
             .unwrap();
@@ -1239,7 +1318,7 @@ mod tests {
                 bytes[0..4].copy_from_slice(&(BufferStatus::NeedData as i32).to_ne_bytes());
             }
             let (descriptor, trigger, _, _, _) = transport(MemoryId(1));
-            let mut session = ClientNodeSession::new(resolver.clone());
+            let mut session = resolver.session();
             session
                 .apply(SessionCommand::ReplaceTransport(descriptor))
                 .unwrap();
@@ -1318,7 +1397,7 @@ mod tests {
             bytes[0..4].copy_from_slice(&(BufferStatus::NeedData as i32).to_ne_bytes());
         }
         let (descriptor, trigger, _, _, _) = transport(MemoryId(1));
-        let mut session = ClientNodeSession::new(resolver.clone());
+        let mut session = resolver.session();
         session
             .apply(SessionCommand::ReplaceTransport(descriptor))
             .unwrap();
@@ -1434,7 +1513,7 @@ mod tests {
         resolver.add(2, 16);
         resolver.add(3, 64);
         resolver.add(4, 8);
-        let mut session = ClientNodeSession::new(resolver);
+        let mut session = resolver.session();
         let format = NegotiatedAudioFormat::pcm_s16le(48_000, 2).unwrap();
         let (buffers, io) = output_descriptors();
         session.apply(SessionCommand::SetFormat(format)).unwrap();
@@ -1506,29 +1585,35 @@ mod tests {
             ApplyOutcome::PendingMemory
         );
         session.apply(SessionCommand::SetActive(true)).unwrap();
-        assert!(session
+        session
             .apply(SessionCommand::SetNodeCommand(NodeCommandState::Start))
-            .is_err());
+            .unwrap();
 
-        initialize_activation(&resolver, 1, ActivationStatus::Inactive, 0);
+        let own = initialize_activation(&resolver, 1, ActivationStatus::Inactive, 0);
         assert_eq!(
             session
-                .apply(SessionCommand::MemoryAvailable(MemoryId(1)))
+                .apply(SessionCommand::MemoryAvailable(resolver.lease(own)))
                 .unwrap(),
             ApplyOutcome::PendingMemory
         );
-        resolver.add(2, 16);
-        resolver.add(4, 8);
+        let metadata = resolver.add(2, 16);
+        let io_key = resolver.add(4, 8);
+        session
+            .apply(SessionCommand::MemoryAvailable(resolver.lease(metadata)))
+            .unwrap();
         assert_eq!(
             session
-                .apply(SessionCommand::MemoryAvailable(MemoryId(4)))
+                .apply(SessionCommand::MemoryAvailable(resolver.lease(io_key)))
                 .unwrap(),
             ApplyOutcome::PendingMemory
         );
         let old_media = resolver.add(3, 64);
-        initialize_activation(&resolver, 5, ActivationStatus::NotTriggered, 1);
         session
-            .apply(SessionCommand::MemoryAvailable(MemoryId(5)))
+            .apply(SessionCommand::MemoryAvailable(resolver.lease(old_media)))
+            .unwrap();
+        let peer = initialize_activation(&resolver, 5, ActivationStatus::NotTriggered, 1);
+        session
+            .apply(SessionCommand::MemoryAvailable(resolver.lease(peer)))
             .unwrap();
         assert_eq!(session.state(), SessionState::Running);
 
@@ -1540,7 +1625,9 @@ mod tests {
             .unwrap();
         assert!(session.output.is_none());
         session
-            .apply(SessionCommand::MemoryAvailable(MemoryId(3)))
+            .apply(SessionCommand::MemoryAvailable(
+                resolver.lease(replacement_media),
+            ))
             .unwrap();
         let rebound = session.output.as_ref().unwrap().id();
         session
@@ -1549,7 +1636,13 @@ mod tests {
         assert_eq!(session.output.as_ref().unwrap().id(), rebound);
 
         let old_generation = session.transport_generation().unwrap();
-        initialize_activation(&resolver, 6, ActivationStatus::Inactive, 0);
+        let replacement_activation =
+            initialize_activation(&resolver, 6, ActivationStatus::Inactive, 0);
+        session
+            .apply(SessionCommand::MemoryAvailable(
+                resolver.lease(replacement_activation),
+            ))
+            .unwrap();
         let (replacement, _, _, _, _) = transport(MemoryId(6));
         session
             .apply(SessionCommand::ReplaceTransport(replacement))
@@ -1574,5 +1667,47 @@ mod tests {
             .apply(SessionCommand::SetNodeCommand(NodeCommandState::Suspend))
             .unwrap();
         assert_eq!(session.state(), SessionState::Configuring);
+    }
+
+    #[test]
+    fn queued_leases_preserve_generation_when_producer_runs_ahead() {
+        let resolver = FakeResolver::new();
+        let old = initialize_activation(&resolver, 70, ActivationStatus::Inactive, 0);
+        let old_lease = resolver.lease(old);
+        let (old_transport, _, _, _, _) = transport(MemoryId(70));
+
+        assert_eq!(resolver.remove(MemoryId(70)), old);
+        let new = initialize_activation(&resolver, 70, ActivationStatus::Inactive, 0);
+        let new_lease = resolver.lease(new);
+        assert_ne!(old, new);
+
+        let mut session = ClientNodeSession::new(resolver.clone());
+        session
+            .apply(SessionCommand::MemoryAvailable(old_lease))
+            .unwrap();
+        session
+            .apply(SessionCommand::ReplaceTransport(old_transport))
+            .unwrap();
+        assert_eq!(session.transport.as_ref().unwrap().activation_key(), old);
+
+        session.apply(SessionCommand::RemoveMemory(old)).unwrap();
+        assert!(session.transport.is_none());
+
+        let (new_transport, _, _, _, _) = transport(MemoryId(70));
+        assert_eq!(
+            session
+                .apply(SessionCommand::ReplaceTransport(new_transport))
+                .unwrap(),
+            ApplyOutcome::PendingMemory
+        );
+        session
+            .apply(SessionCommand::MemoryAvailable(new_lease))
+            .unwrap();
+        assert_eq!(session.transport.as_ref().unwrap().activation_key(), new);
+
+        session.apply(SessionCommand::RemoveMemory(old)).unwrap();
+        assert_eq!(session.transport.as_ref().unwrap().activation_key(), new);
+        session.apply(SessionCommand::RemoveMemory(new)).unwrap();
+        assert!(session.transport.is_none());
     }
 }
