@@ -249,25 +249,32 @@ impl ScriptedServer {
             }
 
             for action in &step.actions {
-                let keep_running = apply_action(&client, &mut sender, deadline, &mut state, action)
-                    .map_err(|err| {
-                        if matches!(
-                            err.kind(),
-                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                        ) {
-                            runtime_wait_error(
-                                &config,
-                                &scenario,
-                                Some(step_index),
-                                state.completed_steps,
-                                "write",
-                                TransportDiagnostics::new(&receiver, &sender, last_frame_route),
-                                err,
-                            )
-                        } else {
-                            err
-                        }
-                    })?;
+                let keep_running = apply_action(
+                    &client,
+                    &mut sender,
+                    deadline,
+                    &mut state,
+                    scenario.name.as_deref().unwrap_or("unnamed"),
+                    action,
+                )
+                .map_err(|err| {
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) {
+                        runtime_wait_error(
+                            &config,
+                            &scenario,
+                            Some(step_index),
+                            state.completed_steps,
+                            "write",
+                            TransportDiagnostics::new(&receiver, &sender, last_frame_route),
+                            err,
+                        )
+                    } else {
+                        err
+                    }
+                })?;
                 if !keep_running {
                     state.completed_steps += 1;
                     return Ok(to_run_report(state));
@@ -385,6 +392,7 @@ fn apply_action(
     sender: &mut FrameSender,
     deadline: Instant,
     state: &mut ExecutionState,
+    scenario_name: &str,
     action: &Action,
 ) -> io::Result<bool> {
     match action {
@@ -466,6 +474,21 @@ fn apply_action(
             state.exported_mem_ids.push(mem.id);
             Ok(true)
         }
+        Action::SendClientNodeFixtureMemory { fixture, role } => {
+            let payload =
+                encode_core_add_mem_payload(role.id(), protocol::spa_data_type::MEM_FD, 0, 0)?;
+            send_event_with_fds(
+                client,
+                sender,
+                deadline,
+                protocol::CORE_ID,
+                core_event::ADD_MEM,
+                payload,
+                vec![fixture.memory_fd(*role)?],
+            )?;
+            state.exported_mem_ids.push(role.id());
+            Ok(true)
+        }
         Action::SendCoreRemoveMem { id } => {
             let payload = encode_core_remove_mem_payload(*id)?;
             send_event(
@@ -515,6 +538,29 @@ fn apply_action(
                 protocol::client_node::event::TRANSPORT,
                 payload,
                 vec![create_eventfd()?, create_eventfd()?],
+            )?;
+            Ok(true)
+        }
+        Action::SendClientNodeFixtureTransport(fixture) => {
+            use crate::testkit::client_node::{MemoryRole, ACTIVATION_SIZE};
+            let object_id = require_client_node_id(state, "SendClientNodeFixtureTransport")?;
+            let payload = protocol::client_node::encode_transport(
+                0,
+                1,
+                pipewire_native_protocol::wire::client_node::RegionRef {
+                    memory_id: MemoryRole::OwnActivation.id(),
+                    offset: 0,
+                    size: ACTIVATION_SIZE as u32,
+                },
+            )?;
+            send_event_with_fds(
+                client,
+                sender,
+                deadline,
+                object_id,
+                protocol::client_node::event::TRANSPORT,
+                payload,
+                fixture.transport_fds()?,
             )?;
             Ok(true)
         }
@@ -574,6 +620,74 @@ fn apply_action(
                 payload,
                 fds,
             )?;
+            Ok(true)
+        }
+        Action::SendClientNodeFixturePeerActivation(fixture) => {
+            use crate::testkit::client_node::{MemoryRole, ACTIVATION_SIZE, PEER_NODE_ID};
+            let object_id = require_client_node_id(state, "SendClientNodeFixturePeerActivation")?;
+            let payload = protocol::client_node::encode_set_activation(
+                PEER_NODE_ID,
+                Some((
+                    0,
+                    pipewire_native_protocol::wire::client_node::RegionRef {
+                        memory_id: MemoryRole::PeerActivation.id(),
+                        offset: 0,
+                        size: ACTIVATION_SIZE as u32,
+                    },
+                )),
+            )?;
+            send_event_with_fds(
+                client,
+                sender,
+                deadline,
+                object_id,
+                protocol::client_node::event::SET_ACTIVATION,
+                payload,
+                vec![fixture.peer_signal_fd()?],
+            )?;
+            Ok(true)
+        }
+        Action::ProveClientNodeFixtureCycle(fixture) => {
+            fixture.wait_own_ready(deadline, scenario_name)?;
+            fixture.prepare_peer();
+            fixture.trigger(1, 1)?;
+            fixture.wait_callbacks(1, deadline, scenario_name)?;
+            fixture.wait_own_ready(deadline, scenario_name)?;
+            fixture.assert_first_cycle()?;
+
+            // Readability is a hint, not cycle authority: drain a coalesced count while the
+            // activation remains FINISHED and require runtime diagnostics from the client.
+            fixture.wake_only(3)?;
+            fixture.wait_stale(deadline, scenario_name)?;
+            Ok(true)
+        }
+        Action::ProveClientNodeFixtureRemovalRace(fixture) => {
+            use crate::testkit::client_node::MemoryRole;
+            fixture.hold_second_callback();
+            fixture.prepare_peer();
+            fixture.trigger(1, 1)?;
+            fixture.wait_second_entered(deadline, scenario_name)?;
+
+            let payload = encode_core_remove_mem_payload(MemoryRole::Media.id())?;
+            send_event(
+                client,
+                sender,
+                deadline,
+                protocol::CORE_ID,
+                core_event::REMOVE_MEM,
+                payload,
+            )?;
+            fixture.wait_media_removed(deadline, scenario_name)?;
+            fixture.release_second_callback();
+            fixture.wait_callbacks(2, deadline, scenario_name)?;
+            Ok(true)
+        }
+        Action::MarkClientNodeFixtureTeardown(fixture) => {
+            fixture.mark_teardown_sent();
+            Ok(true)
+        }
+        Action::ReleaseClientNodeFixture(fixture) => {
+            fixture.release_resources();
             Ok(true)
         }
         Action::SendRegistryGlobalOnLastRegistry(global) => {

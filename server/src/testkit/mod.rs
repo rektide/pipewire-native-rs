@@ -13,6 +13,9 @@ use std::{
 
 use crate::runtime::{RunReport, ScriptedServer};
 
+/// Reusable ClientNode shared-memory and eventfd resources.
+pub mod client_node;
+
 /// Builds a unique Unix socket path in the system temp directory.
 pub fn unique_socket_path(prefix: &str) -> PathBuf {
     let now = SystemTime::now()
@@ -87,6 +90,11 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    /// Returns whether the server thread has already completed.
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
     /// Waits for server completion without allowing an unbounded join.
     pub fn wait(self, deadline: TestDeadline) -> io::Result<RunReport> {
         let remaining = deadline.remaining("waiting for scripted server completion")?;

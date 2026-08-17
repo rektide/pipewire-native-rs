@@ -47,6 +47,15 @@ pub enum Expectation {
         /// Minimum number of advertised parameter PODs.
         min_params: usize,
     },
+    /// Match an exact one-parameter node advertisement.
+    ClientNodeUpdateExact {
+        /// Exact change mask.
+        change_mask: u32,
+        /// Exact sole parameter bytes.
+        param: Vec<u8>,
+        /// Exact node info.
+        info: pipewire_native_protocol::wire::client_node::NodeInfo,
+    },
     /// Match ClientNode `PortUpdate`.
     ClientNodePortUpdate {
         /// Required port direction.
@@ -57,6 +66,15 @@ pub enum Expectation {
         info: bool,
         /// Minimum number of advertised parameter PODs.
         min_params: usize,
+    },
+    /// Match an exact one-parameter output-port advertisement.
+    ClientNodePortUpdateExact {
+        /// Exact change mask.
+        change_mask: u32,
+        /// Exact sole parameter bytes.
+        param: Vec<u8>,
+        /// Exact port info.
+        info: pipewire_native_protocol::wire::client_node::PortInfo,
     },
     /// Match ClientNode `SetActive`.
     ClientNodeSetActive {
@@ -105,6 +123,20 @@ impl Expectation {
                     ..
                 } if update.info.is_some() == *info && update.params.len() >= *min_params
             ),
+            Self::ClientNodeUpdateExact {
+                change_mask,
+                param,
+                info,
+            } => matches!(
+                inbound,
+                InboundMessage::ClientNodeMethod {
+                    method: pipewire_native_protocol::wire::client_node::Method::Update(update),
+                    ..
+                } if update.change_mask == *change_mask
+                    && update.params.len() == 1
+                    && update.params[0].data() == param
+                    && update.info.as_ref() == Some(info)
+            ),
             Self::ClientNodePortUpdate {
                 direction,
                 port_id,
@@ -117,6 +149,22 @@ impl Expectation {
                     ..
                 } if update.direction == *direction && update.port_id == *port_id
                     && update.info.is_some() == *info && update.params.len() >= *min_params
+            ),
+            Self::ClientNodePortUpdateExact {
+                change_mask,
+                param,
+                info,
+            } => matches!(
+                inbound,
+                InboundMessage::ClientNodeMethod {
+                    method: pipewire_native_protocol::wire::client_node::Method::PortUpdate(update),
+                    ..
+                } if update.direction == pipewire_native_protocol::wire::client_node::Direction::Output
+                    && update.port_id == 0
+                    && update.change_mask == *change_mask
+                    && update.params.len() == 1
+                    && update.params[0].data() == param
+                    && update.info.as_ref() == Some(info)
             ),
             Self::ClientNodeSetActive { active } => matches!(
                 inbound,
@@ -213,6 +261,13 @@ pub enum Action {
     SendCoreError(CoreErrorAction),
     /// Emit `Core::AddMem` with a memfd fd attached via SCM_RIGHTS.
     SendCoreAddMem(CoreAddMemAction),
+    /// Emit `Core::AddMem` using one retained ClientNode fixture resource.
+    SendClientNodeFixtureMemory {
+        /// Shared fixture.
+        fixture: crate::testkit::client_node::ClientNodeFixture,
+        /// Memory role to export.
+        role: crate::testkit::client_node::MemoryRole,
+    },
     /// Emit `Core::RemoveMem` for a previously exported memory id.
     SendCoreRemoveMem {
         /// Server memory id to revoke.
@@ -229,6 +284,8 @@ pub enum Action {
         /// Activation memory region.
         activation: pipewire_native_protocol::wire::client_node::RegionRef,
     },
+    /// Emit transport using the fixture's retained trigger and completion eventfds.
+    SendClientNodeFixtureTransport(crate::testkit::client_node::ClientNodeFixture),
     /// Emit a canonical ClientNode port parameter event.
     SendClientNodePortSetParam(pipewire_native_protocol::wire::client_node::PortSetParam),
     /// Emit a canonical ClientNode buffer configuration event.
@@ -242,6 +299,16 @@ pub enum Action {
         /// Activation region, or `None` for the canonical removal sentinel.
         activation: Option<pipewire_native_protocol::wire::client_node::RegionRef>,
     },
+    /// Emit downstream activation using the fixture's retained peer eventfd.
+    SendClientNodeFixturePeerActivation(crate::testkit::client_node::ClientNodeFixture),
+    /// Wait for readiness, prove one cycle, and prove a coalesced wake is not authority.
+    ProveClientNodeFixtureCycle(crate::testkit::client_node::ClientNodeFixture),
+    /// Hold a second callback, retire media through Core, then release the callback.
+    ProveClientNodeFixtureRemovalRace(crate::testkit::client_node::ClientNodeFixture),
+    /// Mark fixture teardown as emitted so the client can deactivate and destroy the node.
+    MarkClientNodeFixtureTeardown(crate::testkit::client_node::ClientNodeFixture),
+    /// Release retained fixture mappings and descriptors.
+    ReleaseClientNodeFixture(crate::testkit::client_node::ClientNodeFixture),
     /// Emit `Registry::Global` on last known registry proxy id.
     SendRegistryGlobalOnLastRegistry(RegistryGlobalAction),
     /// Emit `Registry::GlobalRemove` on last known registry proxy id.
