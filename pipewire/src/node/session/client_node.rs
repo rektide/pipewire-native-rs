@@ -197,11 +197,19 @@ fn command_error(error: CommandSendError) -> io::Error {
 mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-    use pipewire_native_node::session::{
-        cycle::{CommittedOutput, OutputCycle},
-        output::{OutputProcess, ProcessError},
+    use pipewire_native_node::{
+        session::{
+            activation::ActivationView,
+            cycle::{CommittedOutput, OutputCycle},
+            output::{OutputProcess, ProcessError},
+        },
+        shm::create_memfd,
     };
-    use pipewire_native_protocol::wire::client_node::{Command, Event, RegionRef, Transport};
+    use pipewire_native_protocol::wire::client_node::{
+        ActivationStatus, BufferDescriptor, Command, DataDescriptor, Direction, Event, PortSetIo,
+        PortSetParam, PortUseBuffers, RegionRef, Transport,
+    };
+    use pipewire_native_spa::{buffer::data_type, pod::RawPodOwned};
 
     use super::*;
     use crate::{
@@ -345,5 +353,136 @@ mod tests {
         drop(first);
         core.set_memory_importer(None);
         second.runtime.take().unwrap().wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preimported_memory_is_replayed_before_configuration_and_converges() {
+        crate::init();
+        let main_loop = MainLoop::new(&Properties::new()).unwrap();
+        let context = Context::new(&main_loop, Properties::new()).unwrap();
+        let core = crate::core::Core::new_disconnected_for_test(&context);
+        let memory =
+            MemoryPoolHandle::install(&core, pipewire_native_node::shm::ShrinkPolicy::Allow);
+        core.import_memory(
+            50,
+            data_type::MEM_FD,
+            create_memfd("preimported-bridge", 8192).unwrap(),
+            0,
+        )
+        .unwrap();
+        let key = memory
+            .resolve(pipewire_native_node::session::memory::MemoryId(50))
+            .unwrap();
+        {
+            let mut mapping = memory
+                .map(key, 0, ActivationView::required_size(), true)
+                .unwrap();
+            let mut bytes = mapping.borrow();
+            let bytes = unsafe { bytes.bytes_mut() };
+            bytes[0..4].copy_from_slice(&(ActivationStatus::Inactive as u32).to_ne_bytes());
+            bytes[544..548].copy_from_slice(&1_u32.to_ne_bytes());
+        }
+
+        let proxy = ClientNode::new(&core);
+        let bridge = ClientNodeSessionBridge::spawn_tokio(
+            proxy.clone(),
+            memory.clone(),
+            Box::new(UncalledProcess),
+            32,
+        )
+        .unwrap();
+        let (trigger_fd, _) = std::io::pipe().unwrap();
+        let (completion_fd, _) = std::io::pipe().unwrap();
+        proxy.dispatch(Event::Transport(Transport {
+            trigger_fd: trigger_fd.into(),
+            completion_fd: completion_fd.into(),
+            activation: RegionRef {
+                memory_id: 50,
+                offset: 0,
+                size: ActivationView::required_size() as u32,
+            },
+        }));
+        proxy.dispatch(Event::PortSetParam(PortSetParam {
+            direction: Direction::Output,
+            port_id: 0,
+            param_id: 4,
+            flags: 0,
+            param: Some(RawPodOwned::wrap(format_fixture()).unwrap()),
+        }));
+        proxy.dispatch(Event::PortUseBuffers(PortUseBuffers {
+            direction: Direction::Output,
+            port_id: 0,
+            mix_id: None,
+            flags: 0,
+            buffers: vec![BufferDescriptor {
+                metadata: RegionRef {
+                    memory_id: 50,
+                    offset: 4096,
+                    size: 16,
+                },
+                metas: vec![],
+                datas: vec![DataDescriptor {
+                    type_id: data_type::MEM_ID,
+                    data_id: 50,
+                    flags: 0,
+                    map_offset: 4160,
+                    max_size: 64,
+                }],
+            }],
+        }));
+        proxy.dispatch(Event::PortSetIo(PortSetIo::Set {
+            direction: Direction::Output,
+            port_id: 0,
+            mix_id: None,
+            io_id: 1,
+            region: RegionRef {
+                memory_id: 50,
+                offset: 4224,
+                size: 8,
+            },
+        }));
+        bridge
+            .runtime
+            .as_ref()
+            .unwrap()
+            .command_sender()
+            .try_send(SessionCommand::SetActive(true))
+            .unwrap();
+        proxy.dispatch(Event::Command(Command::Start));
+
+        let mut converged = false;
+        for _ in 0..10_000 {
+            let mut mapping = memory
+                .map(key, 0, ActivationView::required_size(), true)
+                .unwrap();
+            let view = unsafe {
+                ActivationView::from_raw_parts(mapping.as_mut_ptr(), mapping.len()).unwrap()
+            };
+            if view.status().unwrap() == ActivationStatus::Finished {
+                converged = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            converged,
+            "pre-imported memory did not reach the session owner"
+        );
+        assert_eq!(bridge.terminal_error(), None);
+        bridge.shutdown().await.unwrap();
+    }
+
+    fn format_fixture() -> Vec<u8> {
+        let line = include_str!("../../../../protocol/tests/fixtures/client-node-v6/upstream.hex")
+            .lines()
+            .find(|line| line.starts_with("format-s16le-48k-stereo "))
+            .unwrap();
+        line.split_once(' ')
+            .unwrap()
+            .1
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
     }
 }

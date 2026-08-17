@@ -42,6 +42,9 @@ impl fmt::Debug for MemoryPoolHandle {
 }
 
 struct MemoryPoolInner {
+    // When both locks are needed, always acquire `pool` before `events`. Event callbacks run only
+    // after both locks are released. This makes pool mutations and subscription snapshots one
+    // ordered stream without allowing callbacks to reenter either critical section.
     pool: Mutex<MemoryPool>,
     events: Mutex<MemoryEventDispatch>,
 }
@@ -63,8 +66,15 @@ type MemoryPoolEventHandler = Box<dyn FnMut(MemoryPoolEvent) + Send>;
 struct MemoryEventDispatch {
     next_id: u64,
     subscribers: BTreeMap<u64, Option<MemoryPoolEventHandler>>,
-    queued: VecDeque<MemoryPoolEvent>,
+    queued: VecDeque<QueuedMemoryEvent>,
     dispatching: bool,
+    #[cfg(test)]
+    quiescence_barriers: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+}
+
+struct QueuedMemoryEvent {
+    event: MemoryPoolEvent,
+    subscribers: Vec<u64>,
 }
 
 /// One independently removable internal memory lifecycle subscription.
@@ -98,9 +108,13 @@ impl MemoryPoolHandle {
         Self { inner }
     }
 
-    /// Adds an independently identified bridge subscription.
+    /// Adds a subscription and atomically queues exact leases for every active generation.
+    ///
+    /// The replay precedes every lifecycle event linearized after this subscription.
     pub(crate) fn subscribe(&self, handler: MemoryPoolEventHandler) -> MemoryPoolSubscription {
-        let id = {
+        let (id, dispatch) = {
+            // Lock order is pool -> events; importer mutations use the same order.
+            let pool = self.inner.pool.lock();
             let mut events = self.inner.events.lock();
             let id = events.next_id;
             events.next_id = events
@@ -108,8 +122,23 @@ impl MemoryPoolHandle {
                 .checked_add(1)
                 .expect("memory subscription IDs exhausted");
             events.subscribers.insert(id, Some(handler));
-            id
+            let mut keys = pool.active_keys();
+            keys.sort_unstable_by_key(|key| (key.id.0, key.generation));
+            for key in keys {
+                let lease = pool
+                    .lease(key)
+                    .expect("active key must retain its exact lease");
+                events.queued.push_back(QueuedMemoryEvent {
+                    event: MemoryPoolEvent::Available(lease),
+                    subscribers: vec![id],
+                });
+            }
+            let dispatch = claim_dispatch(&mut events);
+            (id, dispatch)
         };
+        if dispatch {
+            dispatch_events(&self.inner);
+        }
         MemoryPoolSubscription {
             inner: Arc::downgrade(&self.inner),
             id,
@@ -170,63 +199,102 @@ struct MemoryPoolImporter {
 
 impl CoreMemoryImporter for MemoryPoolImporter {
     fn add_memory(&mut self, id: Id, type_: u32, fd: OwnedFd, flags: u32) -> io::Result<()> {
-        let lease = {
+        let dispatch = {
             let mut pool = self.inner.pool.lock();
             let key = pool
                 .add(MemoryId(id), type_, flags, fd)
                 .map_err(import_error)?;
-            pool.lease(key).map_err(import_error)?
+            let lease = pool.lease(key).map_err(import_error)?;
+            queue_broadcast(
+                &mut self.inner.events.lock(),
+                MemoryPoolEvent::Available(lease),
+            )
         };
-        notify(&self.inner, MemoryPoolEvent::Available(lease));
+        if dispatch {
+            dispatch_events(&self.inner);
+        }
         Ok(())
     }
 
     fn remove_memory(&mut self, id: Id) -> io::Result<()> {
-        let key = self
-            .inner
-            .pool
-            .lock()
-            .remove(MemoryId(id))
-            .map_err(import_error)?;
-        notify(&self.inner, MemoryPoolEvent::Removed(key));
+        let dispatch = {
+            let mut pool = self.inner.pool.lock();
+            let key = pool.remove(MemoryId(id)).map_err(import_error)?;
+            queue_broadcast(&mut self.inner.events.lock(), MemoryPoolEvent::Removed(key))
+        };
+        if dispatch {
+            dispatch_events(&self.inner);
+        }
         Ok(())
     }
 }
 
 impl Drop for MemoryPoolImporter {
     fn drop(&mut self) {
-        let keys = {
+        let dispatch = {
             let mut pool = self.inner.pool.lock();
             let keys = pool.active_keys();
             pool.disconnect();
-            keys
+            let mut events = self.inner.events.lock();
+            for key in keys {
+                queue_broadcast_while_dispatching(&mut events, MemoryPoolEvent::Removed(key));
+            }
+            queue_broadcast_while_dispatching(&mut events, MemoryPoolEvent::Disconnected);
+            claim_dispatch(&mut events)
         };
-        for key in keys {
-            notify(&self.inner, MemoryPoolEvent::Removed(key));
+        if dispatch {
+            dispatch_events(&self.inner);
         }
-        notify(&self.inner, MemoryPoolEvent::Disconnected);
     }
 }
 
+#[cfg(test)]
 fn notify(inner: &MemoryPoolInner, event: MemoryPoolEvent) {
-    {
-        let mut events = inner.events.lock();
-        events.queued.push_back(event);
-        if events.dispatching {
-            return;
-        }
-        events.dispatching = true;
+    let dispatch = queue_broadcast(&mut inner.events.lock(), event);
+    if dispatch {
+        dispatch_events(inner);
     }
-    let _dispatch = DispatchGuard(inner);
+}
+
+fn queue_broadcast(events: &mut MemoryEventDispatch, event: MemoryPoolEvent) -> bool {
+    queue_broadcast_while_dispatching(events, event);
+    claim_dispatch(events)
+}
+
+fn queue_broadcast_while_dispatching(events: &mut MemoryEventDispatch, event: MemoryPoolEvent) {
+    events.queued.push_back(QueuedMemoryEvent {
+        event,
+        subscribers: events.subscribers.keys().copied().collect(),
+    });
+}
+
+fn claim_dispatch(events: &mut MemoryEventDispatch) -> bool {
+    if events.dispatching || events.queued.is_empty() {
+        false
+    } else {
+        events.dispatching = true;
+        true
+    }
+}
+
+fn dispatch_events(inner: &MemoryPoolInner) {
+    let mut dispatch = DispatchGuard { inner, armed: true };
 
     loop {
         let (event, subscribers) = {
             let mut events = inner.events.lock();
-            let Some(event) = events.queued.pop_front() else {
+            let Some(queued) = events.queued.pop_front() else {
+                #[cfg(test)]
+                if let Some((reached, release)) = events.quiescence_barriers.take() {
+                    reached.wait();
+                    release.wait();
+                }
+                // Queue emptiness and dispatcher ownership release are one atomic state change.
+                events.dispatching = false;
+                dispatch.armed = false;
                 return;
             };
-            let subscribers = events.subscribers.keys().copied().collect::<Vec<_>>();
-            (event, subscribers)
+            (queued.event, queued.subscribers)
         };
         for id in subscribers {
             let callback = inner
@@ -246,11 +314,16 @@ fn notify(inner: &MemoryPoolInner, event: MemoryPoolEvent) {
     }
 }
 
-struct DispatchGuard<'a>(&'a MemoryPoolInner);
+struct DispatchGuard<'a> {
+    inner: &'a MemoryPoolInner,
+    armed: bool,
+}
 
 impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
-        self.0.events.lock().dispatching = false;
+        if self.armed {
+            self.inner.events.lock().dispatching = false;
+        }
     }
 }
 
@@ -303,7 +376,7 @@ fn import_error(error: MemoryError) -> io::Error {
 mod tests {
     use std::{
         os::fd::{AsRawFd, RawFd},
-        sync::Mutex as StdMutex,
+        sync::{Barrier, Mutex as StdMutex},
     };
 
     use pipewire_native_node::{session::memory::MemoryPool, shm::create_memfd};
@@ -508,5 +581,101 @@ mod tests {
         drop(second);
         notify(&handle.inner, MemoryPoolEvent::Removed(key));
         assert_eq!(*second_events.lock().unwrap(), [Some(key), Some(key)]);
+    }
+
+    #[test]
+    fn subscription_replays_then_orders_racing_remove_and_reimport() {
+        let inner = inner();
+        let handle = MemoryPoolHandle {
+            inner: Arc::clone(&inner),
+        };
+        let mut importer = MemoryPoolImporter { inner };
+        importer
+            .add_memory(
+                41,
+                data_type::MEM_FD,
+                create_memfd("before-subscribe", 64).unwrap(),
+                0,
+            )
+            .unwrap();
+        let old = handle.resolve(MemoryId(41)).unwrap();
+
+        let replay_reached = Arc::new(Barrier::new(2));
+        let replay_release = Arc::new(Barrier::new(2));
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = {
+            let handle = handle.clone();
+            let replay_reached = Arc::clone(&replay_reached);
+            let replay_release = Arc::clone(&replay_release);
+            let observed = Arc::clone(&observed);
+            std::thread::spawn(move || {
+                handle.subscribe(Box::new(move |event| {
+                    observed.lock().unwrap().push(match event {
+                        MemoryPoolEvent::Available(lease) => (true, lease.key()),
+                        MemoryPoolEvent::Removed(key) => (false, key),
+                        MemoryPoolEvent::Disconnected => return,
+                    });
+                    if observed.lock().unwrap().len() == 1 {
+                        replay_reached.wait();
+                        replay_release.wait();
+                    }
+                }))
+            })
+        };
+
+        replay_reached.wait();
+        importer.remove_memory(41).unwrap();
+        importer
+            .add_memory(
+                41,
+                data_type::MEM_FD,
+                create_memfd("during-subscribe", 64).unwrap(),
+                0,
+            )
+            .unwrap();
+        let new = handle.resolve(MemoryId(41)).unwrap();
+        replay_release.wait();
+        let _subscription = subscriber.join().unwrap();
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [(true, old), (false, old), (true, new)]
+        );
+        assert_ne!(old.generation, new.generation);
+    }
+
+    #[test]
+    fn enqueue_at_quiescence_takes_dispatch_ownership() {
+        let inner = inner();
+        let handle = MemoryPoolHandle {
+            inner: Arc::clone(&inner),
+        };
+        let observed = Arc::new(StdMutex::new(0));
+        let callback_observed = Arc::clone(&observed);
+        let _subscription = handle.subscribe(Box::new(move |_| {
+            *callback_observed.lock().unwrap() += 1;
+        }));
+        let empty_reached = Arc::new(Barrier::new(2));
+        let empty_release = Arc::new(Barrier::new(2));
+        inner.events.lock().quiescence_barriers =
+            Some((Arc::clone(&empty_reached), Arc::clone(&empty_release)));
+
+        let first_inner = Arc::clone(&inner);
+        let first = std::thread::spawn(move || {
+            notify(&first_inner, MemoryPoolEvent::Disconnected);
+        });
+        empty_reached.wait();
+        let second_inner = Arc::clone(&inner);
+        let second = std::thread::spawn(move || {
+            notify(&second_inner, MemoryPoolEvent::Disconnected);
+        });
+        empty_release.wait();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert_eq!(*observed.lock().unwrap(), 2);
+        let events = inner.events.lock();
+        assert!(!events.dispatching);
+        assert!(events.queued.is_empty());
     }
 }
