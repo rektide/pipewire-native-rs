@@ -361,6 +361,35 @@ impl Core {
         )
     }
 
+    /// Creates a Tokio ClientNode session with an explicit monotonic clock.
+    ///
+    /// This is useful for deterministic linked-peer tests and virtual-clock process owners.
+    pub fn create_tokio_client_node_session_with_clock<C>(
+        &self,
+        props: &Properties,
+        memory: crate::node::session::memory::MemoryPoolHandle,
+        process: Box<dyn pipewire_native_node::session::output::OutputProcess>,
+        clock: C,
+    ) -> std::io::Result<crate::node::session::client_node::ClientNodeSessionBridge>
+    where
+        C: pipewire_native_node::runtime::RuntimeClock,
+    {
+        tokio::runtime::Handle::try_current().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("ClientNode session requires a Tokio runtime: {error}"),
+            )
+        })?;
+        let proxy = self.create_client_node(props)?;
+        crate::node::session::client_node::ClientNodeSessionBridge::spawn_tokio_with_clock(
+            proxy,
+            memory,
+            process,
+            pipewire_native_node::runtime::DEFAULT_COMMAND_CAPACITY,
+            clock,
+        )
+    }
+
     /// Destroy a proxy.
     pub fn destroy(&self, object: &dyn HasProxy) -> std::io::Result<()> {
         object_invoke!(self, destroy, object)

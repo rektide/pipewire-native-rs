@@ -56,8 +56,24 @@ impl ClientNodeSessionBridge {
         process: Box<dyn OutputProcess>,
         command_capacity: usize,
     ) -> io::Result<Self> {
+        Self::spawn_tokio_with_clock(
+            proxy,
+            memory,
+            process,
+            command_capacity,
+            pipewire_native_node::runtime::MonotonicClock,
+        )
+    }
+
+    pub(crate) fn spawn_tokio_with_clock<C: pipewire_native_node::runtime::RuntimeClock>(
+        proxy: ClientNode,
+        memory: MemoryPoolHandle,
+        process: Box<dyn OutputProcess>,
+        command_capacity: usize,
+        clock: C,
+    ) -> io::Result<Self> {
         let session = ClientNodeSession::new(memory.clone());
-        let runtime = runtime::spawn_tokio(session, process, command_capacity)?;
+        let runtime = runtime::spawn_tokio_with_clock(session, process, command_capacity, clock)?;
         let sender = runtime.command_sender();
         let failure = Arc::new(Mutex::new(None));
 
@@ -149,6 +165,17 @@ impl ClientNodeSessionBridge {
     /// Clears protocol callbacks, requests terminal teardown, and joins the Tokio task.
     pub async fn shutdown(mut self) -> io::Result<()> {
         self.detach_callbacks();
+        self.runtime
+            .take()
+            .expect("runtime exists until bridge shutdown")
+            .shutdown()
+            .await
+    }
+
+    /// Stops processing, destroys the Core object, and joins the runtime owner.
+    pub async fn shutdown_and_destroy(mut self, core: &crate::core::Core) -> io::Result<()> {
+        self.detach_callbacks();
+        core.destroy(&self.proxy)?;
         self.runtime
             .take()
             .expect("runtime exists until bridge shutdown")

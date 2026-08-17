@@ -22,7 +22,7 @@ tokio = { version = "1.44.1", features = ["rt"] }
 pipewire-native-server.workspace = true
 serial_test = "3"
 tempfile = "3"
-tokio = { version = "1.44.1", features = ["macros", "rt"] }
+tokio = { version = "1.44.1", features = ["macros", "rt", "rt-multi-thread"] }
 
 [build-dependencies]
 pkg-config = "0.3.32"
