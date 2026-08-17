@@ -828,6 +828,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "tinyjson",
+ "tokio",
 ]
 
 [[package]]
