@@ -217,12 +217,12 @@ fn notify(inner: &MemoryPoolInner, event: MemoryPoolEvent) {
         }
         events.dispatching = true;
     }
+    let _dispatch = DispatchGuard(inner);
 
     loop {
         let (event, subscribers) = {
             let mut events = inner.events.lock();
             let Some(event) = events.queued.pop_front() else {
-                events.dispatching = false;
                 return;
             };
             let subscribers = events.subscribers.keys().copied().collect::<Vec<_>>();
@@ -243,6 +243,14 @@ fn notify(inner: &MemoryPoolInner, event: MemoryPoolEvent) {
             };
             active.callback.as_mut().expect("active callback")(event.clone());
         }
+    }
+}
+
+struct DispatchGuard<'a>(&'a MemoryPoolInner);
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.0.events.lock().dispatching = false;
     }
 }
 

@@ -854,4 +854,107 @@ mod tests {
             assert_eq!(view.status().unwrap(), ActivationStatus::Inactive);
         }
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn early_start_converges_after_ordered_memory_and_configuration() {
+        let memory = SharedMemory::new();
+        let session = ClientNodeSession::new(memory.clone());
+        let handle = spawn_tokio(
+            session,
+            Box::new(CountingProcess(Arc::new(AtomicUsize::new(0)))),
+            16,
+        )
+        .unwrap();
+        let sender = handle.command_sender();
+        sender.try_send(SessionCommand::SetActive(true)).unwrap();
+        sender
+            .try_send(SessionCommand::SetNodeCommand(NodeCommandState::Start))
+            .unwrap();
+
+        let activation_key = memory.add(1, ActivationView::required_size());
+        let metadata_key = memory.add(2, 16);
+        let media_key = memory.add(3, 64);
+        let io_key = memory.add(4, 8);
+        {
+            let mut activation = memory
+                .map(activation_key, 0, ActivationView::required_size(), true)
+                .unwrap();
+            let mut guard = activation.borrow();
+            let bytes = unsafe { guard.bytes_mut() };
+            bytes[0..4].copy_from_slice(&(ActivationStatus::Inactive as u32).to_ne_bytes());
+            bytes[544..548].copy_from_slice(&1_u32.to_ne_bytes());
+        }
+        for key in [activation_key, metadata_key, media_key, io_key] {
+            sender
+                .try_send(SessionCommand::MemoryAvailable(
+                    memory.0.lock().unwrap().lease(key).unwrap(),
+                ))
+                .unwrap();
+        }
+        let (trigger_fd, _) = event_pair();
+        let (completion_fd, _) = event_pair();
+        sender
+            .try_send(SessionCommand::ReplaceTransport(TransportDescriptor {
+                trigger_fd,
+                completion_fd,
+                activation: RegionRef {
+                    memory: MemoryId(1),
+                    offset: 0,
+                    len: ActivationView::required_size(),
+                },
+            }))
+            .unwrap();
+        sender
+            .try_send(SessionCommand::SetFormat(
+                NegotiatedAudioFormat::pcm_s16le(48_000, 2).unwrap(),
+            ))
+            .unwrap();
+        sender
+            .try_send(SessionCommand::UseBuffers(BufferSetDescriptor {
+                port: PortId(0),
+                buffers: vec![BufferDescriptor {
+                    metadata: RegionRef {
+                        memory: MemoryId(2),
+                        offset: 0,
+                        len: 16,
+                    },
+                    metas: Vec::<MetaDescriptor>::new().into_boxed_slice(),
+                    media_memory: MemoryId(3),
+                    map_offset: 0,
+                    max_size: 64,
+                }]
+                .into_boxed_slice(),
+            }))
+            .unwrap();
+        sender
+            .try_send(SessionCommand::SetPortIo(PortIoDescriptor {
+                port: PortId(0),
+                region: RegionRef {
+                    memory: MemoryId(4),
+                    offset: 0,
+                    len: 8,
+                },
+            }))
+            .unwrap();
+
+        let mut running = false;
+        for _ in 0..10_000 {
+            let mut activation = memory
+                .map(activation_key, 0, ActivationView::required_size(), true)
+                .unwrap();
+            let view = unsafe {
+                ActivationView::from_raw_parts(activation.as_mut_ptr(), activation.len()).unwrap()
+            };
+            if view.status().unwrap() == ActivationStatus::Finished {
+                running = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            running,
+            "early Start intent did not converge after configuration"
+        );
+        handle.shutdown().await.unwrap();
+    }
 }
