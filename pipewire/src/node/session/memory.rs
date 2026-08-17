@@ -193,8 +193,19 @@ mod tests {
 
     use super::*;
 
-    fn fd_is_open(fd: RawFd) -> bool {
-        unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
+    fn fd_identity(fd: RawFd) -> (libc::dev_t, libc::ino_t) {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        assert_eq!(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, 0);
+        let stat = unsafe { stat.assume_init() };
+        (stat.st_dev, stat.st_ino)
+    }
+
+    fn fd_identity_is_open(fd: RawFd, identity: (libc::dev_t, libc::ino_t)) -> bool {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        (unsafe { libc::fstat(fd, stat.as_mut_ptr()) == 0 }) && {
+            let stat = unsafe { stat.assume_init() };
+            (stat.st_dev, stat.st_ino) == identity
+        }
     }
 
     #[test]
@@ -212,6 +223,7 @@ mod tests {
 
         let duplicate = create_memfd("duplicate", 64).unwrap();
         let duplicate_raw = duplicate.as_raw_fd();
+        let duplicate_identity = fd_identity(duplicate_raw);
         let error = importer
             .add_memory(7, data_type::MEM_FD, duplicate, 0)
             .unwrap_err();
@@ -222,10 +234,11 @@ mod tests {
                 .and_then(|error| error.downcast_ref::<MemoryError>()),
             Some(MemoryError::DuplicateActiveId(MemoryId(7)))
         ));
-        assert!(!fd_is_open(duplicate_raw));
+        assert!(!fd_identity_is_open(duplicate_raw, duplicate_identity));
 
         let unsupported = create_memfd("unsupported", 64).unwrap();
         let unsupported_raw = unsupported.as_raw_fd();
+        let unsupported_identity = fd_identity(unsupported_raw);
         let error = importer
             .add_memory(8, data_type::DMA_BUF, unsupported, 0)
             .unwrap_err();
@@ -236,7 +249,7 @@ mod tests {
                 .and_then(|error| error.downcast_ref::<MemoryError>()),
             Some(MemoryError::UnsupportedMemoryType(_))
         ));
-        assert!(!fd_is_open(unsupported_raw));
+        assert!(!fd_identity_is_open(unsupported_raw, unsupported_identity));
     }
 
     #[test]
@@ -251,11 +264,12 @@ mod tests {
         let mut importer = MemoryPoolImporter { inner };
         let fd = create_memfd("disconnect", 64).unwrap();
         let raw = fd.as_raw_fd();
+        let identity = fd_identity(raw);
         importer.add_memory(9, data_type::MEM_FD, fd, 0).unwrap();
 
         drop(importer);
 
-        assert!(!fd_is_open(raw));
+        assert!(!fd_identity_is_open(raw, identity));
         assert!(matches!(
             handle.resolve(MemoryId(9)),
             Err(MemoryError::Disconnected)
